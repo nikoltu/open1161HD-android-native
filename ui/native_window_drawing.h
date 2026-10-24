@@ -48,7 +48,7 @@ namespace native_window_drawing {
 	};
 	
 	std::unique_ptr<surface> create_rgba_surface(int width, int height);
-	std::unique_ptr<surface> get_window_surface(native_window::window* wnd);
+	std::unique_ptr<surface> get_window_surface(native_window::window* wnd, int width, int height);
 	std::unique_ptr<surface> convert_to_8_bit_indexed(surface* s);
 	
 	std::unique_ptr<surface> load_image(const char* filename);

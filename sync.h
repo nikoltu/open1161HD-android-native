@@ -27,6 +27,17 @@ struct sync_state {
 
 	int game_starting_countdown = 0;
 	uint32_t start_game_seed = 0;
+	// open1161HD task 1: SCBW2 house-rules (qol) negotiated by the HOST. host_qol
+	// is the host's chosen bitmask (set by android_main from --qol before hosting);
+	// send_start_game broadcasts it alongside the seed, and every peer (incl. the
+	// host via loopback) stores the received value in start_game_qol and applies
+	// the SAME config -> identical game_state.qol on all clients, so lockstep stays
+	// deterministic. Clients' own host_qol is unused (only the host broadcasts).
+	uint32_t host_qol = 0;
+	uint32_t start_game_qol = 0;
+	// P4: the host's rules as seen in the LOBBY (carried by game_info, before the
+	// start message) so a joiner's lobby can show the "SCBW2 > N" badge.
+	uint32_t lobby_qol = 0;
 	bool game_started = false;
 
 	struct uid_t {
@@ -82,6 +93,8 @@ struct sync_state {
 		a_circular_vector<scheduled_action> scheduled_actions;
 		uint8_t frame = 0;
 		a_string name;
+		bool ready = false;            // v0.40 lobby ready-check
+		int picked_race = -1;         // v0.44 chosen race (0/1/2), -1 = random
 		bool game_started = false;
 		bool has_greeted = false;
 		std::chrono::steady_clock::time_point last_synced;
@@ -174,7 +187,8 @@ namespace sync_messages {
 		id_create_unit,
 		id_kill_unit,
 		id_remove_unit,
-		id_custom_action
+		id_custom_action,
+		id_set_ready
 	};
 	enum {
 		id_game_started_escape = 0xdc
@@ -504,13 +518,14 @@ struct sync_functions: action_functions {
 		}
 
 		void send_start_game() {
-			writer<5> w;
+			writer<9> w;
 			w.put<uint8_t>(sync_messages::id_start_game);
 			uint32_t seed = 0;
 			for (uint32_t v : sync_state::uid_t::generate().vals) {
 				seed ^= v;
 			}
 			w.put<uint32_t>(seed);
+			w.put<uint32_t>(sync_st.host_qol); // task 1: negotiate house-rules to every peer
 			send(w);
 		}
 		void send_switch_to_slot(int n) {
@@ -524,6 +539,12 @@ struct sync_functions: action_functions {
 			writer<2> w;
 			w.put<uint8_t>(sync_messages::id_set_race);
 			w.put<uint8_t>((int)race);
+			send(w);
+		}
+		void send_set_ready(bool ready) {
+			writer<2> w;
+			w.put<uint8_t>(sync_messages::id_set_ready);
+			w.put<uint8_t>(ready ? 1 : 0);
 			send(w);
 		}
 		void send_create_unit(const unit_type_t* unit_type, xy pos, int owner) {
@@ -573,6 +594,7 @@ struct sync_functions: action_functions {
 				for (size_t i = 0; i != n; ++i) w.put<uint8_t>((uint8_t)*(c->name.data() + i));
 			}
 			w.put<uint8_t>(0);
+			w.put<uint32_t>(sync_st.host_qol); // P4: lobby badge on the joiner (after the 0 terminator)
 			send(w, h);
 		}
 
@@ -684,10 +706,27 @@ struct sync_functions: action_functions {
 
 		void start_game(uint32_t seed) {
 
-			a_string seed_str;
-			for (auto& v : sync_st.clients) seed_str += v.uid.str();
-			uint32_t rand_state = seed ^ data_loading::crc32_t()((const uint8_t*)seed_str.data(), seed_str.size());
+			// Order-INDEPENDENT mix of client UIDs: the host and each guest can
+			// hold sync_st.clients in a different order, so concatenating in list
+			// order produced a different crc32 -> different seed -> instant
+			// lockstep desync. XOR is commutative, so every peer derives the same
+			// seed regardless of client-list order.
+			uint32_t uid_mix = 0;
+			for (auto& v : sync_st.clients) {
+				a_string s = v.uid.str();
+				uid_mix ^= data_loading::crc32_t()((const uint8_t*)s.data(), s.size());
+			}
+			uint32_t rand_state = seed ^ uid_mix;
 			st.lcg_rand_state = rand_state;
+
+			// v0.44: re-apply every client's chosen race to its final slot before
+			// the random pass. Deterministic (same client list + picked_race on
+			// every peer), so it never desyncs, and it fixes races being lost to
+			// message ordering / the map's initial slot race gating.
+			for (auto* c : ptr(sync_st.clients)) {
+				if (c->player_slot >= 0 && c->player_slot < 12 && c->picked_race >= 0 && c->picked_race <= 2)
+					st.players[c->player_slot].race = (bwgame::race_t)c->picked_race;
+			}
 
 			for (int i = 0; i != 12; ++i) {
 				auto& v = st.players[i];
@@ -880,6 +919,7 @@ struct sync_functions: action_functions {
 								if (i < c->name.size()) c->name[i] = (char)r.template get<uint8_t>();
 							}
 						}
+						sync_st.lobby_qol = r.template get<uint32_t>(); // P4: host's house-rules for the badge
 						break;
 					case sync_messages::id_occupy_slot: {
 						int n = r.template get<uint8_t>();
@@ -904,16 +944,25 @@ struct sync_functions: action_functions {
 					case sync_messages::id_set_race: {
 						race_t race = (race_t)r.template get<uint8_t>();
 						if (client->player_slot != -1) {
-							if (sync_st.initial_slot_races[client->player_slot] == (bwgame::race_t)5) {
+							// v0.44: remember the choice on the client itself so
+							// start_game can re-apply it regardless of the map's
+							// initial slot race or message ordering (fixes the
+							// host race being knocked to random).
+							client->picked_race = (int)race;
+							if ((int)race >= 0 && (int)race <= 2)
 								st.players[client->player_slot].race = race;
-							}
 						}
+						break;
+					}
+					case sync_messages::id_set_ready: {
+						client->ready = r.template get<uint8_t>() != 0;
 						break;
 					}
 					case sync_messages::id_start_game:
 						if (!sync_st.game_starting_countdown) {
 							sync_st.game_starting_countdown = 10;
 							sync_st.start_game_seed = r.template get<uint32_t>();
+							sync_st.start_game_qol = r.template get<uint32_t>(); // task 1: adopt host's house-rules
 						}
 						break;
 					case sync_messages::id_leave_game:
@@ -993,6 +1042,26 @@ struct sync_functions: action_functions {
 			}
 
 			process_messages();
+		}
+
+		// v0.54 (experimental FPS parity): non-blocking network pump. Processes
+		// any received frame/action messages so peer frame counters advance,
+		// without the blocking run_until barrier that sync() uses.
+		void poll_nonblocking() {
+			server.set_timeout(std::chrono::seconds(1), std::bind(&syncer_t::timeout_func, this));
+			server.poll(std::bind(&syncer_t::on_new_client, this, std::placeholders::_1));
+			process_messages();
+		}
+
+		// True only when advancing one sim frame will NOT block: after the
+		// advance increments sync_frame, every peer must still be within the
+		// latency window. Conservative (uses sync_frame + 1) so next_frame()
+		// returns immediately without entering the run_until wait.
+		bool ready_to_advance() {
+			for (auto* c : ptr(sync_st.clients)) {
+				if ((int8_t)(sync_st.sync_frame + 1 - c->frame) >= (int8_t)sync_st.latency) return false;
+			}
+			return true;
 		}
 
 		void final_sync() {
@@ -1079,6 +1148,17 @@ struct sync_functions: action_functions {
 		get_syncer(server).sync();
 	}
 
+	// v0.54 (experimental FPS parity): see syncer_t::poll_nonblocking / ready_to_advance.
+	template<typename server_T>
+	void poll(server_T& server) {
+		get_syncer(server).poll_nonblocking();
+	}
+
+	template<typename server_T>
+	bool ready_to_advance(server_T& server) {
+		return get_syncer(server).ready_to_advance();
+	}
+
 	template<typename server_T>
 	void start_game(server_T& server) {
 		if (sync_st.game_started) return;
@@ -1099,6 +1179,23 @@ struct sync_functions: action_functions {
 	void set_local_client_race(server_T& server, race_t race) {
 		if (sync_st.game_started) return;
 		get_syncer(server).send_set_race(race);
+	}
+
+	template<typename server_T>
+	void set_local_client_ready(server_T& server, bool ready) {
+		if (sync_st.game_started) return;
+		get_syncer(server).send_set_ready(ready);
+	}
+
+	// True when every occupied client has toggled ready (host start gate).
+	bool all_clients_ready() const {
+		int occupied = 0, ready = 0;
+		for (auto& c : sync_st.clients) {
+			if (c.player_slot < 0) continue;
+			++occupied;
+			if (c.ready) ++ready;
+		}
+		return occupied >= 2 && ready == occupied;
 	}
 
 	template<typename server_T>

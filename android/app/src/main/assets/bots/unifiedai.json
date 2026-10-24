@@ -1,0 +1,14 @@
+{
+  "schema": "openbw-bot/1",
+  "id": "unifiedai",
+  "name": "Vieningas AI",
+  "race": "any",
+  "level": "adaptive",
+  "author": "open1161HD",
+  "abi": 4,
+  "levels": ["very_easy", "easy", "medium", "hard"],
+  "default_level": "medium",
+  "level_names": { "lt": ["Labai lengvas", "Lengvas", "Vidutinis", "Sunkus"], "en": ["Very easy", "Easy", "Medium", "Hard"] },
+  "description": "One AI for all races with four difficulty levels: race auto-detect, matchup openings, situational tactics, scouting, expansion.",
+  "entry": "libunifiedai.so"
+}

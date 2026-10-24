@@ -527,10 +527,28 @@ struct replay_saver_state {
 	int slot_count = 0;
 	int game_speed = 3;
 	int game_type = 0;
+	// Write the header the way the real game does for a single-player use-map-settings
+	// game (measured on a replay SC:R saved of a campaign map run as a custom game), so
+	// that the real game opens the file. Tool-only: the app leaves it off.
+	bool real_shape = false;
 	int tileset = 0;
 	
 	a_string game_name;
 	a_string map_name;
+	// open1161HD P5: SCBW2 house-rules the game ran with (game_state::qol packed,
+	// bit0 multi_building_select .. bit6 worker_rally_split). Written as a trailer
+	// AFTER the standard BW sections so the file stays a valid 1.16.1 replay for
+	// every other reader; 0 = vanilla, no trailer.
+	uint32_t qol_bits = 0;
+	// v1.0.2, trailer version 2: what the game was SET UP with after the map load,
+	// none of which the 1.16.1 header can say. has_setup = false keeps the old
+	// behaviour (version 1 trailer, or none).
+	//   ai_script  per slot: the aiscript id the native AI was started with (0 = none)
+	//   alliances / shared_vision  as they stood before the first frame (teams)
+	bool has_setup = false;
+	std::array<uint32_t, 8> ai_script{};
+	std::array<std::array<uint8_t, 12>, 12> alliances{};
+	std::array<uint32_t, 12> shared_vision{};
 	game_load_functions::setup_info_t setup_info;
 	std::array<player_t, 12> players;
 	std::array<a_string, 12> player_names;
@@ -581,12 +599,18 @@ struct replay_saver_functions {
 		giw.put<uint32_t>(0); // game flags?
 		giw.put<uint16_t>((uint16_t)replay_saver_st.map_tile_width); // map width
 		giw.put<uint16_t>((uint16_t)replay_saver_st.map_tile_height); // map height
-		giw.put<uint8_t>(replay_saver_st.active_player_count); // active player acount
-		giw.put<uint8_t>(replay_saver_st.slot_count); // slot count
+		const bool rs = replay_saver_st.real_shape;
+		int rs_humans = 0, rs_slots = 0;
+		for (size_t i = 0; i != 8; ++i) {
+			if (replay_saver_st.players[i].controller == player_t::controller_occupied) ++rs_humans;
+			if (replay_saver_st.players[i].controller != player_t::controller_inactive) ++rs_slots;
+		}
+		giw.put<uint8_t>(rs ? rs_humans : replay_saver_st.active_player_count); // active player acount
+		giw.put<uint8_t>(rs ? rs_slots : replay_saver_st.slot_count); // slot count
 		giw.put<uint8_t>(replay_saver_st.game_speed); // game speed
 		giw.put<uint8_t>(0); // game state ?
 		giw.put<uint16_t>(replay_saver_st.game_type); // game type ?
-		giw.put<uint16_t>(0); // game sub type ?
+		giw.put<uint16_t>(rs ? 1 : 0); // game sub type ?
 		giw.put<uint32_t>(0); // ?
 		giw.put<uint16_t>(replay_saver_st.tileset); // tileset
 		giw.put<uint8_t>(1); // replay saved
@@ -594,31 +618,52 @@ struct replay_saver_functions {
 		put_string(replay_saver_st.game_name, 25);
 		put_string(replay_saver_st.map_name, 32);
 		giw.put<uint16_t>(replay_saver_st.game_type); // game type ?
-		giw.put<uint16_t>(0); // game sub type ?
+		giw.put<uint16_t>(rs ? 1 : 0); // game sub type ?
 		giw.put<uint16_t>(0); // sub type display ?
 		giw.put<uint16_t>(0); // sub type label ?
 		giw.put<uint8_t>(replay_saver_st.setup_info.victory_condition); // victory condition
 		giw.put<uint8_t>(replay_saver_st.setup_info.resource_type); // resource type
-		giw.put<uint8_t>(1); // use standard unit stats
+		giw.put<uint8_t>(rs ? 0 : 1); // use standard unit stats
 		giw.put<uint8_t>(2); // fog of war enabled
 		giw.put<uint8_t>(replay_saver_st.setup_info.starting_units); // create initial units
-		giw.put<uint8_t>(0); // use fixed positions ?
-		giw.put<uint8_t>(0); // restriction flags ?
-		giw.put<uint8_t>(0); // allies enabled
+		giw.put<uint8_t>(rs ? 1 : 0); // use fixed positions ?
+		giw.put<uint8_t>(rs ? 3 : 0); // restriction flags ?
+		giw.put<uint8_t>(rs ? 1 : 0); // allies enabled
 		giw.put<uint8_t>(0); // teams enabled
-		giw.put<uint8_t>(0); // cheats enabled
+		giw.put<uint8_t>(rs ? 1 : 0); // cheats enabled
 		giw.put<uint8_t>(replay_saver_st.setup_info.tournament_mode); // tournament mode ?
 		giw.put<uint32_t>(0); // victory condition value?
-		giw.put<uint32_t>(replay_saver_st.setup_info.starting_minerals); // starting minerals
+		giw.put<uint32_t>(rs ? 0 : replay_saver_st.setup_info.starting_minerals); // starting minerals
 		giw.put<uint32_t>(0); // starting gas
 		giw.put<uint8_t>(0); // ?
 		
 		for (size_t i = 0; i != 12; ++i) {
 			giw.put<uint32_t>(i); // slot ?
+			if (rs) {
+				// the real game: human players are numbered from 0, everyone else -1; an unused
+				// slot above 7 is all zero, an unused slot below keeps its race with force 0
+				const bool human = i < 8 && replay_saver_st.players[i].controller == player_t::controller_occupied;
+				giw.put<uint32_t>(human ? 0u : 0xffffffffu);
+				const bool unused = replay_saver_st.players[i].controller == player_t::controller_inactive;
+				giw.put<uint8_t>(i < 8 ? replay_saver_st.players[i].controller : 0);
+				giw.put<uint8_t>(i < 8 ? (int)replay_saver_st.players[i].race : 0);
+				int force = replay_saver_st.players[i].force;
+				giw.put<uint8_t>(i >= 8 || unused ? 0 : (force >= 0 && force < 4 ? force + 1 : force));
+				put_string(replay_saver_st.player_names[i], 25);
+				continue;
+			}
 			giw.put<uint32_t>(i); // player id
 			giw.put<uint8_t>(replay_saver_st.players[i].controller); // controller
 			giw.put<uint8_t>((int)replay_saver_st.players[i].race); // race
-			giw.put<uint8_t>(replay_saver_st.players[i].force); // force
+			// Use-map-settings games: the header stores the lobby force 1-4 (0 = none),
+			// the engine keeps it 0-3 (replay.h subtracts one when loading).
+			{
+				auto& si = replay_saver_st.setup_info;
+				const bool ums = si.victory_condition == 0 && si.tournament_mode == 0 && si.starting_units == 0;
+				int force = replay_saver_st.players[i].force;
+				if (ums && replay_saver_st.has_setup && force >= 0 && force < 4) ++force;
+				giw.put<uint8_t>(force); // force
+			}
 			put_string(replay_saver_st.player_names[i], 25);
 		}
 		
@@ -647,6 +692,19 @@ struct replay_saver_functions {
 		if (!replay_saver_st.map_data) error("replay_saver_functions::save_replay: replay_saver_state::map_data is null");
 		rw.template put<uint32_t>(replay_saver_st.map_data_size);
 		rw.put_bytes(replay_saver_st.map_data, replay_saver_st.map_data_size);
+		// P5 trailer (raw, uncompressed, outside the crc/segment container):
+		// "OBQL" magic, version 1, qol bitmask. replay.h reads it back only when
+		// the bytes are there, so vanilla replays are untouched.
+		if (replay_saver_st.qol_bits || replay_saver_st.has_setup) {
+			w.template put<uint32_t>(0x4C51424Fu); // 'O','B','Q','L' little-endian
+			w.template put<uint32_t>(replay_saver_st.has_setup ? 2 : 1);
+			w.template put<uint32_t>(replay_saver_st.qol_bits);
+			if (replay_saver_st.has_setup) {
+				for (size_t i = 0; i != 8; ++i) w.template put<uint32_t>(replay_saver_st.ai_script[i]);
+				for (size_t i = 0; i != 12; ++i) for (size_t j = 0; j != 12; ++j) w.template put<uint8_t>(replay_saver_st.alliances[i][j]);
+				for (size_t i = 0; i != 12; ++i) w.template put<uint32_t>(replay_saver_st.shared_vision[i]);
+			}
+		}
 	}
 	
 };

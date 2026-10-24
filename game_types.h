@@ -49,38 +49,46 @@ struct object_container {
 	a_deque<std::array<T, allocation_granularity>> list;
 	intrusive_list<T, default_link_f> free_list;
 	size_t size = 0;
+	// The pool's capacity. 1.16.1's by default; a StarCraft: Remastered game with larger
+	// pools (the replay's limits section) raises it. May only change while the pool is empty:
+	// an object's index counts down from the capacity.
+	size_t capacity = max_size;
+	void set_capacity(size_t n) {
+		if (size != 0) error("object_container: capacity change on a pool in use");
+		capacity = n;
+	}
 	
 	T* get(size_t index, bool add_new_to_free = true) {
-		if (index) index = max_size - index;
+		if (index) index = capacity - index;
 		while (size <= index) grow(add_new_to_free);
 		return &list[index / allocation_granularity][index % allocation_granularity];
 	}
 	
 	T* try_get(size_t index) {
-		if (index) index = max_size - index;
+		if (index) index = capacity - index;
 		if (size <= index) return nullptr;
 		return &list[index / allocation_granularity][index % allocation_granularity];
 	}
 	
 	T* at(size_t index) {
-		if (index) index = max_size - index;
+		if (index) index = capacity - index;
 		if (size <= index) error("object_container::get const: invalid index %u", index);
 		return &list[index / allocation_granularity][index % allocation_granularity];
 	}
 	
 	const T* at(size_t index) const {
-		if (index) index = max_size - index;
+		if (index) index = capacity - index;
 		if (size <= index) error("object_container::get const: invalid index %u", index);
 		return &list[index / allocation_granularity][index % allocation_granularity];
 	}
 	
 	void grow(bool add_new_to_free) {
-		if (size == max_size) error("object_container: attempt to grow beyond max_size");
+		if (size == capacity) error("object_container: attempt to grow beyond max_size");
 		list.emplace_back();
-		size_t n = std::min(allocation_granularity, max_size - size);
+		size_t n = std::min(allocation_granularity, capacity - size);
 		for (size_t i = 0; i != n; ++i) {
 			T* obj = &list.back()[i];
-			obj->index = size == 0 ? 0 : max_size - size;
+			obj->index = size == 0 ? 0 : capacity - size;
 			if (add_new_to_free) free_list.push_back(*obj);
 			++size;
 		}
@@ -88,9 +96,9 @@ struct object_container {
 	
 	T* top() {
 		if (free_list.empty()) {
-			if (size == max_size) return nullptr;
+			if (size == capacity) return nullptr;
 			grow(true);
-		} else if (size != max_size && std::next(free_list.begin()) == free_list.end()) {
+		} else if (size != capacity && std::next(free_list.begin()) == free_list.end()) {
 			grow(true);
 		}
 		auto* r = &free_list.front();
@@ -696,6 +704,12 @@ struct unit_t: flingy_t {
 		int creep_timer;
 		int upgrading_level;
 		target_t rally;
+		// open1161HD QoL (SC2-style split rally): a SECOND, worker-only rally that
+		// points at a resource (mineral/gas). When set, larva/CC/Nexus-spawned WORKERS
+		// gather from it while non-workers use `rally` above -- so one town hall can
+		// auto-mine workers AND rally its army elsewhere. Empty (unit==null) = vanilla
+		// single-rally behaviour, so old replays (which never set it) stay identical.
+		target_t worker_rally;
 		union {
 			struct {
 				int resource_count;

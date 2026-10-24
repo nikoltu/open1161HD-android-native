@@ -1,0 +1,66 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'org.openbw.android'
+    compileSdk 34
+    ndkVersion '26.3.11579264'
+
+    defaultConfig {
+        // open1161HD is THE app now: the old openBW+ APK (org.openbw.android) is
+        // retired -- HD is the standard (SD/MPQ still works via the auto asset
+        // tier when no SC:R CASC is present). applicationId keeps the .hd suffix
+        // so existing installs (Tab S7+/S8 Ultra) upgrade in place without a
+        // reinstall/data-migration; namespace + Java class names stay
+        // org.openbw.android (R/BuildConfig, manifest activities).
+        applicationId 'org.openbw.android.hd'
+        minSdk 24
+        targetSdk 34
+        versionCode 203
+        versionName '1.0.22'
+
+        ndk {
+            // arm64-v8a: Tab S7+/S8 Ultra; x86_64: Android Studio emulator
+            abiFilters 'arm64-v8a', 'x86_64'
+        }
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_shared', '-DANDROID_PLATFORM=android-24'
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path 'jni/CMakeLists.txt'
+            version '3.22.1'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // "open1161HD" everywhere the user sees it: launcher label, About box, and
+    // the APK file itself. This is the standard app now (openBW+ retired).
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            outputFileName = "open1161HD-${variant.buildType.name}.apk"
+        }
+    }
+
+    // SDL java classes are copied in by scripts/fetch-sdl.sh
+    sourceSets {
+        main {
+            java.srcDirs += []
+        }
+    }
+}

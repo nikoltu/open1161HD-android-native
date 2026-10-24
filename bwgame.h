@@ -13,8 +13,20 @@
 #include <cstdlib>
 #include <cmath>
 #include <functional>
+#include <bitset>
 
 namespace bwgame {
+
+// Diagnostic hook for trigger tracing. Null unless the app installs a sink
+// (android_main does so for --trigger-trace), so normal runs pay nothing but
+// a null check. Exists because campaign trigger faults are invisible from the
+// outside: a condition that silently never matches looks exactly like a map
+// that is simply hard.
+inline void (*&trigger_trace_sink())(const a_string&) {
+	static void (*fn)(const a_string&) = nullptr;
+	return fn;
+}
+inline bool trigger_tracing() { return trigger_trace_sink() != nullptr; }
 
 static const std::array<unsigned int, 64> tan_table = {
 	7, 13, 19, 26, 32, 38, 45, 51, 58, 65, 71, 78, 85, 92,
@@ -125,6 +137,11 @@ struct global_state {
 
 	a_vector<uint8_t> melee_trg;
 
+	// aiscript VM (v0.21): raw bytecode blobs; the entry table sits at the
+	// start of each file (id, offset, string, flags; id == 0 terminates).
+	a_vector<uint8_t> aiscript_bin;
+	a_vector<uint8_t> bwscript_bin;
+
 	std::array<a_vector<uint8_t>, 8> tileset_vf4;
 	std::array<a_vector<uint8_t>, 8> tileset_cv5;
 };
@@ -136,6 +153,34 @@ struct game_state {
 	game_state(game_state&&) = default;
 	game_state& operator=(const game_state&) = delete;
 	game_state& operator=(game_state&&) = default;
+
+	// SCBW2 quality-of-life "house rules": gameplay-altering options negotiated at
+	// game creation (host-set in multiplayer, shown in the lobby; single-player sets
+	// its own defaults). Part of the STATIC game definition, so if every peer loaded
+	// the same value the lockstep sim stays in sync. All-false == vanilla BW 1.16.1,
+	// the path the determinism gates (replay 2494091895 / campaign 66/0) exercise.
+	// NOTE: only `multi_building_select` changes how the SIM interprets a recorded
+	// select action, so it is the one flag that (a) must be identical across net
+	// peers and (b) needs to be serialized into the replay header to replay correctly
+	// -- that persistence is the deferred P5 item, so this flag is kept OFF/unexposed
+	// until then; replays currently always run vanilla. The UI-fan rules
+	// (group_rally, mbs_train) bake their effect into the broadcast/recorded action
+	// stream, so they replay and net-sync correctly with no header persistence.
+	struct qol_rules_t {
+		bool multi_building_select = false;  // buildings may share one selection (SC2 MBS enabler)
+		bool group_rally = false;            // a rally applies to every selected building
+		bool mbs_train = false;              // train/research/upgrade fans to all identical selected buildings
+		bool unlimited_selection = false;    // >12 UI selection with paged sub-cards (display only)
+		bool smart_cast = false;             // route an energy spell to the best-energy caster
+		bool auto_worker = false;            // auto-produce workers up to a target
+		bool worker_rally_split = false;     // a rally onto a resource sets a SEPARATE worker-only rally
+		// bit7: a unit leaving its factory treats the rally point as a right-click
+		// (gathers a rallied resource, attacks a rallied enemy). The app plays every
+		// melee / LAN game with this on (state_functions::smart_rally); it lives here
+		// too so a recorded game can carry it -- playback used to run with it OFF and
+		// diverged as soon as a rally sat on a resource, an own unit or an enemy.
+		bool smart_rally = false;
+	} qol;
 
 	size_t map_tile_width;
 	size_t map_tile_height;
@@ -163,6 +208,18 @@ struct game_state {
 	size_t tileset_index;
 
 	a_vector<tile_id> gfx_tiles;
+	// Map tiles whose tile group is not in the loaded tileset table -- they become the
+	// null tile (unwalkable). A map made with SC:R's extended tilesets, loaded with the
+	// 1.16.1 tables, has hundreds: ramps and paths are missing and nothing plays right.
+	size_t tiles_beyond_tileset = 0;
+	// v1.0.5: two gameplay thresholds the original derives from its object pools --
+	// a Valkyrie holds its rockets while 80 of the 100 bullets are in use, and an
+	// order is not queued once 1800 of the 2000 orders are in use. SC:R games are
+	// played with larger pools (an SC:R replay says which: its LMTS section, e.g.
+	// 400 bullets / 4000 orders), so there the Valkyries DO fire. replay.h raises
+	// these for such a replay; everything else keeps the 1.16.1 values.
+	int halo_rocket_bullet_cap = 80;
+	int order_queue_cap = 1800;
 	a_vector<cv5_entry> cv5;
 	a_vector<vf4_entry> vf4;
 	a_vector<uint16_t> mega_tile_flags;
@@ -187,6 +244,20 @@ struct game_state {
 	regions_t regions;
 
 	a_vector<trigger> triggers;
+
+	// CHK UPRP: unit property slots for the "Create Unit with Properties" action.
+	struct unit_properties_t {
+		uint16_t valid_flags = 0;      // which state flags apply
+		uint16_t valid_properties = 0; // 0x1 owner, 0x2 hp, 0x4 shields, 0x8 energy, 0x10 resources, 0x20 hangar
+		uint8_t owner = 0;
+		uint8_t hp_percent = 100;
+		uint8_t shield_percent = 100;
+		uint8_t energy_percent = 100;
+		uint32_t resources = 0;
+		uint16_t units_in_hangar = 0;
+		uint16_t unit_flags = 0; // 0x1 cloak, 0x2 burrow, 0x4 in transit, 0x8 hallucinated, 0x10 invincible
+	};
+	std::array<unit_properties_t, 64> uprp{};
 };
 
 struct state_base_copyable {
@@ -239,6 +310,11 @@ struct state_base_copyable {
 	uint32_t lcg_rand_state;
 
 	int last_error;
+	// v0.83: which player last hit an error, on which frame, so the UI can poll
+	// and show it (bwgame has no notion of the local player; ui.h does). Written
+	// by the sim, never read by it -- display-only, determinism-neutral.
+	int last_error_player = -1;
+	int last_error_frame = -1;
 
 	int trigger_timer;
 	std::array<a_vector<running_trigger>, 8> running_triggers;
@@ -268,6 +344,165 @@ struct state_base_copyable {
 	bool cheat_operation_cwal;
 
 	a_vector<location> locations;
+
+	// Trigger engine extensions (full CHK conditions/actions support).
+	// All of these are simulation state: they are only mutated from inside
+	// the deterministic sim (trigger actions / unit death accounting), so
+	// they are safe for lockstep multiplayer and replays.
+	std::array<bool, 256> trigger_switches;
+	std::array<type_indexed_array<int32_t, UnitTypes>, 12> unit_deaths;
+	std::array<type_indexed_array<int32_t, UnitTypes>, 12> unit_kills;
+	// EUD (v0.25): sparse backing store for out-of-range deaths slots, which
+	// modern UMS maps use as extra variables. Keyed unit_id * 12 + player
+	// (the original deaths-table linear layout). Ordered map -> deterministic.
+	a_map<uint32_t, int32_t> eud_deaths;
+	int countdown_timer_ms;
+	bool countdown_paused;
+	std::array<int32_t, 12> custom_score;
+	std::array<int32_t, 12> kills_score;
+	std::array<int32_t, 12> razings_score;
+	uint32_t trigger_speech_muted; // bitmask per player (mute/unmute unit speech)
+	std::array<int, 8> mission_objectives_string; // map string index, 0 = none set
+	struct leaderboard_t {
+		int type; // 0 none, 1 control, 2 control-at, 3 resources, 4 kills, 5 points, 6 greed
+		int string_index;
+		int unit_id;
+		int resource_type;
+		int score_type;
+		int location; // 1-based, 0 = none
+		int goal; // -1 = no goal
+		bool show_computers;
+	};
+	leaderboard_t leaderboard;
+	int next_scenario_string; // map string index, 0 = none (Set Next Scenario)
+
+	// aiscript VM (v0.21 slice A). Deterministic: lives in state, driven by
+	// sim frames, randomness through lcg_rand only.
+	struct ai_build_goal {
+		int unit_id;
+		int count;
+		// open1161HD S3: which town this goal builds at. Only meaningful for
+		// buildings (army trains from any production building); army goals carry
+		// xy() so they de-dup by unit id alone, exactly as before. Melee scripts
+		// only run start_town, so every building goal gets the start location and
+		// the goal list stays byte-identical to the pre-S3 one.
+		xy town;
+	};
+	struct ai_thread_t {
+		bool active;
+		uint32_t pc;
+		int wait_until_frame;
+		uint32_t return_pc; // one-deep call/return stack (aiscript 'call')
+		// open1161HD S2b: a wait_build/wait_buildstart/wait_train gate blocks the
+		// thread until the AI owns a required unit. Campaign scripts sometimes wait
+		// on things our production manager never makes (Starport/Factory add-ons like
+		// Control Tower / Machine Shop -- measured terran08 Ter8 stuck forever at
+		// wait_build building=115 Control Tower). Track how long a thread has been
+		// parked on the SAME wait so it can give up and let the rest of the script
+		// (its attack loop) run, instead of freezing the whole AI. 0 = not blocked.
+		uint32_t block_pc;
+		int block_since;
+		// open1161HD S3: this thread's town. `loc` = the RunAIScriptAtLocation
+		// region the thread was started at (xy() for melee / plain RunAIScript);
+		// `town` = the build anchor start_town/start_areatown resolved to. Per
+		// thread so a player's several town scripts each keep their own base.
+		xy loc;
+		xy town;
+		// v1.0.16: which table this thread's script is in (bwscript.bin instead of
+		// aiscript.bin). Per thread: a Brood War mission runs its campaign script from
+		// bwscript.bin and helper scripts ("enter closest bunker", ...) from aiscript.bin
+		// for the same player.
+		bool bw;
+	};
+	// How many script threads one player may have. Was 8: Brood War Terran 1 starts 12
+	// for one player in its first two triggers (campaign script + 11 bunkers).
+	enum { ai_max_threads = 64 };
+	struct ai_player_t {
+		bool active;
+		bool bw; // the table of the first script started (kept for the trace / save layout)
+		xy town_pos;
+		static_vector<ai_thread_t, ai_max_threads> threads; // [0] = main; multirun spawns more
+		static_vector<ai_build_goal, 48> build_goals;
+		static_vector<ai_build_goal, 24> attack_group;
+		static_vector<ai_build_goal, 16> upgrade_goals; // unit_id = upgrade id, count = level
+		static_vector<int, 16> tech_goals;
+		// v0.83 aiscript define_max (0x4b): a per-unit ceiling the script sets
+		// so its own build goals do not run away. unit_id/count reused.
+		static_vector<ai_build_goal, 32> max_counts;
+		// v0.83 aiscript max_force (0x2e): the largest attack wave the script
+		// wants sent out at once. 0 = unset (no limit), which is the state
+		// every script starts in.
+		int max_force = 0;
+		// v0.81: unit types the script reserved for home defense (aiscript
+		// defenseuse_*). BW keeps four lists keyed by (attacker, defender)
+		// air/ground; we keep one, because our military manager has no
+		// per-threat-type response to select between them. Verified from
+		// script data via --ai-trace: the terran03 zerg script sets
+		// gg=Zergling, ag=Hydralisk, ga=Mutalisk, aa=Mutalisk -- i.e. the
+		// first letter is the attacker and the second the defender.
+		static_vector<int, 16> defense_units;
+		// v0.83.033: aiscript start_campaign (0x38). Campaign scripts define an
+		// attack composition + max_force but rely on this opcode to keep producing
+		// that composition and to launch attack waves; without it the starting
+		// army only bleeds away (measured terran03: military 111->84). Melee
+		// scripts never execute 0x38, so this stays false in melee/LAN and cannot
+		// affect that determinism. Set once, never cleared.
+		bool campaign = false;
+		// v1.0.17: the units this player had when start_campaign ran -- the map's
+		// pre-placed garrison, by unit slot. Measured against the real game (Terran 3,
+		// Brood War Terran 1): a script's attack wave is made of units TRAINED for it
+		// (attack_add 2 zerglings -> one egg -> those two go); the garrison stays at its
+		// posts and the army does not shrink with every wave. A slot's bit is cleared
+		// when a new unit takes the slot.
+		std::bitset<1700> garrison;
+		// The wave being gathered (attack_do): its units by slot, where they meet and
+		// where they go. Measured (Brood War Terran 1, second wave): the real game's six
+		// units leave four barracks, meet, and walk in as one group; sent straight from
+		// their barracks ours arrived one by one and died without a kill.
+		std::bitset<1700> wave;
+		xy wave_gather;
+		xy wave_target;
+		int wave_deadline = 0; // 0 = no wave gathering
+		// attack_do while the wave's units are still in training: the order waits here
+		// (the script's attack_clear empties attack_group right after attack_do).
+		static_vector<ai_build_goal, 24> wave_order;
+		int wave_order_deadline = 0;
+		// v0.83.036 (B): aiscript enter_bunker (0x29). A defensive campaign AI
+		// (measured Revolution/terran05 p6: 10 bunkers, military 52, 0 attacks --
+		// exactly the user's "AI doesn't hop into bunkers") uses this to garrison
+		// its bunkers with infantry. Unimplemented, the marines stood outside.
+		// Set once; ai_manage then keeps bunkers topped up. Melee never runs 0x29.
+		bool garrison_bunkers = false;
+		// open1161HD Faze 7 (S1): scripted attack/town locations from
+		// RunAIScriptAtLocation (trigger action 16). Vanilla campaigns point each
+		// attacker town's waves at a distinct enemy region; our VM previously
+		// discarded the location and every wave funnelled at the nearest enemy
+		// start, collapsing all 44 multi-town missions to one attack axis. We
+		// record each distinct scripted region and bias ai_enemy_target to the
+		// nearest enemy near the round-robin next region. EMPTY in melee/LAN
+		// (RunAIScript carries no location), so melee determinism is untouched.
+		static_vector<xy, 8> attack_targets;
+		int attack_target_rr = 0; // round-robin index over attack_targets
+		// open1161HD S2: frame of the last wave this AI launched from its OWN
+		// aiscript schedule (attack_prepare/attack_do/send_suicide). The campaign
+		// manager's synthetic fallback wave only fires when this has gone quiet, so
+		// a script that runs its own attack cadence (the vanilla case -- measured
+		// Ter3: waves at f754, ~f2754, ... every ~2000f) never gets doubled up,
+		// while a script that stalls before its attack loop still gets a safety net.
+		int last_attack_frame = -100000;
+		// open1161HD: campaign transport-drop op. When an attack target is not
+		// ground-reachable (Revolution/terran05: the Confederate town sits on
+		// region 5, the captured Antiga base on region 1 with water between), a
+		// pure AttackMove wave strands its ground units at the shore and only air
+		// crosses. This ferries the ground portion by Dropship: gather+load near
+		// the ship, MoveUnload onto the target's landmass, then AttackMove. Guarded
+		// by ai.campaign, so melee/replay/skirmish never set it (byte-identical).
+		int transport_phase = 0;        // 0 none, 1 load, 2 ferry+unload
+		unit_id transport_ship;         // the dropship in use (null = none/dead)
+		xy transport_target;            // wave destination
+		int transport_since = -100000;  // frame the op/phase (re)started (timeout)
+	};
+	std::array<ai_player_t, 8> ai_players;
 };
 
 struct psionic_matrix_link_f {
@@ -324,6 +559,54 @@ struct state_base_non_copyable {
 
 	const unit_t* consider_collision_with_unit_bug;
 	const unit_t* prev_bullet_source_unit;
+
+	// --- SC:R "121" replay unit-tag resolution (seRS replays only) --------------
+	// SC:R's 0x60-0x65 commands reference units by a classic index|generation tag in
+	// a WIDER bitfield (13-bit index + 3-bit generation) with the unit array offset
+	// +1700 from the classic 1700-slot array; get_unit_by_scr_tag (actions.h) decodes
+	// it directly. scr_tag_mode is set when a seRS replay is loaded (replay.h) and is
+	// false on every classic reRS / campaign / normal-game path (none emit 0x60-0x65),
+	// so the melee determinism gate is untouched. scr_dbg_* are harness-only counters.
+	// None of these are serialized (savegame.h) or hashed (sync.h) -- pure runtime.
+	bool scr_tag_mode = false;
+	// Which tag layout this seRS replay uses: 0 = not seen yet, 1 = the wide one
+	// described above, 2 = the classic 11-bit index | generation value stored in the
+	// 32-bit field (older SC:R builds -- measured on dewalt1/2.rep: the first select
+	// is 0xe2b, exactly the classic id of the player's Nexus). Decided by the first
+	// real tag of the replay, which always names a starting unit (generation 1):
+	// classic <= 0xea4, wide >= 0x26a5.
+	int scr_tag_format = 0;
+	// Harness-only: how often an object could not be created because its 1.16.1
+	// pool was full (0 bullets, 1 images, 2 sprites, 3 units, 4 orders), and the
+	// frame of the first time. SC:R raised these pools, so an SC:R replay that
+	// runs into one here plays differently from the recording.
+	// Harness-only: player-issued production refused for lack of supply (0), minerals
+	// (1) or gas (2). The original's UI does not let a player issue what they cannot
+	// pay for, so in a faithful replay these stay near zero; the first one marks where
+	// OUR economy has fallen behind the recorded one. Log rows: frame, owner, unit
+	// type, kind.
+	std::array<long, 3> dbg_deny{};
+	std::array<std::array<int, 4>, 24> dbg_deny_log{};
+	int dbg_deny_n = 0;
+	// Harness-only: gameplay thresholds derived from the 1.16.1 pool sizes -- 0 Valkyrie
+	// rockets not fired (80 active bullets of 100), 1 order not queued (1800 of 2000).
+	std::array<long, 3> dbg_threshold_hits{};
+	std::array<int, 3> dbg_threshold_first_frame{{-1, -1, -1}};
+	std::array<long, 5> dbg_limit_hits{};
+	std::array<int, 5> dbg_limit_first_frame{{-1, -1, -1, -1, -1}};
+	long scr_dbg_resolved = 0, scr_dbg_null = 0;      // real (non-zero) tags only
+	uint16_t scr_dbg_last_null_tag = 0;               // the most recent tag that did not resolve
+	long scr_dbg_sel_odd = 0;                         // multi-selections holding a foreign unit or a building
+	int scr_dbg_sel_odd_first_frame = -1;
+	uint16_t scr_dbg_sel_odd_last_tag = 0;
+	long scr_dbg_sel_null = 0, scr_dbg_tgt_recovered = 0;  // harness diagnostics
+	int scr_dbg_first_null_frame = -1;                // frame of the first classic select miss
+	uint32_t scr_dbg_first_null_tag = 0;              // its raw tag; owner in low byte of _meta
+	int scr_dbg_first_null_owner = -1;
+	int scr_dbg_first_null_slot_owner = -3;           // owner of the unit physically at that slot (-2 = no unit)
+	int scr_dbg_first_null_slot_gen = -1, scr_dbg_first_null_want_gen = -1;
+	long scr_dbg_sel_null_by_owner[12] = {};          // classic select misses per command owner (storm id)
+	bool dbg_skip_triggers = false;                   // harness: skip map-trigger execution (UMS desync probe)
 };
 
 struct state : state_base_copyable, state_base_non_copyable {
@@ -340,11 +623,33 @@ struct state_functions {
 	virtual void on_player_eliminated(int owner) {}
 	virtual void on_victory_state(int owner, int state) {}
 
+	// A nuclear missile has been launched at this position. Upstream left a
+	// "todo: callback for message" here; the sound was always played, only the
+	// on-screen notice was missing. Called once per launch, from
+	// order_NukeLaunch's order_state 1.
+	virtual void on_nuke_launch(xy target) {}
+
+	// Trigger presentation hooks. These carry no simulation state — the sim
+	// stays deterministic regardless of what the UI does with them. `owner`
+	// is the trigger owner; the UI decides whether it concerns the local player.
+	virtual void on_trigger_display_text(int owner, const a_string& text) {}
+	virtual void on_trigger_play_wav(int owner, const a_string& filename) {}
+	virtual void on_trigger_center_view(int owner, xy pos) {}
+	virtual void on_trigger_minimap_ping(int owner, xy pos) {}
+	virtual void on_trigger_portrait(int owner, int unit_id, int duration_ms) {}
+	virtual void on_trigger_pause(int owner, bool pause) {}
+
 	virtual ~state_functions() {}
 
 	state& st;
 	const global_state& global_st = *st.global;
 	const game_state& game_st = *st.game;
+
+	// Android port: when set (melee/LAN only, never during replay playback so
+	// recorded games stay bit-identical), a building's rally point is resolved
+	// like a right-click — workers rallied to minerals/gas auto-gather, combat
+	// units rallied to an enemy attack. See rally_unit().
+	bool smart_rally = false;
 
 	explicit state_functions(state& st) : st(st) {}
 	state_functions(state_functions&& n) : st(n.st) {}
@@ -1438,6 +1743,16 @@ struct state_functions {
 		return ut->id >= UnitTypes::Special_Floor_Missile_Trap && ut->id <= UnitTypes::Special_Right_Wall_Flame_Trap;
 	}
 
+	// The four installation doors. Explicit ids (not a range) to match the order
+	// validation at case Orders::OpenDoor, and because the door ids are not
+	// contiguous with each other in UnitTypes.
+	bool unit_is_door(unit_type_autocast ut) const {
+		return ut->id == UnitTypes::Special_Upper_Level_Door
+		    || ut->id == UnitTypes::Special_Right_Upper_Level_Door
+		    || ut->id == UnitTypes::Special_Pit_Door
+		    || ut->id == UnitTypes::Special_Right_Pit_Door;
+	}
+
 	bool unit_is_zerg_building(unit_type_autocast ut) const {
 		return ut->id >= UnitTypes::Zerg_Infested_Command_Center && ut->id <= UnitTypes::Special_Cerebrate_Daggoth;
 	}
@@ -2211,7 +2526,86 @@ struct state_functions {
 
 	void drop_carried_items(unit_t* u) {
 		if ((u->carrying_flags & ~3) == 0) return;
-		error("drop_carried_items: fixme");
+		// A (#144): a worker carrying a powerup drops it back at the point where
+		// it was placed (building.powerup.origin, recorded on creation) and clears
+		// the carry state -- the reverse of order_PowerupIdle's pickup. move THEN
+		// show so it reappears at the origin, not at the carrier. The Drone-morph
+		// path (order_BuildingMorph, ~6677) also moves it to origin afterwards --
+		// redundant with this, harmless (same spot).
+		if (ut_worker(u) && u->worker.powerup) {
+			unit_t* p = u->worker.powerup;
+			u->worker.powerup = nullptr;
+			if (ut_powerup(p)) {
+				p->connected_unit = nullptr;
+				move_unit(p, p->building.powerup.origin);
+				show_unit(p);
+				set_unit_order(p, get_order_type(Orders::PowerupIdle));
+			}
+			// A (#144): tear down the carried image mounted in order_PowerupIdle.
+			destroy_carrying_images(u);
+		}
+		u->carrying_flags &= 3;
+	}
+
+	// A (#144): a powerup on the ground idles in Orders::PowerupIdle (measured:
+	// Young Chrysalis units.dat human/computer_ai_idle = 97 = PowerupIdle). Each
+	// frame, if a worker was explicitly sent to this powerup (order_target.unit
+	// == u) and has reached it, that worker picks it up: the powerup is hidden and
+	// linked via worker.powerup, so the "bring powerup to location" trigger
+	// (trigger_unit_pred through worker.powerup) then sees it wherever the carrier
+	// goes. Gating on order_target.unit avoids a worker that merely walks past.
+	void order_PowerupIdle(unit_t* u) {
+		if (!ut_powerup(u)) return;
+		if (u->connected_unit) return;   // already being carried
+		for (int p = 0; p != 12; ++p) {
+			for (auto i = st.player_units[p].begin(); i != st.player_units[p].end(); ++i) {
+				unit_t* w = &*i;
+				if (!ut_worker(w) || !u_completed(w) || unit_dying(w)) continue;
+				if (w->worker.powerup) continue;
+				if ((w->carrying_flags & ~3) != 0) continue;
+				// Pickup is a DELIBERATE act: the worker must have been right-clicked
+				// onto THIS powerup. get_default_order case 1 (3916) returns Move for a
+				// powerup target, and a move-to-unit sets order_target.unit == the
+				// powerup (17539) -- that is the signal, exactly as the header comment
+				// always intended. The earlier pure-72px-proximity gate was wrong: it
+				// grabbed ANY idle worker merely standing on the powerup, so The Big
+				// Push's Psi Emitter -- created directly on top of the player's SCV via
+				// MoveLocation (terran08 TRIG#1) -- was snatched invisibly at frame 1
+				// and never seen on the map ("psi emiteris nera spawnintas ant mapo").
+				// It also broke the real-game path everywhere else: a move-to-unit
+				// stops at the target's collision radius (~189px short for a large
+				// powerup), well outside 72px, so a normal right-click never picked
+				// anything up -- only powerups spawned on top of a worker did.
+				if (w->order_target.unit != u) continue;
+				// order_target.unit == u persists through the whole approach (order_Move
+				// clears it only on arrival), so this distance test races nothing.
+				// Accept the pickup anywhere within the move-to-unit stop reach.
+				xy d = w->sprite->position - u->sprite->position;
+				if ((int)(d.x * d.x + d.y * d.y) > 220 * 220) continue;
+				// A (#144): a powerup's own ground image (IMAGEID_Flag..Khaydarin_Crystal,
+				// Uraj..Khalis -- exactly the range destroy_carrying_images sweeps) doubles
+				// as its carried image. Read it before hide_unit, then mount it on the
+				// carrier's sprite with the special (carry) offset, mirroring the mineral/gas
+				// gather path -- otherwise the powerup is carried invisibly (user: Psi Emitter
+				// "nematau" in The Big Push). Destroyed again in drop_carried_items.
+				const image_type_t* powerup_image = (u->sprite && u->sprite->main_image)
+					? u->sprite->main_image->image_type : nullptr;
+				w->worker.powerup = u;
+				w->carrying_flags |= 4;
+				u->connected_unit = w;
+				hide_unit(u);
+				if (powerup_image) {
+					image_t* image = create_image(powerup_image, w->sprite, {}, image_order_above);
+					if (image) {
+						if (!i_flag(image, image_t::flag_uses_special_offset)) {
+							i_set_flag(image, image_t::flag_uses_special_offset);
+							update_image_special_offset(image);
+						}
+					}
+				}
+				return;
+			}
+		}
 	}
 
 	bool has_available_supply_for(int owner, const unit_type_t* unit_type, bool show_error = false) const {
@@ -2232,7 +2626,7 @@ struct state_functions {
 		}
 		if (st.supply_used[owner][index] + supply_required > st.supply_available[owner][index]) {
 			// todo: callback for error message/sound?
-			(void)show_error;
+			if (show_error) { ++st.dbg_deny[0]; if (st.dbg_deny_n < 24) st.dbg_deny_log[(size_t)st.dbg_deny_n++] = {{(int)st.current_frame, owner, (int)unit_type->id, 0}}; }
 			return false;
 		}
 		return true;
@@ -2241,12 +2635,12 @@ struct state_functions {
 	bool has_available_resources_for(int owner, const unit_type_t* unit_type, bool show_error = false) const {
 		if (st.current_minerals[owner] < unit_type->mineral_cost) {
 			// todo: callback for error message/sound?
-			(void)show_error;
+			if (show_error) { ++st.dbg_deny[1]; if (st.dbg_deny_n < 24) st.dbg_deny_log[(size_t)st.dbg_deny_n++] = {{(int)st.current_frame, owner, (int)unit_type->id, 1}}; }
 			return false;
 		}
 		if (st.current_gas[owner] < unit_type->gas_cost) {
 			// todo: callback for error message/sound?
-			(void)show_error;
+			if (show_error) { ++st.dbg_deny[2]; if (st.dbg_deny_n < 24) st.dbg_deny_log[(size_t)st.dbg_deny_n++] = {{(int)st.current_frame, owner, (int)unit_type->id, 2}}; }
 			return false;
 		}
 		return true;
@@ -2388,7 +2782,12 @@ struct state_functions {
 		if (unit_is(u, UnitTypes::Zerg_Devourer)) return false;
 		if (unit_is(u, UnitTypes::Zerg_Mutalisk)) return false;
 		if (unit_is(u, UnitTypes::Zerg_Hydralisk)) return false;
-		if (unit_is_nydus(u) && !u->building.nydus.exit) return false;
+		// v1.0.14: upstream had this test inverted (`!exit`): a Nydus Canal morphing from a
+		// drone -- it has no exit yet -- could not be cancelled, while the exit end could.
+		// Measured against the real game (SC:R 1.23.9, replay d12 frame 20191): the player
+		// cancels such a canal and gets the drone back. The exit end, raised by its parent
+		// canal, is the one that cannot be cancelled.
+		if (unit_is_nydus(u) && u->building.nydus.exit) return false;
 		if (u_grounded_building(u)) {
 			if (unit_race(u) == race_t::zerg) {
 				cancel_morphing_building(u);
@@ -2623,6 +3022,11 @@ struct state_functions {
 	}
 
 	void kill_unit(unit_t* u) {
+		// Death accounting for triggers (Deaths condition / Set Deaths action).
+		// Counted once here — every death path funnels through kill_unit.
+		if (!ut_turret(u) && !unit_dying(u) && u->owner < 12) {
+			++st.unit_deaths[u->owner][u->unit_type->id];
+		}
 		drop_carried_items(u);
 		while (!u->order_queue.empty()) {
 			remove_queued_order(u, &u->order_queue.front());
@@ -3387,11 +3791,7 @@ struct state_functions {
 			if (unit_is_researching(u)) cancel_research(u);
 			if (unit_is_upgrading(u)) cancel_upgrade(u);
 		}
-		if (unit_is_reaver(u) || unit_is_carrier(u)) {
-			cancel_build_queue(u);
-			u->current_build_unit = nullptr;
-			u->secondary_order_state = 0;
-		}
+		if (unit_is_reaver(u) || unit_is_carrier(u)) cancel_build_queue(u);
 		set_unit_owner(u, new_owner, true);
 		if (new_owner < 8) set_sprite_owner(u, new_owner);
 		if (any_upgrades_granted) apply_upgrades_to_player_units(new_owner);
@@ -4251,6 +4651,30 @@ struct state_functions {
 	void order_TurretGuard(unit_t* u) {
 		set_next_target_waypoint(u, u->subunit->next_target_waypoint);
 		order_PlayerGuard(u);
+	}
+
+	// v0.83.014 (G4b) -- GROUNDED RECONSTRUCTION, behaviour GUESSED and
+	// UNVERIFIED. There is no reference: upstream openbw error()s this order,
+	// and the firing logic lived in StarCraft.exe, not in any data file. What
+	// IS measured (tools/datdump on units.dat): the floor/wall traps idle in
+	// this order (167 Hidden Gun) with weapon 130, i.e. a trap is a stationary
+	// auto-attacker. So this reuses the SHIPPED Guard acquisition
+	// (find_acquire_target + auto_attack_target) rather than inventing target
+	// logic or constants -- the acquisition range and weapon come from the
+	// trap's own .dat. The cloak/reveal pass (HideTrap/RevealTrap) is left
+	// cosmetic. Correctness (does it fire at the right things, at the right
+	// time) is NOT confirmed and needs a trap map on hardware; determinism and
+	// no-crash ARE confirmed by aidump savetest.
+	void order_HiddenGun(unit_t* u) {
+		if (!unit_autoattack(u)) {
+			if (u->main_order_timer == 0) {
+				u->main_order_timer = 15;
+				if (unit_target_acquisition_range(u) != 0) {
+					unit_t* target = find_acquire_target(u);
+					if (target) auto_attack_target(u, target);
+				}
+			}
+		}
 	}
 
 	void order_Move(unit_t* u) {
@@ -5757,8 +6181,22 @@ struct state_functions {
 						if (order->id == Orders::RallyPointUnit) {
 							if (unit_is_factory(u)) {
 								if (!target) target = u;
-								u->building.rally.unit = target;
-								u->building.rally.pos = target->sprite->position;
+								// open1161HD split rally: a rally onto a RESOURCE sets
+								// the worker-only rally (spawned workers auto-gather it);
+								// a rally onto anything else is the vanilla unit rally.
+								// The two are independent, so one town hall can auto-mine
+								// its workers AND rally its army elsewhere at once.
+								bool is_resource = st.game->qol.worker_rally_split
+								    && (unit_is_mineral_field(target)
+								    || unit_is(target, UnitTypes::Resource_Vespene_Geyser)
+								    || unit_is_refinery(target));
+								if (is_resource && target != u) {
+									u->building.worker_rally.unit = target;
+									u->building.worker_rally.pos = target->sprite->position;
+								} else {
+									u->building.rally.unit = target;
+									u->building.rally.pos = target->sprite->position;
+								}
 							}
 						} else if (order->id == Orders::RallyPointTile) {
 							if (unit_is_factory(u)) {
@@ -6179,8 +6617,11 @@ struct state_functions {
 			u->order_state = 1;
 		} else if (u->order_state == 1) {
 			if (u->main_order_timer <= 45 || unit_is_at_move_target(u)) {
+				// The advisor line: 127 + race, see the play_sound override.
+				// Deliberately unconditional, as in retail -- everyone hears a
+				// launch. Whether the TEXT is shown is the UI's call.
 				play_sound(127, true);
-				// todo: callback for message
+				on_nuke_launch(u->order_target.pos);   // was: todo: callback for message
 				u->order_state = 2;
 			}
 		} else if (u->order_state == 2) {
@@ -7608,14 +8049,59 @@ struct state_functions {
 	}
 
 	void order_Neutral(unit_t* u) {
+		// open1161HD: a neutral (rescuable) unit joins a nearby HUMAN player -- its
+		// team colour changes to that player's -- the way a campaign neutral base is
+		// handed over when you reach it. Revolution's Antiga base is a controller-7
+		// neutral player that holds the map's ONLY Command Center + production, the
+		// player starts with no SCV/CC, and there is no give-units trigger: the
+		// mission is unwinnable unless approaching the base transfers it. Minerals,
+		// geysers and critters never join (they would wreck melee -- and the neutral
+		// player owns none of them here anyway). Throttled to ~15 frames like
+		// rescue_passive; a computer's units cannot grab it by proximity (they must
+		// attack it, which takes the revolt path below).
+		if (u->main_order_timer == 0 && !unit_is_critter(u->unit_type)
+		    && !unit_is_mineral_field(u) && !unit_is(u, UnitTypes::Resource_Vespene_Geyser)) {
+			u->main_order_timer = 15;
+			for (unit_t* n : find_units_noexpand(square_at(u->sprite->position, 64))) {
+				if (n == u) continue;
+				if (us_hidden(n)) continue;
+				if (st.players[n->owner].controller != player_t::controller_occupied) continue;
+				give_unit_to(u, n->owner);
+				return;
+			}
+		}
 		unit_t* target = u->auto_target_unit;
 		if (target) {
 			u->auto_target_unit = nullptr;
 			if (!us_hidden(target) && !unit_target_is_undetected(u, target) && target->owner != u->owner) {
+				// A provoked neutral player turns hostile and its units start
+				// acting as a computer player (v0.21 slice A: Guard behavior).
 				st.players[u->owner].controller = player_t::controller_computer_game;
 				st.alliances[u->owner][target->owner] = 0;
 				st.alliances[target->owner][u->owner] = 0;
-				error("a neutral unit attacked something. this triggers computer player behavior which is not supported yet :(");
+				set_unit_order(u, get_order_type(Orders::Guard));
+			}
+		}
+	}
+
+	void order_RescuePassive(unit_t* u) {
+		// fixme: approximation. The exact search area and tie-breaking order
+		// of the original rescue check are unverified; original BW rescues a
+		// unit when an active player's unit comes near it.
+		if (u->main_order_timer == 0) {
+			u->main_order_timer = 15;
+			for (unit_t* n : find_units_noexpand(square_at(u->sprite->position, 64))) {
+				if (n == u) continue;
+				if (us_hidden(n)) continue;
+				auto c = st.players[n->owner].controller;
+				// open1161HD: rescue only to the HUMAN (occupied), never a computer.
+				// A campaign's rescuable units (Norad II/terran06: the crash-site
+				// garrison + Norad II) are meant for the player; letting a nearby
+				// COMPUTER zerg grab them by proximity ("zergai perima kontrolę") both
+				// robbed the player and handed the enemy a free base.
+				if (c != player_t::controller_occupied) continue;
+				give_unit_to(u, n->owner);
+				break;
 			}
 		}
 	}
@@ -7956,6 +8442,12 @@ struct state_functions {
 		case Orders::Pickup4:
 			error("Pickup4");
 			break;
+		case Orders::PowerupIdle:
+			// A (#144): a ground powerup checks each frame for a worker sent to
+			// pick it up. Previously fell through to the switch default (a no-op),
+			// which is why powerups sat un-pickable.
+			order_PowerupIdle(u);
+			break;
 		case Orders::WatchTarget:
 			order_WatchTarget(u);
 			break;
@@ -8077,46 +8569,63 @@ struct state_functions {
 			error("CTFCOP2");
 			break;
 		case Orders::ComputerAI:
-			error("ComputerAI");
+			// v0.21 slice A: until the aiscript VM lands, computer units use
+			// Guard behavior (return fire, chase targets in range) instead of
+			// crashing. Buildings and workers idle like their human idle order.
+			if (u_grounded_building(u) || ut_worker(u)) set_unit_order(u, u->unit_type->human_ai_idle);
+			else set_unit_order(u, get_order_type(Orders::Guard));
 			break;
 		case Orders::AtkMoveEP:
-			error("AtkMoveEP");
-			break;
 		case Orders::HarassMove:
-			error("HarassMove");
+			// AI-only movement orders: behave like an attack-move until the
+			// dedicated implementations exist.
+			order_AttackMove(u);
 			break;
 		case Orders::AIPatrol:
-			error("AIPatrol");
-			break;
 		case Orders::GuardPost:
-			error("GuardPost");
+			// AI-only guard orders (e.g. overlord/creature computer idle):
+			// fall back to Guard behavior like ComputerAI does.
+			set_unit_order(u, get_order_type(Orders::Guard));
 			break;
 		case Orders::RescuePassive:
-			error("RescuePassive");
+			order_RescuePassive(u);
 			break;
 		case Orders::Neutral:
 			order_Neutral(u);
 			break;
 		case Orders::ComputerReturn:
-			error("ComputerReturn");
+			// See ComputerAI above: fall back to Guard until the aiscript VM.
+			set_unit_order(u, get_order_type(u_grounded_building(u) ? Orders::Nothing : Orders::Guard));
 			break;
 		case Orders::InitializePsiProvider:
 			order_InitializePsiProvider(u);
 			break;
+		// The installation door/trap orders. v0.83.002 stopped them throwing
+		// (they made The Jacobs Installation, The Amerigo, protoss06, expterran07
+		// unplayable). v0.83.012 animated doors via the "set doodad state"
+		// trigger. v0.83.014 closed the rest, grounded on tools/datdump:
+		//   - Door passability: set_unit_doodad_state toggles no_collide (doors
+		//     idle in Nothing; trigger-driven). Measured mechanism, verified
+		//     deterministic; walk-through still wants a hardware look.
+		//   - HiddenGun (order_HiddenGun, above): traps idle in THIS order, so it
+		//     is their firing loop -- reconstructed from the shipped Guard
+		//     acquisition. GUESSED behaviour, no upstream reference.
+		//   - opcode 35: implemented as a safe no-op in the interpreter (the trap
+		//     is its only user); see opc_setspawnframe.
+		// OpenDoor/CloseDoor/HideTrap/RevealTrap still idle: no unit idles in
+		// them (datdump), and the trigger path does not issue them.
 		case Orders::HiddenGun:
-			error("HiddenGun");
+			order_HiddenGun(u);
 			break;
+		// Doors idle in Nothing (measured); these orders exist but no unit idles
+		// in them -- they are trigger-issued transiently, and our trigger path
+		// goes straight through set_unit_doodad_state, so these stay idle.
+		// HideTrap/RevealTrap are the trap cloak pass, left cosmetic (traps idle
+		// in HiddenGun, not here).
 		case Orders::OpenDoor:
-			error("OpenDoor");
-			break;
 		case Orders::CloseDoor:
-			error("CloseDoor");
-			break;
 		case Orders::HideTrap:
-			error("HideTrap");
-			break;
 		case Orders::RevealTrap:
-			error("RevealTrap");
 			break;
 		case Orders::EnableDoodad:
 			error("EnableDoodad");
@@ -8180,10 +8689,49 @@ struct state_functions {
 
 	void rally_unit(unit_t* u, const unit_t* factory_unit) {
 		if (!unit_is_factory(factory_unit)) return;
+		// open1161HD split rally: a spawned WORKER prefers the worker-only rally (a
+		// resource) and auto-gathers it -- resolved exactly like a right-click, so it
+		// does not depend on the global smart_rally flag. Everyone else, and workers
+		// when no worker-rally is set, falls through to the vanilla `rally` below. The
+		// worker-rally is empty unless the player rallied onto a resource, so this is
+		// a no-op (byte-identical) for old games and replays.
+		auto wr = factory_unit->building.worker_rally;
+		if (ut_worker(u) && wr.unit && wr.pos.x) {
+			unit_t* rt = wr.unit;
+			const order_type_t* order = get_default_order(default_action(u), u, wr.pos, rt, nullptr);
+			if (order && order->id == Orders::AttackDefault) order = u->unit_type->attack_unit;
+			if (order && order->id != Orders::RallyPointUnit && order->id != Orders::RallyPointTile
+					&& unit_can_receive_order(u, order, u->owner)) {
+				if (rt) set_unit_order(u, order, rt);
+				else set_unit_order(u, order, wr.pos);
+				return;
+			}
+		}
 		auto target = factory_unit->building.rally;
 		if (target.unit == factory_unit) return;
 		if (target.pos.x) {
-			if (target.unit && target.unit->owner == u->owner) {
+			if (smart_rally || st.game->qol.smart_rally) {
+				// Resolve the rally target exactly as a right-click would, so
+				// workers rallied to minerals OR a gas refinery auto-gather and
+				// combat units rallied to an enemy attack. This must run BEFORE the
+				// "follow friendly unit" case: a rally onto your OWN refinery
+				// (owner == u->owner) would otherwise hit Follow and never gather -
+				// exactly why mineral rally (neutral fields) worked but gas
+				// (player-owned refinery) never did. Falls back to Follow for a
+				// friendly non-resource unit, or Move for empty ground.
+				unit_t* rt = target.unit;
+				const order_type_t* order = get_default_order(default_action(u), u, target.pos, rt, nullptr);
+				if (order && order->id == Orders::AttackDefault) order = u->unit_type->attack_unit;
+				if (order && order->id != Orders::RallyPointUnit && order->id != Orders::RallyPointTile
+						&& unit_can_receive_order(u, order, u->owner)) {
+					if (rt) set_unit_order(u, order, rt);
+					else set_unit_order(u, order, target.pos);
+				} else if (rt && rt->owner == u->owner) {
+					set_unit_order(u, get_order_type(Orders::Follow), rt);
+				} else {
+					set_unit_order(u, get_order_type(Orders::Move), target.pos);
+				}
+			} else if (target.unit && target.unit->owner == u->owner) {
 				set_unit_order(u, get_order_type(Orders::Follow), target.unit);
 			} else {
 				set_unit_order(u, get_order_type(Orders::Move), target.pos);
@@ -8924,6 +9472,16 @@ struct state_functions {
 			if (new_pos.x <= u->terrain_no_collision_bounds.to.x && new_pos.y <= u->terrain_no_collision_bounds.to.y) return false;
 		}
 
+		// v1.0.10: every contour that overlaps the box of the move blocks it. Upstream let a
+		// contour with both end flags (0x30) through unless it reached past the box -- so a
+		// small obstacle lying wholly inside a LONG move was missed. Short per-frame moves
+		// never contain a whole contour, which is why this stayed hidden; the long ones are
+		// the weld spots a constructing SCV picks (order_ConstructingBuilding), where a
+		// collision costs two more random draws and so shifts the whole game. Measured
+		// against the real game (SC:R 1.23.9, tools/scrprobe.py): replay d17, frame 9405,
+		// SCV at 1222,139 -> 1082,47 past a 16x24 px blob -- the real game makes 12 draws,
+		// upstream 10. With this rule d17 and rep1v1_b play back clean and none of the
+		// other 49 replays of the corpus changes.
 		xy min_pos = pos;
 		xy max_pos = new_pos;
 		if (max_pos.x < min_pos.x) std::swap(min_pos.x, max_pos.x);
@@ -8935,9 +9493,7 @@ struct state_functions {
 				auto c = expand(*i);
 				if (c.v[0] < new_pos.y) break;
 				if (c.v[1] <= max_pos.x && c.v[2] >= min_pos.x) {
-					if (~c.flags & 0x30) return true;
-					if (c.v[1] <= min_pos.x) return true;
-					if (c.v[2] >= max_pos.x) return true;
+					return true;
 				}
 			}
 		}
@@ -8946,9 +9502,7 @@ struct state_functions {
 				auto c = expand(*i);
 				if (c.v[0] > new_pos.x) break;
 				if (c.v[1] <= max_pos.y && c.v[2] >= min_pos.y) {
-					if (~c.flags & 0x30) return true;
-					if (c.v[1] <= min_pos.y) return true;
-					if (c.v[2] >= max_pos.y) return true;
+					return true;
 				}
 			}
 		}
@@ -8957,9 +9511,7 @@ struct state_functions {
 				auto c = expand(*i);
 				if (c.v[0] > new_pos.y) break;
 				if (c.v[1] <= max_pos.x && c.v[2] >= min_pos.x) {
-					if (~c.flags & 0x30) return true;
-					if (c.v[1] <= min_pos.x) return true;
-					if (c.v[2] >= max_pos.x) return true;
+					return true;
 				}
 			}
 		}
@@ -8969,9 +9521,7 @@ struct state_functions {
 				auto c = expand(*i);
 				if (c.v[0] < new_pos.x) break;
 				if (c.v[1] <= max_pos.y && c.v[2] >= min_pos.y) {
-					if (~c.flags & 0x30) return true;
-					if (c.v[1] <= min_pos.y) return true;
-					if (c.v[2] >= max_pos.y) return true;
+					return true;
 				}
 			}
 		}
@@ -9223,7 +9773,6 @@ struct state_functions {
 
 			all_nodes.clear();
 			open.clear();
-			goal_node = nullptr;
 
 			all_nodes.emplace_back();
 			node_t* start_node = &all_nodes.back();
@@ -9759,7 +10308,6 @@ struct state_functions {
 		};
 
 		auto pf_add_neighbor = [&](xy pos, int flags) {
-			if (!is_in_map_bounds(pos)) return;
 			if (pos == w.cur_pos) return;
 			bool is_goal = false;
 			if (w.target_unit) {
@@ -12594,7 +13142,10 @@ struct state_functions {
 			order_HarvestGas(u);
 			return;
 		case Orders::PowerupIdle:
-			error("hidden PowerupIdle");
+			// A (#144): a carried powerup is hidden and still holds PowerupIdle;
+			// while hidden it just waits (the carrier moves it), so this is a
+			// no-op rather than the old error stub.
+			return;
 			return;
 		case Orders::NukeLaunch:
 			order_NukeLaunch(u);
@@ -12627,10 +13178,12 @@ struct state_functions {
 			error("hidden EnterTransport");
 			break;
 		case Orders::ComputerAI:
-			error("hidden ComputerAI");
+			// Hidden computer units (in transports/bunkers) just wait, like
+			// the hidden PlayerGuard path does.
+			set_unit_order(u, get_order_type(u_in_bunker(u) ? Orders::BunkerGuard : Orders::Nothing));
 			break;
 		case Orders::RescuePassive:
-			error("hidden RescuePassive");
+			// rescuable units inside transports etc. just wait
 			break;
 		default:
 			break;
@@ -12740,6 +13293,8 @@ struct state_functions {
 				u->building.rally.pos = target->sprite->position;
 			}
 			test(u->building.rally.unit);
+			if (u->building.worker_rally.unit == target) u->building.worker_rally.pos = target->sprite->position;
+			test(u->building.worker_rally.unit);
 		}
 		if (unit_turret(u)) remove_target_references(unit_turret(u), target);
 		for (auto i = u->order_queue.begin(); i != u->order_queue.end();) {
@@ -13079,8 +13634,17 @@ struct state_functions {
 		} else if (p.controller == player_t::controller_computer) {
 			p.controller = player_t::controller_computer_defeated;
 		}
-		for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end();) {
-			unit_t* u = &*i++;
+		// v1.0.4: collect first, then hand over. Making one unit neutral can take
+		// others with it (the units inside a bunker or a transport, a building's
+		// addon), and when that was the NEXT unit of this list the loop walked on
+		// through the neutral player's list -- every mineral field and critter on
+		// the map -- until something threw (measured: campaign terran06, a defeat
+		// at frame ~8000 ended in "array::at" instead of the defeat screen). The
+		// order is the list's order, as before; a unit already handed over is skipped.
+		a_vector<unit_t*> owned;
+		for (unit_t* u : ptr(st.player_units[owner])) owned.push_back(u);
+		for (unit_t* u : owned) {
+			if (u->owner != owner) continue;
 			make_unit_neutral(u);
 		}
 	}
@@ -13106,6 +13670,11 @@ struct state_functions {
 	void process_triggers() {
 		int timer_step = 42;
 
+		if (st.countdown_timer_ms > 0 && !st.countdown_paused) {
+			st.countdown_timer_ms -= timer_step;
+			if (st.countdown_timer_ms < 0) st.countdown_timer_ms = 0;
+		}
+
 		for (size_t i = 0; i != 12; ++i) {
 			if (!st.trigger_waiting[i]) continue;
 			auto& t = st.trigger_wait_timers[i];
@@ -13125,6 +13694,8 @@ struct state_functions {
 		}
 		st.trigger_timer = 30;
 
+		if (st.dbg_skip_triggers) return;   // harness UMS-desync probe (never set in gated paths)
+
 		execute_trigger_struct ets;
 
 		bool any_triggers_executed = false;
@@ -13134,16 +13705,41 @@ struct state_functions {
 				auto& t = *rt.t;
 				bool execute_now = true;
 				if (~rt.flags & 1) {
+					size_t ci = 0;
 					for (auto& c : t.conditions) {
 						if (c.type == 0) break;
+						++ci;
+						if (c.flags & 2) continue; // condition disabled in editor
 						if (!test_trigger_condition(c, i)) {
+							// Periodic full snapshot rather than per-evaluation:
+							// triggers are polled every 30 frames, so logging
+							// each failure would bury the signal. Every
+							// condition is dumped, not just the one that
+							// failed -- a gating condition earlier in the list
+							// otherwise hides the interesting ones behind it.
+							if (trigger_tracing() && st.current_frame % 600 == 2) {
+								int idx = (int)(&rt - st.running_triggers[i].data());
+								size_t cj = 0;
+								for (auto& c2 : t.conditions) {
+									if (c2.type == 0) break;
+									++cj;
+									trigger_trace_sink()(format(
+									    "trace f%d p%d trig#%d cond%d type=%d grp=%d unit=%d cmp=%d count=%d extra=%d loc=%d -> %s%s\n",
+									    (int)st.current_frame, i, idx, (int)cj, c2.type, c2.group, c2.unit_id,
+									    c2.num_n, c2.count_n, c2.extra_n, c2.location,
+									    (c2.flags & 2) ? "disabled" : (test_trigger_condition(c2, i) ? "ok" : "FAIL"),
+									    c2.type == 4 ? format(" (have=%d)", trigger_group_resources(i, c2.group, c2.extra_n)).c_str() : ""));
+								}
+							}
 							execute_now = false;
 							break;
 						}
 					}
+					// Fresh execution starts from the first action; a trigger
+					// resuming from a Wait (flags & 1) continues where it left off.
+					if (execute_now) rt.current_action_index = 0;
 				}
 				if (execute_now) {
-					rt.current_action_index = 0;
 					execute_trigger(ets, i, rt, t);
 					any_triggers_executed = true;
 				}
@@ -13192,6 +13788,7 @@ struct state_functions {
 		++st.current_frame;
 		process_frame();
 		process_triggers();
+		process_ai();
 	}
 
 	int lcg_rand(int source) {
@@ -13643,7 +14240,26 @@ struct state_functions {
 			kill_unit(u);
 			// todo: units lost scores
 			if (source_unit && unit_target_is_enemy(source_unit, u)) {
-				// todo: kill scores
+				// Kill accounting for triggers (Kills condition) and scores
+				// (Kills/Razings score types). Deterministic sim state.
+				if (!ut_turret(u)) {
+					int killer = source_unit->owner;
+					// v0.83.004: credit the KILLING UNIT too, not just its owner.
+					// unit_t::kill_count existed and the HUD already knew how to
+					// draw it -- my own comment there even claimed the sim
+					// maintained it. Nothing did: the only mention in the engine
+					// was one unit inheriting another's tally on transform, and a
+					// reset. So every unit showed zero kills forever.
+					// A turret's kills belong to the machine it sits on (a siege
+					// tank has one record, not two).
+					unit_t* credit = unit_main_unit(source_unit);
+					if (credit && credit->kill_count < 0x7fffffff) ++credit->kill_count;
+					if (killer < 12) {
+						++st.unit_kills[killer][u->unit_type->id];
+						if (u->unit_type->group_flags & GroupFlags::Building) st.razings_score[killer] += u->unit_type->destroy_score;
+						else st.kills_score[killer] += u->unit_type->destroy_score;
+					}
+				}
 			}
 		}
 	}
@@ -13653,6 +14269,32 @@ struct state_functions {
 		xy offset = get_image_lo_offset(target->sprite->main_image, 5, index, true);
 		auto* image = create_image(get_image_type(ImageTypes::IMAGEID_Shield_Overlay), target->sprite, offset, image_order_above);
 		if (image) set_image_heading_by_index(image, index);
+	}
+
+	// Damage-type x target-size factor (fp8, 256_fp8 = full). BW damage table:
+	// Explosive 50/75/100, Concussive 100/50/25 for Small/Medium/Large; Normal
+	// and IgnoreArmor 100 for every size; Independent (damage_type_none) 0.
+	// Independent-SIZE (0) targets take 0 from Explosive/Concussive. Pure helper
+	// so tools/combatcheck can byte-diff it against the grp-toolkit combat
+	// reference. `damage *= f` reproduces the original per-case switch exactly:
+	// 256_fp8 leaves damage unchanged (shift by 8 is exact), 0_fp8 zeroes it.
+	static fp8 damage_size_factor(int damage_type, int unit_size) {
+		switch (damage_type) {
+		case weapon_type_t::damage_type_none:
+			return 0_fp8;
+		case weapon_type_t::damage_type_explosive:
+			if (unit_size == 0) return 0_fp8;
+			if (unit_size == 1) return 128_fp8;
+			if (unit_size == 2) return 192_fp8;
+			return 256_fp8;
+		case weapon_type_t::damage_type_concussive:
+			if (unit_size == 0) return 0_fp8;
+			if (unit_size == 2) return 128_fp8;
+			if (unit_size == 3) return 64_fp8;
+			return 256_fp8;
+		default: // damage_type_normal, damage_type_ignore_armor
+			return 256_fp8;
+		}
 	}
 
 	void weapon_deal_damage(const weapon_type_t* weapon, fp8 damage, int damage_divisor, unit_t* target, direction_t heading, unit_t* source_unit, int source_owner) {
@@ -13686,25 +14328,7 @@ struct state_functions {
 			if (damage > armor) damage -= armor;
 			else damage = 0_fp8;
 		}
-		switch (weapon->damage_type) {
-		case weapon_type_t::damage_type_none:
-			damage = 0_fp8;
-			break;
-		case weapon_type_t::damage_type_explosive:
-			if (target->unit_type->unit_size == 0) damage = 0_fp8;
-			else if (target->unit_type->unit_size == 1) damage *= 128_fp8;
-			else if (target->unit_type->unit_size == 2) damage *= 192_fp8;
-			break;
-		case weapon_type_t::damage_type_concussive:
-			if (target->unit_type->unit_size == 0) damage = 0_fp8;
-			else if (target->unit_type->unit_size == 2) damage *= 128_fp8;
-			else if (target->unit_type->unit_size == 3) damage *= 64_fp8;
-			break;
-		case weapon_type_t::damage_type_normal:
-			break;
-		case weapon_type_t::damage_type_ignore_armor:
-			break;
-		}
+		damage *= damage_size_factor(weapon->damage_type, target->unit_type->unit_size);
 		if (shield_damage == 0_fp8 && damage < 128_fp8) damage = 128_fp8;
 		unit_deal_damage(target, damage, source_unit, source_owner, weapon->id != WeaponTypes::Irradiate);
 		if (shield_damage != 0_fp8) {
@@ -13834,6 +14458,68 @@ struct state_functions {
 		if (!unit_is_carrier(u)) return;
 		for (unit_t* n : ptr(u->carrier.outside_units)) {
 			set_unit_order(n, get_order_type(Orders::InterceptorReturn));
+		}
+	}
+
+	// Enable/disable a "doodad" unit -- installation doors, traps, and any
+	// building a trigger switches off. Deliberately mirrors the enable/disable
+	// half of update_psionic_matrix(): flag, idle, and the matching iscript
+	// animation, in that order. Used by trigger action 42 and by the THG2
+	// loader for units the map marks as starting disabled.
+	void set_unit_doodad_state(unit_t* u, bool enable) {
+		if (!u || !u->sprite) return;
+		bool was_disabled = u_disabled(u);
+		if (enable == !was_disabled) return;
+		// v0.83.012: the v0.83.002 comment here claimed a door's Enable/Disable
+		// animation runs iscript opcode 35, so every door and trap was denied
+		// its animation. Measured, that was wrong. A census of the retail
+		// iscript.bin (the loader's own decoder, which knows the operand
+		// widths) finds opcode 35 exactly ONCE in the whole file: script 345,
+		// operand 20 -- and images.dat/sprites.dat/flingy.dat/units.dat trace
+		// script 345 to image 736 -> sprite 308 -> flingy 179 -> unit 203,
+		// Special_Floor_Missile_Trap, in its aiming loop next to attackwith and
+		// curdirectcondjmp.
+		//
+		// The doors run script 340/341, which use only playfram, wait, goto,
+		// end and sigorder. Their Enable animation steps frame 9 -> 0 and their
+		// Disable steps 0 -> 9, each ending in sigorder 1. So they can animate.
+		// Only the one trap still cannot.
+		bool animate = !unit_is(u, UnitTypes::Special_Floor_Missile_Trap);
+		if (enable) {
+			u_unset_status_flag(u, unit_t::status_flag_disabled);
+			if (u->subunit) u_unset_status_flag(u->subunit, unit_t::status_flag_disabled);
+			if (animate && u_completed(u)) sprite_run_anim(u->sprite, iscript_anims::Enable);
+		} else {
+			u_set_status_flag(u, unit_t::status_flag_disabled);
+			if (u->subunit) u_set_status_flag(u->subunit, unit_t::status_flag_disabled);
+			if (animate) {
+				iscript_run_to_idle(u);
+				if (u_completed(u)) sprite_run_anim(u->sprite, iscript_anims::Disable);
+			}
+		}
+		// v0.83.014 (G4b) -- door PASSABILITY.
+		//
+		// DIRECTION (measured): rendering CRDoor1.grp (image 742) frame by frame
+		// shows frame 0 is the full, tall CLOSED door (6057 opaque px) and frame 9
+		// a thin line on the floor -- the OPEN door retracted flush (~800 px). The
+		// Enable animation ends on frame 0 (census 9->0), Disable on frame 9. So
+		// enable == closed == blocks; disable == open == passable.
+		//
+		// MECHANISM (measured, corrected from the v0.83.012 note): the lever is
+		// status_flag_no_collide, NOT tile_t::flag_occupied. flag_occupied is only
+		// read by building placement and creep/larva spawn; walking-unit collision
+		// skips a unit when u_no_collide(n) (see the movement collision loop:
+		// `if (u_no_collide(n)) continue;`). Region contours are STATIC terrain,
+		// built once at load from tile passability -- a door is a UNIT, never part
+		// of the contours, so nothing needs rebuilding: an open door just has to
+		// leave unit collision. units.dat (tools/datdump) confirms doors idle in
+		// order 23 Nothing -- they are trigger-driven, so this is the whole path.
+		//
+		// So: open door -> no_collide on (units walk through); closed -> off.
+		// A unit standing where a door closes keeps its position; it collides
+		// again on its next move (BW does not eject it either).
+		if (unit_is_door(u)) {
+			u_set_status_flag(u, unit_t::status_flag_no_collide, !enable);
 		}
 	}
 
@@ -14492,10 +15178,14 @@ struct state_functions {
 	}
 
 	bullet_t* create_bullet(const weapon_type_t* weapon_type, unit_t* source_unit, xy pos, int owner, direction_t heading) {
-		if (weapon_type->id == WeaponTypes::Halo_Rockets && st.active_bullets_size >= 80) return nullptr;
+		if (weapon_type->id == WeaponTypes::Halo_Rockets && (int)st.active_bullets_size >= game_st.halo_rocket_bullet_cap) {
+			// harness: 5 = Valkyrie rockets held back by the bullet threshold
+			if (!st.dbg_threshold_hits[0]++) st.dbg_threshold_first_frame[0] = (int)st.current_frame;
+			return nullptr;
+		}
 		if (u_cannot_attack(source_unit) && !is_spell(weapon_type)) return nullptr;
 		bullet_t* b = st.bullets_container.top();
-		if (!b) return nullptr;
+		if (!b) { if (!st.dbg_limit_hits[0]++) st.dbg_limit_first_frame[0] = (int)st.current_frame; return nullptr; }
 		if (!initialize_bullet(b, weapon_type, source_unit, pos, owner, heading)) {
 			return nullptr;
 		}
@@ -14539,7 +15229,11 @@ struct state_functions {
 			st.free_thingies.pop_front();
 			return r;
 		}
-		if (st.thingies.size() >= 500) return nullptr;
+		if (st.thingies.size() >= 500) {
+			// harness: 2 = an effect sprite ("thingy") not created, pool of 500 in use
+			if (!st.dbg_threshold_hits[2]++) st.dbg_threshold_first_frame[2] = (int)st.current_frame;
+			return nullptr;
+		}
 		return &*st.thingies.emplace(st.thingies.end());
 	}
 
@@ -14959,6 +15653,19 @@ struct state_functions {
 				if (noop) break;
 				if (iscript_unit) use_weapon(iscript_unit, (WeaponTypes)a);
 				break;
+			case opc_setspawnframe:
+				// v0.83.014 (G4b): the missile trap's aiming loop (script 345)
+				// is the ONLY user in the whole iscript.bin (census: opcode 35
+				// once, operand 20). Its authentic action -- a spawn
+				// direction/frame for the fired overlay -- is in no data file,
+				// so this is a safe operand-consuming no-op (width "1"): the
+				// weapon still fires and homes via order_target; only the
+				// spawned sprite's initial facing may differ (cosmetic).
+				// Without this case the default throws the moment a trap fires,
+				// which is exactly what order_HiddenGun now makes happen.
+				a = *p++;
+				if (noop) break;
+				break;
 			case opc_move:
 				a = *p++;
 				if (distance_moved) {
@@ -15271,7 +15978,7 @@ struct state_functions {
 		if (!image_type)  error("attempt to create image of null type");
 
 		image_t* image = st.images_container.top();
-		if (!image) return nullptr;
+		if (!image) { if (!st.dbg_limit_hits[1]++) st.dbg_limit_first_frame[1] = (int)st.current_frame; return nullptr; }
 		st.images_container.pop();
 
 		if (sprite->images.empty()) {
@@ -15307,7 +16014,7 @@ struct state_functions {
 		if (!sprite_type)  error("attempt to create sprite of null type");
 
 		sprite_t* sprite = st.sprites_container.top();
-		if (!sprite) return nullptr;
+		if (!sprite) { if (!st.dbg_limit_hits[2]++) st.dbg_limit_first_frame[2] = (int)st.current_frame; return nullptr; }
 		st.sprites_container.pop();
 
 		auto initialize_sprite = [&]() {
@@ -15491,13 +16198,13 @@ struct state_functions {
 	}
 
 	void unit_finder_reinsert(unit_t* u) {
-		if (u->unit_finder_bounding_box.to.x == -1) return;
+		if (u->unit_finder_bounding_box.from.x == -1) return;
 		rect bb = unit_sprite_inner_bounding_box(u);
 		unit_finder_reinsert(u, bb);
 	}
 
 	void unit_finder_remove(unit_t* u) {
-		if (u->unit_finder_bounding_box.to.x == -1) return;
+		if (u->unit_finder_bounding_box.from.x == -1) return;
 		if (unit_finder_search_index) error("attempt to modify unit finder while search is active");
 		auto remove = [&](auto& vec, int value) {
 			auto cmp_l = [&](auto& a, int b) {
@@ -16271,8 +16978,10 @@ struct state_functions {
 		u->previous_hp = 1;
 
 		u->building.rally = {};
+		u->building.worker_rally = {};
 
 		if (!initialize_unit_type(u, unit_type, pos, owner)) return false;
+		if (u->index < 1700) for (auto& ai : st.ai_players) { ai.garrison.reset(u->index); ai.wave.reset(u->index); }
 
 		new (&u->build_queue) static_vector<const unit_type_t*, 5>();
 		new (&u->build_queue_limbo) static_vector<const unit_type_t*, 5>();
@@ -16321,6 +17030,7 @@ struct state_functions {
 		auto get_new = [&](const unit_type_t* unit_type) {
 			unit_t* u = st.units_container.top();
 			if (!u) {
+				if (!st.dbg_limit_hits[3]++) st.dbg_limit_first_frame[3] = (int)st.current_frame;
 				st.last_error = 61; // Cannot create more units
 				return (unit_t*)nullptr;
 			}
@@ -16529,7 +17239,13 @@ struct state_functions {
 			return u_flying(u) == u_flying(target);
 		};
 		const unit_t* blocking_unit = find_unit(unit_inner_bounding_box(u, pos), blocking_unit_pred);
-		if (!blocking_unit && is_in_bounds(unit_inner_bounding_box(u, pos), {{0, 0}, {(int)game_st.map_width, (int)game_st.map_height - 32}})) {
+		// v1.0.11: the last usable pixel row is map_height - 32 - 1 (as the clamp of `bounds`
+		// above says); upstream tested against map_height - 32, one row too far. A unit whose
+		// box reached that row counted as inside, failed the terrain fit and -- for an unload
+		// (terrain_displaces_unit == false) -- the whole placement was refused. Measured against
+		// the real game (SC:R 1.23.9, replay d06 frame 17277): a dropship at 1872,4049 on a
+		// 4096 px high map unloads its tank at 1872,4040; upstream refused for 66 frames.
+		if (!blocking_unit && is_in_bounds(unit_inner_bounding_box(u, pos), {{0, 0}, {(int)game_st.map_width - 1, (int)game_st.map_height - 32 - 1}})) {
 			if (u_flying(u) || unit_type_can_fit_at(u->unit_type, pos)) return {true, pos};
 			if (!terrain_displaces_unit) {
 				st.last_error = 60;
@@ -16778,7 +17494,7 @@ struct state_functions {
 
 	order_t* create_order(const order_type_t* order_type, order_target_t target) {
 		order_t* o = st.orders_container.top();
-		if (!o) return nullptr;
+		if (!o) { if (!st.dbg_limit_hits[4]++) st.dbg_limit_first_frame[4] = (int)st.current_frame; return nullptr; }
 		st.orders_container.pop();
 		++st.active_orders_size;
 		o->order_type = order_type;
@@ -16848,8 +17564,10 @@ struct state_functions {
 			}
 		}
 		if (queue) {
-			if (u->order_queue_count < 8 && st.active_orders_size < 1800) {
+			if (u->order_queue_count < 8 && (int)st.active_orders_size < game_st.order_queue_cap) {
 				queue_order_back(u, order_type, target);
+			} else if (u->order_queue_count < 8) {
+				if (!st.dbg_threshold_hits[1]++) st.dbg_threshold_first_frame[1] = (int)st.current_frame;
 			}
 		} else {
 			set_unit_order(u, order_type, target);
@@ -17199,14 +17917,27 @@ struct state_functions {
 			u->secondary_order_timer = 0;
 		}
 		if (st.players[u->owner].controller == player_t::controller_rescue_passive) {
-			error("fixme rescue passive");
+			set_unit_order(u, get_order_type(Orders::RescuePassive));
 		} else {
 			if (st.players[u->owner].controller == player_t::controller_neutral) set_unit_order(u, get_order_type(Orders::Neutral));
 			else if (st.players[u->owner].controller == player_t::controller_computer_game) set_unit_order(u, u->unit_type->computer_ai_idle);
 			else set_unit_order(u, u->unit_type->human_ai_idle);
 		}
-		if (ut_flag(u, (unit_type_t::flags_t)0x800)) {
-			error("fixme unknown flag");
+		// v0.83.002: 0x800 is flag_powerup (data_types.h:93), not an unknown
+		// flag, and throwing here made four missions unloadable: zerg01, zerg02
+		// and both Brood War protoss missions that hand out crystals -- The
+		// Quest for Uraj among them. Recording the drop-back point (where the
+		// item was placed) is what let those maps LOAD.
+		// ⚠️ CORRECTION (v0.83.036): the original comment here claimed powerup
+		// CARRY was "already implemented (worker.powerup, the pick-up orders,
+		// drop_carried_items)" -- that is FALSE. worker.powerup is never assigned
+		// (pickup unimplemented) and drop_carried_items (2356) is a `fixme` stub.
+		// So a worker cannot pick up a powerup, which is why Egression's Chrysalis
+		// cannot be carried by a Drone. The read side (this origin, the trigger
+		// predicate at 19503, follow-origin at 6677) exists; the write side does
+		// not.
+		if (ut_powerup(u)) {
+			u->building.powerup.origin = u->sprite->position;
 		}
 		u->air_strength = get_unit_strength(u, false);
 		u->ground_strength = get_unit_strength(u, true);
@@ -17239,8 +17970,19 @@ struct state_functions {
 		return u;
 	}
 
+	// Record which player just failed an action, so ui.h poll_last_error() can
+	// show it (the sim has no notion of the local player). The error CODE is in
+	// st.last_error, set by the failing operation immediately before this call
+	// (find_unit_placement -> 60, create_unit -> 61/62); every call site in this
+	// file follows that pattern, so st.last_error is current here.
+	//
+	// stat_txt.tbl holds the error family at entries 843..902 (sixty strings,
+	// codes 0..59), measured with `aidump tbl`. Our 60/61/62 are out-of-range
+	// engine sentinels -- 843+60 would be "Die", an order name -- so the UI
+	// remaps them to real placement/creation strings; the mapping lives there.
 	void display_last_error_for_player(int player) {
-		// todo
+		st.last_error_player = player;
+		st.last_error_frame = (int)st.current_frame;
 	}
 
 	bool player_has_unit(int owner, UnitTypes unit_type_id) const {
@@ -18647,7 +19389,16 @@ struct state_functions {
 		if (u_hallucination(u)) return false;
 		if (unit_is_disabled(u)) return false;
 		int owner = u->owner;
-		if (!player_tech_available(owner, tech->id)) return false;
+		// Heroes wield their innate abilities regardless of the player's
+		// tech-availability table (PTEC). Infested Kerrigan is a Zerg-owned unit
+		// casting Psionic Storm -- a Protoss tech her owner never has "available"
+		// -- so this gate silently blocked the hero exceptions the per-tech cases
+		// below already encode (Kerrigan/Tassadar for Psi Storm, etc.), leaving
+		// that code unreachable and her spells dead. The per-tech cases still
+		// restrict WHICH heroes may use each tech, so heroes gain only their
+		// intended kit; non-heroes keep the availability gate unchanged. Melee
+		// has no heroes -> the replay/LAN determinism path is byte-identical.
+		if (!ut_hero(u) && !player_tech_available(owner, tech->id)) return false;
 		switch (tech->id) {
 		case TechTypes::Stim_Packs:
 			if (!ut_hero(u) && !player_has_researched(owner, TechTypes::Stim_Packs)) return false;
@@ -18797,23 +19548,23 @@ struct state_functions {
 				else if (unit_id == 230) r += count_obj.completed_non_building_counts[p];
 				else if (unit_id == 231) r += count_obj.completed_building_counts[p];
 				else if (unit_id == 232) r += count_obj.completed_factory_counts[p];
-				else r += count_obj.completed_unit_counts[p].at((UnitTypes)unit_id);
+				else if ((size_t)unit_id < 228) r += count_obj.completed_unit_counts[p].at((UnitTypes)unit_id);
 			} else {
 				if (unit_id == 229) r += count_obj.non_building_counts[p] + count_obj.building_counts[p];
 				else if (unit_id == 230) r += count_obj.non_building_counts[p];
 				else if (unit_id == 231) r += count_obj.building_counts[p];
 				else if (unit_id == 232) r += count_obj.factory_counts[p];
-				else r += count_obj.unit_counts[owner].at((UnitTypes)unit_id);
+				else if ((size_t)unit_id < 228) r += count_obj.unit_counts[p].at((UnitTypes)unit_id);
 			}
 		}
 		return r;
 	}
 
 	bool trigger_count_comparison(const trigger::condition& c, int count) const {
-		if (c.num_n == 0) return count >= c.count_n;
-		else if (c.num_n == 1) return count <= c.count_n;
-		else if (c.num_n == 2) return count == c.count_n;
-		else return false;
+		if (c.num_n == 0) return count >= c.count_n; // at least
+		else if (c.num_n == 1) return count <= c.count_n; // at most
+		// "exactly" is 10 in the CHK format (2 kept for safety)
+		else return count == c.count_n;
 	}
 
 	struct bring_unit_counters {
@@ -18884,20 +19635,140 @@ struct state_functions {
 		return r;
 	}
 
+	// Aggregate a per-player, per-unit-type counter table (kills/deaths) over a
+	// trigger player group, honoring the group unit ids (229 any, 230 men,
+	// 231 buildings, 232 factories).
+	int trigger_table_count(const std::array<type_indexed_array<int32_t, UnitTypes>, 12>& tbl, int owner, int player, int unit_id, bool eud = false) const {
+		int r = 0;
+		for (int p : trigger_players(owner, player)) {
+			if (unit_id == 229 || unit_id == 230 || unit_id == 231 || unit_id == 232) {
+				for (size_t i = 0; i != 228; ++i) {
+					const unit_type_t* ut = get_unit_type((UnitTypes)i);
+					if (unit_id == 230 && (~ut->group_flags & GroupFlags::Men)) continue;
+					if (unit_id == 231 && (~ut->group_flags & GroupFlags::Building)) continue;
+					if (unit_id == 232 && (~ut->group_flags & GroupFlags::Factory)) continue;
+					r += tbl[p].at((UnitTypes)i);
+				}
+			} else if ((size_t)unit_id < 228) {
+				r += tbl[p].at((UnitTypes)unit_id);
+			} else if (eud) {
+				// EUD (v0.25): out-of-range deaths slots are widely used as
+				// extra variables by modern UMS maps. Back them with a sparse
+				// map instead of crashing (address-emulation of real engine
+				// memory is out of scope).
+				auto i = st.eud_deaths.find((uint32_t)unit_id * 12u + (uint32_t)p);
+				if (i != st.eud_deaths.end()) r += i->second;
+			}
+		}
+		return r;
+	}
+
+	int trigger_player_resources(int p, int type) const {
+		int r = 0;
+		if (type == 0 || type == 2) r += st.current_minerals.at(p);
+		if (type == 1 || type == 2) r += st.current_gas.at(p);
+		return r;
+	}
+
+	// Score types: 0 total, 1 units, 2 buildings, 3 units+buildings, 4 kills,
+	// 5 razings, 6 kills+razings, 7 custom.
+	int trigger_player_score(int p, int type) const {
+		switch (type) {
+		case 0: return st.unit_score.at(p) + st.building_score.at(p) + st.kills_score.at(p) + st.razings_score.at(p) + st.custom_score.at(p);
+		case 1: return st.unit_score.at(p);
+		case 2: return st.building_score.at(p);
+		case 3: return st.unit_score.at(p) + st.building_score.at(p);
+		case 4: return st.kills_score.at(p);
+		case 5: return st.razings_score.at(p);
+		case 6: return st.kills_score.at(p) + st.razings_score.at(p);
+		case 7: return st.custom_score.at(p);
+		default: return 0;
+		}
+	}
+
+	int trigger_group_resources(int owner, int player, int type) const {
+		int r = 0;
+		for (int p : trigger_players(owner, player)) r += trigger_player_resources(p, type);
+		return r;
+	}
+
+	int trigger_group_score(int owner, int player, int type) const {
+		int r = 0;
+		for (int p : trigger_players(owner, player)) r += trigger_player_score(p, type);
+		return r;
+	}
+
+	// Elapsed game time in seconds. The sim runs one frame per 42 ms of game
+	// time (the same base used by trigger Wait timers), so a trigger "second"
+	// is 1000 ms of accumulated 42 ms frames.
+	int trigger_elapsed_seconds() const {
+		return (int)((int64_t)st.current_frame * 42 / 1000);
+	}
+
+	// "Command the Most/Least"-family evaluator: whether the trigger owner's
+	// count is the maximum (or minimum) among all active players. Ties count.
+	template<typename F>
+	bool trigger_owner_extreme(int owner, bool most, F&& count_of) const {
+		if (!player_slot_active(owner)) return false;
+		int own = count_of(owner);
+		for (int p : active_players()) {
+			if (p == owner) continue;
+			int v = count_of(p);
+			if (most ? v > own : v < own) return false;
+		}
+		return true;
+	}
+
 	bool test_trigger_condition(const trigger::condition& c, int owner) const {
 		switch (c.type) {
+		case 1: // countdown timer (seconds)
+			return trigger_count_comparison(c, st.countdown_timer_ms / 1000);
 		case 2: // command
 			return trigger_count_comparison(c, trigger_command_count(st, owner, c.group, c.unit_id, c.num_n != 1));
 		case 3: // bring
 			return trigger_count_comparison(c, trigger_command_count(trigger_bring_count(st.locations.at(c.location - 1)), owner, c.group, c.unit_id, c.num_n != 1));
-		case 12: // elapsed time
-			return trigger_count_comparison(c, st.current_frame);
+		case 4: // accumulate
+			return trigger_count_comparison(c, trigger_group_resources(owner, c.group, c.extra_n));
+		case 5: // kills
+			return trigger_count_comparison(c, trigger_table_count(st.unit_kills, owner, c.group, c.unit_id));
+		case 6: // command the most
+			return trigger_owner_extreme(owner, true, [&](int p) { return trigger_command_count(st, p, 13, c.unit_id, true); });
+		case 7: // command the most at
+			return trigger_owner_extreme(owner, true, [&](int p) { return trigger_command_count(trigger_bring_count(st.locations.at(c.location - 1)), p, 13, c.unit_id, true); });
+		case 8: // most kills
+			return trigger_owner_extreme(owner, true, [&](int p) { return trigger_table_count(st.unit_kills, p, 13, c.unit_id); });
+		case 9: // highest score
+			return trigger_owner_extreme(owner, true, [&](int p) { return trigger_player_score(p, c.extra_n); });
+		case 10: // most resources
+			return trigger_owner_extreme(owner, true, [&](int p) { return trigger_player_resources(p, c.extra_n); });
+		case 11: // switch (num_n: 2 = set, 3 = cleared)
+			return st.trigger_switches.at((size_t)(uint8_t)c.extra_n) == (c.num_n == 2);
+		case 12: // elapsed time (seconds)
+			return trigger_count_comparison(c, trigger_elapsed_seconds());
+		case 13: // data is a mission briefing — never true in-game
+			return false;
 		case 14: // opponents
 			return trigger_count_comparison(c, trigger_opponent_count(owner, c.group));
+		case 15: // deaths
+			return trigger_count_comparison(c, trigger_table_count(st.unit_deaths, owner, c.group, c.unit_id, true));
+		case 16: // command the least
+			return trigger_owner_extreme(owner, false, [&](int p) { return trigger_command_count(st, p, 13, c.unit_id, true); });
+		case 17: // command the least at
+			return trigger_owner_extreme(owner, false, [&](int p) { return trigger_command_count(trigger_bring_count(st.locations.at(c.location - 1)), p, 13, c.unit_id, true); });
+		case 18: // least kills
+			return trigger_owner_extreme(owner, false, [&](int p) { return trigger_table_count(st.unit_kills, p, 13, c.unit_id); });
+		case 19: // lowest score
+			return trigger_owner_extreme(owner, false, [&](int p) { return trigger_player_score(p, c.extra_n); });
+		case 20: // least resources
+			return trigger_owner_extreme(owner, false, [&](int p) { return trigger_player_resources(p, c.extra_n); });
+		case 21: // score
+			return trigger_count_comparison(c, trigger_group_score(owner, c.group, c.extra_n));
 		case 22: // always
 			return true;
+		case 23: // never
+			return false;
 		default:
-			error("unknown trigger condition %d\n", c.type);
+			// Unknown/EUD-extended condition: treat as not met, don't crash the game.
 			return false;
 		}
 	}
@@ -18977,25 +19848,38 @@ struct state_functions {
 		case 15: return owner != n && st.alliances[owner][n] == 2; // ally
 		case 16: return owner != n && st.alliances[owner][n] == 1; // neutral
 		case 17: return true; // all players
-		case 18: return n < 8 && st.players[n].force == 1;
-		case 19: return n < 8 && st.players[n].force == 2;
-		case 20: return n < 8 && st.players[n].force == 3;
-		case 21: return n < 8 && st.players[n].force == 4;
+		// Force group ids 18-21 = Force 1-4; player force is 0-based (FORC).
+		case 18: return n < 8 && st.players[n].force == 0;
+		case 19: return n < 8 && st.players[n].force == 1;
+		case 20: return n < 8 && st.players[n].force == 2;
+		case 21: return n < 8 && st.players[n].force == 3;
 		case 26: return owner != n && (st.alliances[owner][n] != 2 || st.alliances[n][owner] != 2); // non allied victory
 		default: return false;
 		}
 	}
 
 	bool unit_is_at_elevation_flags(const unit_t* u, int elevation_flags) const {
+		// BW MRGN location elevation flags: a SET bit EXCLUDES that elevation.
+		//   bit0=low ground, bit1=med ground, bit2=high ground,
+		//   bit3=low air,   bit4=med air,   bit5=high air.
+		// So a GROUND unit is gated by the ground bits (1<<height) and a FLYING
+		// unit by the air bits (8<<height). Upstream OpenBW had these two branches
+		// SWAPPED (ground units tested against air bits and vice versa). Harmless
+		// for the common elevation_flags==0 location, but it makes any elevation-
+		// restricted Bring/Command @location resolve for the wrong movement class.
+		// The Big Push (terran08) win = Bring Psi Emitter @loc0 (flags 0x38 = exclude
+		// all air, keep ground): an SCV carries the emitter there on foot, but the
+		// swapped logic excluded the ground SCV (only air counted) so the victory
+		// trigger never fired. Fixed to the documented layout.
 		int ground_height = get_ground_height_at(u->sprite->position);
 		if (u_flying(u)) {
-			if (ground_height == 0) return (elevation_flags & 1) == 0;
-			if (ground_height == 1) return (elevation_flags & 2) == 0;
-			if (ground_height == 2) return (elevation_flags & 4) == 0;
-		} else {
 			if (ground_height == 0) return (elevation_flags & 8) == 0;
 			if (ground_height == 1) return (elevation_flags & 0x10) == 0;
 			if (ground_height == 2) return (elevation_flags & 0x20) == 0;
+		} else {
+			if (ground_height == 0) return (elevation_flags & 1) == 0;
+			if (ground_height == 1) return (elevation_flags & 2) == 0;
+			if (ground_height == 2) return (elevation_flags & 4) == 0;
 		}
 		return true;
 	}
@@ -19011,7 +19895,11 @@ struct state_functions {
 		}
 
 		if (unit_dying(u)) return false;
-		if (ut_powerup(u)) error("trigger_unit_pred: powerup");
+		// v0.83.002: a powerup lying on the ground used to throw here. It is the
+		// opposite of an edge case -- "bring the Uraj Crystal to this location"
+		// IS the Brood War protoss campaign, and that condition walks exactly
+		// this predicate. Carried powerups are already covered above via their
+		// carrier; a loose one now matches on owner and type like any unit.
 		if (!trigger_players_pred(owner, player, u->owner)) return false;
 		if (uid == 229) return true;
 		else if (uid == 230) {
@@ -19037,6 +19925,82 @@ struct state_functions {
 	struct execute_trigger_struct {
 		std::array<int, 12> victory_state{};
 	};
+
+	// Map string access at trigger runtime (CHK string refs are 1-based).
+	a_string trigger_string(size_t index) const {
+		if (index == 0) return a_string();
+		--index;
+		if (index >= game_st.map_strings.size()) return a_string();
+		return game_st.map_strings[index];
+	}
+
+	xy trigger_location_center(int location) const {
+		auto& loc = st.locations.at(location - 1);
+		return (loc.area.from + loc.area.to) / 2;
+	}
+
+	// Iterate units matching a trigger action's player group / unit id /
+	// location filter, visiting at most `count` units (0 = all).
+	template<typename F>
+	void trigger_for_units(int owner, int player_group, int location, int unit_id, int count, F&& f) {
+		int n = count == 0 ? -1 : count;
+		auto handle = [&](unit_t* u) {
+			if (n == 0) return;
+			if (ut_turret(u)) return;
+			if (unit_dying(u)) return;
+			if (ut_powerup(u)) return;
+			if (!trigger_players_pred(owner, player_group, u->owner)) return;
+			bool ok = false;
+			if (unit_id == 229) ok = true;
+			else if (unit_id == 230) ok = (u->unit_type->group_flags & GroupFlags::Men) != 0;
+			else if (unit_id == 231) ok = (u->unit_type->group_flags & GroupFlags::Building) != 0;
+			else if (unit_id == 232) ok = (u->unit_type->group_flags & GroupFlags::Factory) != 0;
+			else ok = unit_is(u, (UnitTypes)unit_id);
+			if (!ok) return;
+			if (n > 0) --n;
+			f(u);
+		};
+		if (location) {
+			// v0.83.002: COLLECT, then act. This used to call handle() -- and so
+			// the trigger's own action -- from inside the find_units() walk,
+			// while the unit finder is locked against modification. Any action
+			// that kills, moves, creates or gives a unit then threw "attempt to
+			// modify unit finder while search is active" and ended the mission.
+			// Six missions died this way within 600 frames (expprotoss01/03,
+			// expterran03/04/07, expzerg02); it never showed up before because
+			// nothing here had ever been stepped, only loaded.
+			//
+			// Ids, not pointers: an action that kills one unit can invalidate
+			// another still queued, and get_unit() returns null for those.
+			static_vector<::bwgame::unit_id, 1700> matched;
+			auto& loc = st.locations.at(location - 1);
+			for (unit_t* u : find_units(loc.area)) {
+				if (!unit_is_at_elevation_flags(u, loc.elevation_flags)) continue;
+				if (matched.size() == matched.capacity()) break;
+				matched.push_back(get_unit_id(u));
+			}
+			for (::bwgame::unit_id id : matched) {
+				unit_t* u = get_unit(id);
+				if (u) handle(u);
+			}
+		} else {
+			for (int p : trigger_players(owner, player_group)) {
+				for (auto i = st.player_units[p].begin(); i != st.player_units[p].end();) {
+					unit_t* u = &*i++;
+					handle(u);
+				}
+			}
+		}
+	}
+
+	// Modifier byte shared by Set Resources/Deaths/Score/Countdown:
+	// 7 = set to, 8 = add, 9 = subtract.
+	static int32_t trigger_apply_modifier(int modifier, int32_t current, int32_t amount) {
+		if (modifier == 7) return amount;
+		if (modifier == 8) return current + amount;
+		if (modifier == 9) return current < amount ? 0 : current - amount;
+		return current;
+	}
 
 	bool execute_trigger_action(execute_trigger_struct& ets, int owner, running_trigger& rt, running_trigger::action& ra, const trigger::action& a) {
 		switch (a.type) {
@@ -19064,7 +20028,109 @@ struct state_functions {
 			st.trigger_wait_timers[owner] = a.time_n;
 			ra.flags |= 1;
 			return false;
-		case 15: // ai script
+		case 5: // pause game
+			on_trigger_pause(owner, true);
+			return true;
+		case 6: // unpause game
+			on_trigger_pause(owner, false);
+			return true;
+		case 7: { // transmission (ping + portrait + wav + text)
+			// v0.83.004: a Transmission BLOCKS its trigger for its duration, the
+			// same way a Wait does. It used to return immediately, so a mission
+			// whose trigger holds four transmissions in a row played all four in
+			// ONE frame: every line appeared at once and the whole conversation
+			// ended abruptly, with the WAVs cutting each other off. The wait is
+			// what makes it a conversation instead of a dump.
+			if (st.trigger_waiting[owner]) return false;
+			if (ra.flags & 1) {
+				ra.flags &= ~1;
+				return true;
+			}
+			if (a.location) on_trigger_minimap_ping(owner, trigger_location_center(a.location));
+			// v0.83.007: the duration is time_n, and it is measured, not chosen.
+			// `aidump trig campaign/terran/tutorial` prints every transmission's
+			// fields beside the true length of the WAV it plays:
+			//     time_n 7547  grp2 100  num@27 9   wav  7530 ms
+			//     time_n 1005  grp2 0    num@27 9   wav  1002 ms
+			//     time_n 18664 grp2 0    num@27 9   wav 18622 ms
+			// time_n tracks the WAV to within ~15 ms every time; grp2 is 0 or a
+			// flat 100 and num_n is always 9. The old line read
+			// "num_n == 7 ? group2_n : 3000", so num_n never being 7 meant EVERY
+			// line got a flat three seconds -- which is why an 18-second speech
+			// was cut off after three and the next speaker talked over it.
+			int dur = (int)a.time_n;
+			if (dur <= 0) dur = 3000;
+			if (a.extra_n < 228) on_trigger_portrait(owner, a.extra_n, dur);
+			if (a.sound_index) on_trigger_play_wav(owner, trigger_string(a.sound_index));
+			if (a.string_index) on_trigger_display_text(owner, trigger_string(a.string_index));
+			if (rt.flags & 0x10) return true;   // same skip-waits flag Wait honours
+			// v0.83.006: a beat between speaking turns. With the wait alone the
+			// lines still ran nose-to-tail -- Adjutant, SCV, Adjutant again --
+			// and read as one voice talking over itself. A second of silence is
+			// what turns a queue of lines into a conversation.
+			//
+			// Applied to every transmission rather than only to a change of
+			// speaker: knowing who spoke last would need a new field in `state`
+			// (sim state, because it changes trigger timing and so must be
+			// identical on every LAN peer and in every replay), and that field
+			// would also have to be added to savegame.h. Not worth it for a beat
+			// that reads the same either way.
+			st.trigger_waiting[owner] = true;
+			st.trigger_wait_timers[owner] = dur + 1000;
+			ra.flags |= 1;
+			return false;
+		}
+		case 8: // play wav
+			if (a.sound_index) on_trigger_play_wav(owner, trigger_string(a.sound_index));
+			return true;
+		case 9: // display text message
+			if (a.string_index) on_trigger_display_text(owner, trigger_string(a.string_index));
+			return true;
+		case 10: // center view
+			if (a.location) on_trigger_center_view(owner, trigger_location_center(a.location));
+			return true;
+		case 11: // create unit with properties
+			for (int p : trigger_players(owner, a.group_n)) {
+				const unit_type_t* ut = get_unit_type((UnitTypes)a.extra_n);
+				if (unit_is_mineral_field(ut) || unit_is(ut, UnitTypes::Resource_Vespene_Geyser)) p = 11;
+				xy pos = trigger_location_center(a.location);
+				// Create-unit "number of units" byte (@27) 0 means 1: measured across
+				// all 64 campaign CHKs, 55% of CreateUnitWithProperties and many
+				// CreateUnit actions store 0, and 0=no-op would silently drop most
+				// scripted campaign spawns. Selection actions (give/move/kill/remove)
+				// treat 0 as "all" via trigger_for_units; create clamps to one.
+				int cnt = a.num_n ? (int)a.num_n : 1;
+				for (int i = 0; i != cnt; ++i) {
+					unit_t* u = trigger_create_unit(ut, pos, p);
+					if (u && a.group2_n >= 1 && a.group2_n <= 64) {
+						auto& prop = game_st.uprp.at(a.group2_n - 1);
+						if (prop.valid_properties & 0x2) set_unit_hp(u, u->unit_type->hitpoints * (int)prop.hp_percent / 100);
+						if ((prop.valid_properties & 0x4) && u->unit_type->has_shield) u->shield_points = fp8::integer(u->unit_type->shield_points) * (int)prop.shield_percent / 100;
+						if (prop.valid_properties & 0x8) u->energy = unit_max_energy(u) * (int)prop.energy_percent / 100;
+						if ((prop.valid_properties & 0x10) && ut_resource(u)) set_unit_resources(u, (int)prop.resources);
+						if ((prop.valid_flags & 0x10) && (prop.unit_flags & 0x10)) {
+							if (!u_invincible(u)) u_set_status_flag(u, unit_t::status_flag_invincible);
+						}
+					}
+				}
+			}
+			return true;
+		case 12: // set mission objectives
+			st.mission_objectives_string.at(owner) = a.string_index;
+			return true;
+		case 13: // set switch (num_n: 4 set, 5 clear, 6 toggle, 11 randomize)
+			if (a.group2_n < 256) {
+				auto& sw = st.trigger_switches[a.group2_n];
+				if (a.num_n == 4) sw = true;
+				else if (a.num_n == 5) sw = false;
+				else if (a.num_n == 6) sw = !sw;
+				else if (a.num_n == 11) sw = (lcg_rand(51) & 1) != 0;
+			}
+			return true;
+		case 14: // set countdown timer (time_n seconds)
+			st.countdown_timer_ms = (int)trigger_apply_modifier(a.num_n, st.countdown_timer_ms / 1000, a.time_n) * 1000;
+			return true;
+		case 15: case 16: // ai script / ai script at location (town == player here)
 			switch (a.group2_n) {
 			case 0x3069562b:
 				st.shared_vision[0] |= 1 << owner;
@@ -19091,8 +20157,55 @@ struct state_functions {
 				st.shared_vision[7] |= 1 << owner;
 				break;
 			default:
-				error("unknown ai script");
+				// Hand the script id to the aiscript VM (v0.21). open1161HD S1:
+				// carry the scripted location (RunAIScriptAtLocation == action 16)
+				// so this town's attack waves aim at its own region rather than
+				// the global-nearest enemy. action 15 (RunAIScript) has location 0.
+				ai_start_script(owner, (uint32_t)a.group2_n,
+				    a.location ? trigger_location_center(a.location) : xy());
+				break;
 			}
+			return true;
+		case 17: // leader board control
+			st.leaderboard = {};
+			st.leaderboard.type = 1;
+			st.leaderboard.string_index = a.string_index;
+			st.leaderboard.unit_id = a.extra_n;
+			st.leaderboard.goal = -1;
+			return true;
+		case 18: // leader board control at location
+			st.leaderboard = {};
+			st.leaderboard.type = 2;
+			st.leaderboard.string_index = a.string_index;
+			st.leaderboard.unit_id = a.extra_n;
+			st.leaderboard.location = a.location;
+			st.leaderboard.goal = -1;
+			return true;
+		case 19: // leader board resources
+			st.leaderboard = {};
+			st.leaderboard.type = 3;
+			st.leaderboard.string_index = a.string_index;
+			st.leaderboard.resource_type = a.extra_n;
+			st.leaderboard.goal = -1;
+			return true;
+		case 20: // leader board kills
+			st.leaderboard = {};
+			st.leaderboard.type = 4;
+			st.leaderboard.string_index = a.string_index;
+			st.leaderboard.unit_id = a.extra_n;
+			st.leaderboard.goal = -1;
+			return true;
+		case 21: // leader board points
+			st.leaderboard = {};
+			st.leaderboard.type = 5;
+			st.leaderboard.string_index = a.string_index;
+			st.leaderboard.score_type = a.extra_n;
+			st.leaderboard.goal = -1;
+			return true;
+		case 23: // kill unit at location
+			trigger_for_units(owner, a.group_n, a.location, a.extra_n, a.num_n, [&](unit_t* u) {
+				kill_unit(u);
+			});
 			return true;
 		case 22: // kill unit
 			for (int p : trigger_players(owner, a.group_n)) {
@@ -19101,7 +20214,8 @@ struct state_functions {
 					unit_t* u = &*i++;
 					if (ut_turret(u)) continue;
 					if (unit_dying(u)) continue;
-					if (ut_powerup(u)) error("trigger kill unit fixme: powerup");
+					// v0.83.002: see trigger_unit_pred -- a powerup is killable
+					// and removable like anything else; it used to throw.
 					if (u->owner != p) continue;
 					if (uid == 229) kill_unit(u);
 					else if (uid == 230) {
@@ -19123,7 +20237,8 @@ struct state_functions {
 					unit_t* u = &*i++;
 					if (ut_turret(u)) continue;
 					if (unit_dying(u)) continue;
-					if (ut_powerup(u)) error("trigger kill unit fixme: powerup");
+					// v0.83.002: see trigger_unit_pred -- a powerup is killable
+					// and removable like anything else; it used to throw.
 					if (u->owner != p) continue;
 					bool ok = false;
 					if (uid == 229) ok = true;
@@ -19146,7 +20261,12 @@ struct state_functions {
 			//for (int p : trigger_players(owner, a.group_n)) {
 			if (true) {
 				int uid = a.extra_n;
+				// "Remove N units at location": the @27 count is honoured. 0 = all
+				// (BW's "All"), N = up to N matching units (measured: campaigns use
+				// 0, 1, 2, 3 and 100). Was removing ALL regardless of N.
+				int remaining = a.num_n ? (int)a.num_n : -1;
 				std::function<void(unit_t*)> proc = [&](unit_t* u) {
+					if (remaining == 0) return;
 					if (!unit_is_at_elevation_flags(u, st.locations[a.location - 1].elevation_flags)) return;
 
 					if (unit_provides_space(u)) {
@@ -19158,9 +20278,10 @@ struct state_functions {
 						proc(u->worker.powerup);
 					}
 
+					if (remaining == 0) return;
 					if (ut_turret(u)) return;
 					if (unit_dying(u)) return;
-					if (ut_powerup(u)) error("trigger remove unit fixme: powerup");
+					// v0.83.002: powerups are removable too -- see trigger_unit_pred.
 					if (!trigger_players_pred(owner, a.group_n, u->owner)) return;
 					bool ok = false;
 					if (uid == 229) ok = true;
@@ -19176,44 +20297,246 @@ struct state_functions {
 					if (!ok) return;
 					hide_unit(u);
 					kill_unit(u);
+					if (remaining > 0) --remaining;
 
 				};
+				// v0.83.002: same reentrancy fix as trigger_for_units -- proc()
+				// hides and kills units, and doing that inside the find_units
+				// walk threw "attempt to modify unit finder while search is
+				// active". Traced to this action with `aidump campaign
+				// expprotoss/protoss01 600` (action type=25 at frame 122).
+				static_vector<::bwgame::unit_id, 1700> found;
 				for (unit_t* u : find_units(st.locations.at(a.location - 1).area)) {
+					if (found.size() == found.capacity()) break;
+					found.push_back(get_unit_id(u));
+				}
+				for (::bwgame::unit_id id : found) {
+					unit_t* u = get_unit(id);
+					if (!u) continue;
 					proc(u);
 				}
 			}
 			return true;
-		case 26: // set resources
+		case 26: // set resources (extra_n: 0 ore, 1 gas, 2 both; num_n: 7/8/9)
 			for (int p : trigger_players(owner, a.group_n)) {
 				if (p >= 8) continue;
-				if (a.num_n == 7) {
-					if (a.extra_n == 0 || a.extra_n == 2) {
-						st.current_minerals[p] = a.group2_n;
-						st.total_minerals_gathered[p] = a.group2_n;
-					}
-					if (a.extra_n == 1 || a.extra_n == 2) {
-						st.current_gas[p] = a.group2_n;
-						st.total_gas_gathered[p] = a.group2_n;
-					}
-				} else if (a.num_n == 8) {
-					if (a.extra_n == 0 || a.extra_n == 2) {
-						st.current_minerals[p] += a.group2_n;
-						st.total_minerals_gathered[p] += a.group2_n;
-					}
-					if (a.extra_n == 1 || a.extra_n == 2) {
-						st.current_gas[p] += a.group2_n;
-						st.total_gas_gathered[p] += a.group2_n;
-					}
-				} else if (a.num_n == 8) {
-					if (a.extra_n == 0 || a.extra_n == 2) {
-						if (st.current_minerals[p] < a.group2_n) st.current_minerals[p] = 0;
-						else st.current_minerals[p] -= a.group2_n;
-					}
-					if (a.extra_n == 1 || a.extra_n == 2) {
-						if (st.current_gas[p] < a.group2_n) st.current_gas[p] = 0;
-						else st.current_gas[p] -= a.group2_n;
-					}
+				if (a.extra_n == 0 || a.extra_n == 2) {
+					st.current_minerals[p] = trigger_apply_modifier(a.num_n, st.current_minerals[p], a.group2_n);
+					if (a.num_n != 9 && st.total_minerals_gathered[p] < st.current_minerals[p]) st.total_minerals_gathered[p] = st.current_minerals[p];
 				}
+				if (a.extra_n == 1 || a.extra_n == 2) {
+					st.current_gas[p] = trigger_apply_modifier(a.num_n, st.current_gas[p], a.group2_n);
+					if (a.num_n != 9 && st.total_gas_gathered[p] < st.current_gas[p]) st.total_gas_gathered[p] = st.current_gas[p];
+				}
+			}
+			return true;
+		case 27: // set score (extra_n: score type; num_n: 7/8/9)
+			for (int p : trigger_players(owner, a.group_n)) {
+				if (p >= 12) continue;
+				auto apply = [&](std::array<int32_t, 12>& arr) {
+					arr[p] = trigger_apply_modifier(a.num_n, arr[p], a.group2_n);
+				};
+				auto apply_int = [&](std::array<int, 12>& arr) {
+					arr[p] = (int)trigger_apply_modifier(a.num_n, arr[p], a.group2_n);
+				};
+				switch (a.extra_n) {
+				case 1: apply_int(st.unit_score); break;
+				case 2: apply_int(st.building_score); break;
+				case 4: apply(st.kills_score); break;
+				case 5: apply(st.razings_score); break;
+				default: apply(st.custom_score); break;
+				}
+			}
+			return true;
+		case 28: // minimap ping
+			if (a.location) on_trigger_minimap_ping(owner, trigger_location_center(a.location));
+			return true;
+		case 29: // talking portrait
+			if (a.extra_n < 228) on_trigger_portrait(owner, a.extra_n, a.time_n);
+			return true;
+		case 30: // mute unit speech
+			st.trigger_speech_muted |= 1u << owner;
+			return true;
+		case 31: // unmute unit speech
+			st.trigger_speech_muted &= ~(1u << owner);
+			return true;
+		case 32: // leaderboard computer players (num_n: 4 on, 5 off, 6 toggle)
+			if (a.num_n == 4) st.leaderboard.show_computers = true;
+			else if (a.num_n == 5) st.leaderboard.show_computers = false;
+			else if (a.num_n == 6) st.leaderboard.show_computers = !st.leaderboard.show_computers;
+			return true;
+		case 33: // leaderboard goal control
+			st.leaderboard = {};
+			st.leaderboard.type = 1;
+			st.leaderboard.string_index = a.string_index;
+			st.leaderboard.unit_id = a.extra_n;
+			st.leaderboard.goal = a.group2_n;
+			return true;
+		case 34: // leaderboard goal control at location
+			st.leaderboard = {};
+			st.leaderboard.type = 2;
+			st.leaderboard.string_index = a.string_index;
+			st.leaderboard.unit_id = a.extra_n;
+			st.leaderboard.location = a.location;
+			st.leaderboard.goal = a.group2_n;
+			return true;
+		case 35: // leaderboard goal resources
+			st.leaderboard = {};
+			st.leaderboard.type = 3;
+			st.leaderboard.string_index = a.string_index;
+			st.leaderboard.resource_type = a.extra_n;
+			st.leaderboard.goal = a.group2_n;
+			return true;
+		case 36: // leaderboard goal kills
+			st.leaderboard = {};
+			st.leaderboard.type = 4;
+			st.leaderboard.string_index = a.string_index;
+			st.leaderboard.unit_id = a.extra_n;
+			st.leaderboard.goal = a.group2_n;
+			return true;
+		case 37: // leaderboard goal points
+			st.leaderboard = {};
+			st.leaderboard.type = 5;
+			st.leaderboard.string_index = a.string_index;
+			st.leaderboard.score_type = a.extra_n;
+			st.leaderboard.goal = a.group2_n;
+			return true;
+		case 39: // move unit
+			if (a.group2_n) {
+				xy dest = trigger_location_center(a.group2_n);
+				trigger_for_units(owner, a.group_n, a.location, a.extra_n, a.num_n, [&](unit_t* u) {
+					if (ut_building(u) && !u_flying(u)) {
+						// Grounded buildings are teleported as-is (BW behavior).
+						move_unit(u, dest);
+					} else {
+						auto r = find_unit_placement(u, dest, false);
+						move_unit(u, r.first ? r.second : dest);
+					}
+				});
+			}
+			return true;
+		case 40: // leaderboard greed
+			st.leaderboard = {};
+			st.leaderboard.type = 6;
+			st.leaderboard.resource_type = 2;
+			st.leaderboard.goal = a.group2_n;
+			return true;
+		case 41: // set next scenario
+			st.next_scenario_string = a.string_index;
+			return true;
+		case 42: { // set doodad state (num_n: 4 enable, 5 disable, 6 toggle)
+			// v0.83.002: this used to be a no-op whose comment said installation
+			// doors and traps were "not supported" -- which is exactly why the
+			// Jacobs Installation doors never opened. The flag-and-animation
+			// pairing is not invented here: it is the one update_psionic_matrix()
+			// already uses when a protoss building loses power.
+			auto apply = [&](unit_t* u) {
+				set_unit_doodad_state(u, a.num_n == 4 || (a.num_n == 6 && u_disabled(u)));
+			};
+			// v0.83.031: installation doors are created owner=11 (Neutral) by the
+			// THG2 loader, and traps keep whatever (often inactive) slot the map
+			// placed them on. player_slot_active() is false for slots >=8, so
+			// trigger_for_units' owner filter (trigger_players_pred) rejects them
+			// and the door never opens -- the measured cause of the Jacobs
+			// Installation doors doing nothing on hardware. For door/trap doodad
+			// types, match by type inside the location regardless of owner: SC's
+			// "All Players" here means "the doodad at this spot", not a real player
+			// (per the user's Set-Doodad-State debugging notes). Other doodads keep
+			// the ordinary owner-filtered path.
+			bool doodad = false;
+			if (a.extra_n >= 0 && a.extra_n < 228) {
+				auto* dt = get_unit_type((UnitTypes)a.extra_n);
+				doodad = unit_is_door(dt) || unit_is_trap(dt);
+			}
+			if (doodad && a.location) {
+				// Collect ids first, then act: an action must never run inside the
+				// find_units() walk (it would throw "modify unit finder").
+				static_vector<::bwgame::unit_id, 256> matched;
+				auto& loc = st.locations.at(a.location - 1);
+				for (unit_t* u : find_units(loc.area)) {
+					if (!unit_is(u, (UnitTypes)a.extra_n)) continue;
+					if (unit_dying(u)) continue;
+					if (!unit_is_at_elevation_flags(u, loc.elevation_flags)) continue;
+					if (matched.size() == matched.capacity()) break;
+					matched.push_back(get_unit_id(u));
+				}
+				for (::bwgame::unit_id id : matched) {
+					unit_t* u = get_unit(id);
+					if (u) apply(u);
+				}
+			} else {
+				trigger_for_units(owner, a.group_n, a.location, a.extra_n, 0, apply);
+			}
+			return true;
+		}
+		case 43: // set invincibility (num_n: 4 set, 5 clear, 6 toggle)
+			trigger_for_units(owner, a.group_n, a.location, a.extra_n, 0, [&](unit_t* u) {
+				bool set = a.num_n == 4 || (a.num_n == 6 && !u_invincible(u));
+				if (set == u_invincible(u)) return;
+				if (set) u_set_status_flag(u, unit_t::status_flag_invincible);
+				else u_unset_status_flag(u, unit_t::status_flag_invincible);
+			});
+			return true;
+		case 45: // set deaths (extra_n: unit; num_n: 7/8/9; group2_n: amount)
+			for (int p : trigger_players(owner, a.group_n)) {
+				if (p >= 12) continue;
+				if (a.extra_n < 228) {
+					auto& v = st.unit_deaths[p][(UnitTypes)a.extra_n];
+					v = trigger_apply_modifier(a.num_n, v, a.group2_n);
+				} else {
+					// EUD (v0.25): out-of-range slot = extra map variable.
+					auto& v = st.eud_deaths[(uint32_t)a.extra_n * 12u + (uint32_t)p];
+					v = trigger_apply_modifier(a.num_n, v, a.group2_n);
+				}
+			}
+			return true;
+		case 47: // comment
+			return true;
+		case 48: // give units to player (group2_n: new owner group)
+			if (true) {
+				int new_owner = -1;
+				for (int p : trigger_players(owner, a.group2_n)) { new_owner = p; break; }
+				if (new_owner >= 0) {
+					trigger_for_units(owner, a.group_n, a.location, a.extra_n, a.num_n, [&](unit_t* u) {
+						trigger_give_unit_to(u, new_owner);
+					});
+				}
+			}
+			return true;
+		case 49: // modify unit hit points (group2_n: percent)
+			trigger_for_units(owner, a.group_n, a.location, a.extra_n, a.num_n, [&](unit_t* u) {
+				set_unit_hp(u, u->unit_type->hitpoints * (int)a.group2_n / 100);
+			});
+			return true;
+		case 50: // modify unit energy (group2_n: percent)
+			trigger_for_units(owner, a.group_n, a.location, a.extra_n, a.num_n, [&](unit_t* u) {
+				if (ut_has_energy(u)) u->energy = unit_max_energy(u) * (int)a.group2_n / 100;
+			});
+			return true;
+		case 51: // modify unit shield points (group2_n: percent)
+			trigger_for_units(owner, a.group_n, a.location, a.extra_n, a.num_n, [&](unit_t* u) {
+				if (u->unit_type->has_shield) u->shield_points = fp8::integer(u->unit_type->shield_points) * (int)a.group2_n / 100;
+			});
+			return true;
+		case 53: // modify unit hanger count — not supported yet
+			return true;
+		case 54: // pause countdown timer
+			st.countdown_paused = true;
+			return true;
+		case 55: // unpause countdown timer
+			st.countdown_paused = false;
+			return true;
+		case 56: // draw
+			for (int p : active_players()) {
+				if (st.players[p].controller == player_t::controller_occupied || st.players[p].controller == player_t::controller_computer_game) {
+					ets.victory_state[p] = 5;
+				}
+			}
+			return true;
+		case 57: // set alliance status (extra_n: 0 enemy, 1 ally, 2 allied victory)
+			for (int p : trigger_players(owner, a.group_n)) {
+				if (p == owner) continue;
+				st.alliances[owner][p] = a.extra_n == 0 ? 0 : 2;
 			}
 			return true;
 		case 38: // move location
@@ -19252,7 +20575,9 @@ struct state_functions {
 				if (unit_is_mineral_field(ut) || unit_is(ut, UnitTypes::Resource_Vespene_Geyser)) p = 11;
 				auto& loc = st.locations.at(a.location - 1);
 				xy pos = (loc.area.from + loc.area.to) / 2;
-				for (int i = 0; i != a.num_n; ++i) {
+				// See case 11: campaign create-unit count byte is 0 = one unit.
+				int cnt = a.num_n ? (int)a.num_n : 1;
+				for (int i = 0; i != cnt; ++i) {
 					trigger_create_unit(ut, pos, p);
 				}
 			}
@@ -19299,19 +20624,1657 @@ struct state_functions {
 			}
 			return true;
 		default:
-			error("unknown trigger action %d", a.type);
+			// Unknown/EUD-extended action: skip instead of crashing the game.
+			return true;
+		}
+	}
+
+	// --- aiscript VM (v0.21 slice A) ----------------------------------------
+	// Interprets scripts/aiscript.bin / bwscript.bin. Implemented: control
+	// flow, waits, build/train/morph goals, attack waves, shared vision.
+	// Everything else is skipped by its argument signature so campaign
+	// scripts run without crashing. All state lives in st.ai_players and all
+	// randomness goes through lcg_rand — deterministic for replays/lockstep.
+
+	// Argument signature per opcode: b = byte, w = word, j = word jump
+	// target, d = dword, s = null-terminated string. nullptr = unknown.
+	// Canonical table (PyMS/PyAI command definitions), cross-checked against
+	// the real 1.16.1 Patch_rt bytecode with a static walk validator.
+	static const char* ai_op_args(uint8_t op) {
+		static const char* table[0x72] = {
+			/*0x00 goto*/ "j", /*0x01 notowns_jump*/ "wj", /*0x02 wait*/ "w",
+			/*0x03 start_town*/ "", /*0x04 start_areatown*/ "", /*0x05 expand*/ "bj",
+			/*0x06 build*/ "bwb", /*0x07 upgrade*/ "bwb", /*0x08 tech*/ "wb",
+			/*0x09 wait_build*/ "bw", /*0x0a wait_buildstart*/ "bw",
+			/*0x0b attack_clear*/ "", /*0x0c attack_add*/ "bw",
+			/*0x0d attack_prepare*/ "", /*0x0e attack_do*/ "",
+			/*0x0f wait_secure*/ "", /*0x10 capt_expand*/ "",
+			/*0x11 build_bunkers*/ "", /*0x12 wait_bunkers*/ "",
+			/*0x13 defensebuild_gg*/ "bw", /*0x14 defensebuild_ag*/ "bw",
+			/*0x15 defensebuild_ga*/ "bw", /*0x16 defensebuild_aa*/ "bw",
+			/*0x17 defenseuse_gg*/ "bw", /*0x18 defenseuse_ag*/ "bw",
+			/*0x19 defenseuse_ga*/ "bw", /*0x1a defenseuse_aa*/ "bw",
+			/*0x1b defenseclear_gg*/ "", /*0x1c defenseclear_ag*/ "",
+			/*0x1d defenseclear_ga*/ "", /*0x1e defenseclear_aa*/ "",
+			/*0x1f send_suicide*/ "b", /*0x20 player_enemy*/ "",
+			/*0x21 player_ally*/ "", /*0x22 default_min*/ "b",
+			/*0x23 defaultbuild_off*/ "", /*0x24 stop*/ "",
+			/*0x25 switch_rescue*/ "", /*0x26 move_dt*/ "",
+			/*0x27 debug*/ "js", /*0x28 fatal_error*/ "",
+			/*0x29 enter_bunker*/ "", /*0x2a value_area*/ "",
+			/*0x2b transports_off*/ "", /*0x2c check_transports*/ "",
+			/*0x2d nuke_rate*/ "b", /*0x2e max_force*/ "w",
+			/*0x2f clear_combatdata*/ "", /*0x30 random_jump*/ "bj",
+			/*0x31 time_jump*/ "bj", /*0x32 farms_notiming*/ "",
+			/*0x33 farms_timing*/ "", /*0x34 build_turrets*/ "",
+			/*0x35 wait_turrets*/ "", /*0x36 default_build*/ "",
+			/*0x37 harass_factor*/ "w", /*0x38 start_campaign*/ "",
+			/*0x39 race_jump*/ "jjj", /*0x3a region_size*/ "bj",
+			/*0x3b get_oldpeons*/ "b", /*0x3c groundmap_jump*/ "j",
+			/*0x3d place_guard*/ "wb", /*0x3e wait_force*/ "bw",
+			/*0x3f guard_resources*/ "w", /*0x40 call*/ "j",
+			/*0x41 return*/ "", /*0x42 eval_harass*/ "j",
+			/*0x43 creep*/ "b", /*0x44 panic*/ "j",
+			/*0x45 player_need*/ "bw", /*0x46 do_morph*/ "bw",
+			/*0x47 wait_upgrades*/ "", /*0x48 multirun*/ "j",
+			/*0x49 rush*/ "bj", /*0x4a scout_with*/ "w",
+			/*0x4b define_max*/ "bw", /*0x4c train*/ "bw",
+			/*0x4d target_expansion*/ "", /*0x4e wait_train*/ "bw",
+			/*0x4f set_attacks*/ "b", /*0x50 set_gencmd*/ "",
+			/*0x51 make_patrol*/ "", /*0x52 give_money*/ "",
+			/*0x53 prep_down*/ "bbw", /*0x54 resources_jump*/ "wwj",
+			/*0x55 enter_transport*/ "", /*0x56 exit_transport*/ "",
+			/*0x57 sharedvision_on*/ "b", /*0x58 sharedvision_off*/ "b",
+			/*0x59 nuke_location*/ "", /*0x5a harass_location*/ "",
+			/*0x5b implode*/ "", /*0x5c guard_all*/ "",
+			/*0x5d enemyowns_jump*/ "wj", /*0x5e enemyresources_jump*/ "wwj",
+			/*0x5f if_dif*/ "bbj", /*0x60 easy_attack*/ "bw",
+			/*0x61 kill_thread*/ "", /*0x62 killable*/ "",
+			/*0x63 wait_finishattack*/ "", /*0x64 quick_attack*/ "",
+			/*0x65 junkyard_dog*/ "", /*0x66 fake_nuke*/ "",
+			/*0x67 disruption_web*/ "", /*0x68 recall_location*/ "",
+			/*0x69 set_randomseed*/ "d", /*0x6a if_owned*/ "wj",
+			/*0x6b create_nuke*/ "", /*0x6c create_unit*/ "www",
+			/*0x6d nuke_pos*/ "ww", /*0x6e help_iftrouble*/ "",
+			/*0x6f allies_watch*/ "bj", /*0x70 try_townpoint*/ "bj",
+			/*0x71 if_towns*/ "", // Oracle opcode 113, 0 args: our military model
+			                      // has no per-town branch, so the switch default
+			                      // treats it as a no-op and the thread continues
+			                      // (was: op>=0x71 -> nullptr -> thread deactivated).
+		};
+		if (op >= 0x72) return nullptr;
+		return table[op];
+	}
+
+	const a_vector<uint8_t>& ai_script_data(bool bw) const {
+		return bw ? global_st.bwscript_bin : global_st.aiscript_bin;
+	}
+
+	// Find a script id in one of the .bin entry tables; returns byte offset
+	// or 0 if not found. BW-era files (BrooDat/Patch_rt) start with a DWORD
+	// offset to the entry table; the vanilla StarDat file has the table at
+	// offset 0 (its first DWORD is the ASCII id 'Ter3', far beyond the size).
+	// v1.0.18: the two tables have different entry widths -- aiscript.bin 16 bytes (id,
+	// offset, string id, flags), bwscript.bin 8 (id, offset). Walking bwscript.bin in
+	// steps of 16 saw every other entry only: 78 of its 156 scripts, so the second and
+	// third computer players of most Brood War missions (TB3B, ZB4B, PB6B, ...) never
+	// got their script. Found by aidump aiscan (SCRIPT_NOT_FOUND).
+	static uint32_t ai_find_script(const a_vector<uint8_t>& data, uint32_t id, size_t entry_size = 16) {
+		size_t pos = 0;
+		if (data.size() >= 4) {
+			uint32_t header;
+			memcpy(&header, data.data(), 4);
+			if (header >= 4 && header < data.size()) pos = header;
+		}
+		while (pos + entry_size <= data.size()) {
+			uint32_t e_id;
+			uint32_t e_off;
+			memcpy(&e_id, data.data() + pos, 4);
+			memcpy(&e_off, data.data() + pos + 4, 4);
+			if (e_id == 0) break;
+			if (e_id == id && e_off != 0 && e_off < data.size()) return e_off;
+			pos += entry_size;
+		}
+		return 0;
+	}
+
+	// Start a script (4-char ASCII id, e.g. 'TMCu' = "uCMT" little-endian).
+	bool ai_start_script(int owner, uint32_t id, xy script_loc = xy()) {
+		if (owner < 0 || owner >= 8) return false;
+		auto& ai = st.ai_players[owner];
+		uint32_t off = ai_find_script(global_st.aiscript_bin, id);
+		bool bw = false;
+		if (!off) {
+			off = ai_find_script(global_st.bwscript_bin, id, 8);
+			bw = true;
+		}
+		if (!off) {
+			if (trigger_tracing()) trigger_trace_sink()(format("aiscan f%d p%d SCRIPT_NOT_FOUND %c%c%c%c\n", (int)st.current_frame, owner, (char)(id & 0xff), (char)((id >> 8) & 0xff), (char)((id >> 16) & 0xff), (char)((id >> 24) & 0xff)));
 			return false;
+		}
+		if (trigger_tracing()) trigger_trace_sink()(format("aiscan f%d p%d SCRIPT_START %c%c%c%c bw=%d\n", (int)st.current_frame, owner, (char)(id & 0xff), (char)((id >> 8) & 0xff), (char)((id >> 16) & 0xff), (char)((id >> 24) & 0xff), bw ? 1 : 0));
+		// Campaign triggers can start several town scripts for one player;
+		// add a thread to a running AI instead of resetting it (a reset would
+		// kill the earlier towns' threads and goals). v1.0.16: also when the new
+		// script is in the other table -- the reset used to wipe a Brood War
+		// campaign script the moment a trigger started an aiscript.bin helper
+		// for the same player, and that player then did nothing all mission.
+		if (!ai.active) {
+			ai = {};
+			ai.active = true;
+			ai.bw = bw;
+			ai.town_pos = game_st.start_locations[owner];
+		}
+		// open1161HD S1: remember each distinct scripted region (deduped). Empty
+		// script_loc = RunAIScript (melee / no-location) -> nothing recorded, so
+		// ai_enemy_target keeps its exact melee behaviour and determinism.
+		if (script_loc != xy()) {
+			bool have = false;
+			for (auto& t : ai.attack_targets) if (t == script_loc) { have = true; break; }
+			if (!have && ai.attack_targets.size() < 8) ai.attack_targets.push_back(script_loc);
+		}
+		// open1161HD S3: carry the invocation location into the thread so its
+		// start_areatown anchors the town there. town starts at the main base and
+		// start_town/start_areatown resolve it; loc is xy() for melee/plain
+		// RunAIScript, so those threads reduce to the pre-S3 behaviour exactly.
+		if (ai.threads.size() < state::ai_max_threads)
+			ai.threads.push_back({true, off, 0, 0, 0, 0, script_loc, game_st.start_locations[owner], bw});
+		else if (trigger_tracing()) trigger_trace_sink()(format("aiscan f%d p%d THREAD_LIMIT\n", (int)st.current_frame, owner));
+#ifdef BWGAME_AI_STEP_TRACE
+		// AITR runtime-trace hook (tool-only; the APK never defines this flag, so
+		// the game binary and its determinism are untouched). Records which script
+		// FourCC a player is now running, so per-step events can be grouped and
+		// aligned against grp-toolkit's static disassembly (ai_runtime.compare).
+		if (trigger_tracing())
+			trigger_trace_sink()(format("aistart f%d p%d b%d id%u off%u\n",
+			    st.current_frame, owner, bw ? 1 : 0, (unsigned)id, (unsigned)off));
+#endif
+		return true;
+	}
+
+	int ai_owned_count(int owner, int unit_id, bool completed_only) const {
+		if ((size_t)unit_id >= 228) return 0;
+		int r = st.completed_unit_counts[owner].at((UnitTypes)unit_id);
+		if (!completed_only) r = st.unit_counts[owner].at((UnitTypes)unit_id);
+		return r;
+	}
+
+	// v0.83: the define_max ceiling for a unit type, or -1 when none is set.
+	int ai_max_count(const state::ai_player_t& ai, int unit_id) const {
+		for (auto& m : ai.max_counts) if (m.unit_id == unit_id) return m.count;
+		return -1;
+	}
+
+	void ai_add_goal(state::ai_player_t& ai, int unit_id, int count, xy town = xy()) {
+		if ((size_t)unit_id >= 228) return;
+		// open1161HD S3: a building goal is anchored to the town that raised it, so
+		// two towns building the same thing are distinct goals placed at their own
+		// bases. Army units train from any production building, so they stay
+		// town-agnostic (xy()) and de-dup by unit id exactly as before -- keeping
+		// the melee goal list byte-identical (melee only ever runs start_town, so a
+		// building goal's town is always the start location there anyway).
+		xy goal_town = ut_building(get_unit_type((UnitTypes)unit_id)) ? town : xy();
+		// v0.83: honour define_max. Scripts raise the same goal repeatedly as
+		// they loop, and without the ceiling the AI kept queueing units it had
+		// itself declared a limit for.
+		int cap = ai_max_count(ai, unit_id);
+		if (cap >= 0 && count > cap) count = cap;
+		for (auto& g : ai.build_goals) {
+			if (g.unit_id == unit_id && g.town == goal_town) {
+				if (count > g.count) g.count = count;
+				return;
+			}
+		}
+		if (ai.build_goals.size() < 48) ai.build_goals.push_back({unit_id, count, goal_town});
+	}
+
+	xy ai_enemy_target(int owner) {
+		// Nearest enemy start location; fall back to any enemy unit.
+		// open1161HD S1: measure distance from the AI's currently-selected
+		// scripted region (round-robin over RunAIScriptAtLocation locations)
+		// rather than its single town, so each attacker town's waves head for
+		// its own scripted enemy region. With no scripted locations (melee) the
+		// reference is town_pos exactly as before -> identical melee behaviour.
+		auto& me = st.ai_players[owner];
+		xy ref = me.town_pos;
+		if (!me.attack_targets.empty())
+			ref = me.attack_targets[(size_t)(me.attack_target_rr % (int)me.attack_targets.size())];
+		xy best{-1, -1};
+		int32_t best_d = std::numeric_limits<int32_t>::max();
+		// open1161HD: a campaign attacker focuses the HUMAN, not other computer
+		// enemies. Norad II/terran06 has two enemy zergs in different forces (blue
+		// P2 vs orange P5), so each would pick the OTHER as its nearest target and
+		// grind it down ("oranžinis sudrasko mėlyną") instead of assaulting the
+		// player. Vanilla campaign AIs attack the player; prefer occupied (human)
+		// targets, and fall back to any enemy only when there is no human enemy left.
+		bool prefer_human = me.campaign;
+		bool any_human_enemy = false;
+		if (prefer_human) {
+			for (int p = 0; p != 8; ++p) {
+				if (p == owner || !player_slot_active(p)) continue;
+				if (st.alliances[owner][p] != 0) continue;
+				if (st.players[p].controller == player_t::controller_occupied
+				    && !st.player_units[p].empty()) { any_human_enemy = true; break; }
+			}
+		}
+		for (int p = 0; p != 8; ++p) {
+			if (p == owner) continue;
+			if (!player_slot_active(p)) continue;
+			if (st.alliances[owner][p] != 0) continue;
+			if (prefer_human && any_human_enemy
+			    && st.players[p].controller != player_t::controller_occupied) continue;
+			bool has_units = !st.player_units[p].empty();
+			if (!has_units) continue;
+			xy pos = game_st.start_locations[p];
+			// open1161HD S1b: a campaign attacker aims at the enemy's ACTUAL
+			// nearest base, not its fixed (possibly abandoned) start marker.
+			// Revolution/terran05: the player marches off its start onto the
+			// captured Antiga base, so every wave kept funnelling to the empty
+			// start location -- the user's "the enemy never actually attacks me,
+			// everything idles at my start". Scoped to a campaign/scripted AI
+			// (attack_targets non-empty OR ai.campaign); melee keeps the exact
+			// start_locations[] reference, so skirmish determinism is unchanged.
+			// Buildings anchor the base; fall back to any unit, then start marker.
+			if (me.campaign || !me.attack_targets.empty()) {
+				xy bpos{-1, -1}; int32_t bd = std::numeric_limits<int32_t>::max();
+				xy upos{-1, -1}; int32_t ud = std::numeric_limits<int32_t>::max();
+				for (unit_t* eu : ptr(st.player_units[p])) {
+					if (unit_dying(eu)) continue;
+					int32_t dd = xy_length(eu->sprite->position - ref);
+					if (ut_building(eu)) { if (dd < bd) { bd = dd; bpos = eu->sprite->position; } }
+					else if (dd < ud) { ud = dd; upos = eu->sprite->position; }
+				}
+				if (bpos.x >= 0) pos = bpos;
+				else if (upos.x >= 0) pos = upos;
+			} else if (pos == xy()) {
+				pos = st.player_units[p].front().sprite->position;
+			}
+			int32_t d = xy_length(pos - ref);
+			if (d < best_d) {
+				best_d = d;
+				best = pos;
+			}
+		}
+		return best;
+	}
+
+	bool ai_is_defense_unit(const state::ai_player_t& ai, int unit_id) const {
+		for (int id : ai.defense_units) if (id == unit_id) return true;
+		return false;
+	}
+
+	// open1161HD S1: step the round-robin so the NEXT wave targets the next
+	// scripted region. No-op with 0/1 scripted locations (melee, single-town).
+	void ai_advance_target(int owner) {
+		auto& me = st.ai_players[owner];
+		if (me.attack_targets.size() > 1)
+			me.attack_target_rr = (me.attack_target_rr + 1) % (int)me.attack_targets.size();
+	}
+
+	// open1161HD: is the AI's attack target reachable over LAND from its base?
+	// Campaign attackers separated from the target by water (Revolution: enemy
+	// region 5, captured base region 1) must ferry the ground army by transport.
+	bool ai_target_ground_reachable(int owner, xy target) const {
+		return is_reachable(st.ai_players[owner].town_pos, target);
+	}
+
+	// open1161HD: begin a transport-drop op toward an un-ground-reachable target
+	// (idempotent -- one op at a time). The ground wave is diverted here instead
+	// of stranding at the shore; ai_transport_tick then loads/ferries/unloads it.
+	void ai_transport_request(int owner, xy target) {
+		auto& ai = st.ai_players[owner];
+		if (!ai.campaign || ai.transport_phase != 0) return;
+		ai.transport_phase = 1;
+		ai.transport_target = target;
+		ai.transport_ship = unit_id{};
+		ai.transport_since = (int)st.current_frame;
+	}
+
+	// open1161HD: a Dropship requires a Control Tower add-on on the Starport,
+	// which campaign build lists (Ter5) often omit. Build one on an idle,
+	// add-on-less Starport so the transport op can train its ferry. Reuses the
+	// production manager's addon placement. Campaign transport-only.
+	void ai_build_transport_addon(int owner) {
+		const unit_type_t* ct = get_unit_type(UnitTypes::Terran_Control_Tower);
+		for (unit_t* sp : ptr(st.player_units[owner])) {
+			if (!unit_is(sp, UnitTypes::Terran_Starport)) continue;
+			if (!u_completed(sp) || unit_dying(sp) || !u_grounded_building(sp)) continue;
+			if (unit_addon(sp)) continue;
+			if (sp->secondary_order_type->id == Orders::BuildAddon) continue;
+			xy p = sp->sprite->position - sp->unit_type->placement_size / 2;
+			p += ct->addon_position;
+			p += ct->placement_size / 2;
+			if (can_place_building(sp, owner, ct, p, false, false)) {
+				place_building(sp, get_order_type(Orders::PlaceAddon), ct, sp->sprite->position);
+				return;
+			}
+		}
+	}
+
+	// open1161HD: advance the campaign transport-drop state machine one manage
+	// tick. Phase 1 = build/find a Dropship and load the ground campaign army;
+	// Phase 2 = MoveUnload onto the target landmass, then AttackMove the drop.
+	// Campaign-only (guarded); melee never enters (ai_transport_request is a
+	// no-op there), so melee/replay determinism is untouched.
+	void ai_transport_tick(int owner) {
+		auto& ai = st.ai_players[owner];
+		if (!ai.campaign || ai.transport_phase == 0) return;
+		xy target = ai.transport_target;
+		unit_t* ship = get_unit(ai.transport_ship);
+		if (ship && (!unit_is(ship, UnitTypes::Terran_Dropship) || !u_completed(ship)
+		    || unit_dying(ship) || ship->owner != owner)) ship = nullptr;
+		// Abandon a stuck op after a while -- but building a Control Tower add-on
+		// (~2400f) plus the Dropship (~750f) must fit, so give phase 1 a long
+		// leash. Refresh the clock whenever we make progress (CT or Dropship in
+		// production) so a genuinely stuck op still eventually resets.
+		if (ai.transport_phase == 1 && owner < 12
+		    && (ai_owned_count(owner, (int)UnitTypes::Terran_Control_Tower, false) > 0
+		        || ai_owned_count(owner, (int)UnitTypes::Terran_Dropship, false) > 0)) {
+			ai.transport_since = (int)st.current_frame;
+		}
+		if ((int)st.current_frame - ai.transport_since > 9000) {
+			ai.transport_phase = 0; ai.transport_ship = unit_id{}; return;
+		}
+		if (ai.transport_phase == 1) { // gather + load
+			// Grab our dropship -- complete, or note one still in production.
+			unit_t* prod = nullptr;
+			if (!ship) {
+				for (unit_t* u : ptr(st.player_units[owner])) {
+					if (!unit_is(u, UnitTypes::Terran_Dropship) || unit_dying(u)) continue;
+					if (u_completed(u)) { ship = u; ai.transport_ship = get_unit_id(u); break; }
+					prod = u; // one is being built -- wait for it, do not re-queue
+				}
+			}
+			if (!ship) {
+				if (!prod) {
+					// Queue a Dropship at a Control-Tower Starport (behind whatever it
+					// is training) unless one is already queued; if no Starport can
+					// build one yet, add the Control Tower add-on first. A plain build
+					// goal would be starved -- campaign standing production keeps the
+					// army goals permanently unmet and the manager advances only the
+					// first unmet goal, and ai_find_trainer needs an idle (empty-queue)
+					// Starport that a busy air-producing campaign AI never offers.
+					const unit_type_t* dt = get_unit_type(UnitTypes::Terran_Dropship);
+					bool queued = false; unit_t* sp = nullptr;
+					for (unit_t* u : ptr(st.player_units[owner])) {
+						if (!unit_is(u, UnitTypes::Terran_Starport) || !u_completed(u) || unit_dying(u)) continue;
+						for (const unit_type_t* q : u->build_queue) if (q == dt) queued = true;
+						if (!sp && unit_can_build(u, dt) && u->build_queue.size() < 5) sp = u;
+					}
+					if (!queued) {
+						if (sp) {
+							bool was_empty = sp->build_queue.empty();
+							if (build_queue_push(sp, dt) && was_empty)
+								set_secondary_order(sp, get_order_type(Orders::Train));
+						} else {
+							ai_build_transport_addon(owner); // Dropship needs a Control Tower
+						}
+					}
+				}
+				return; // wait for the dropship to finish
+			}
+			int slots = (int)unit_space_left(ship);
+			for (unit_t* u : ptr(st.player_units[owner])) {
+				if (slots <= 0) break;
+				if (!u_completed(u) || unit_dying(u) || u_loaded(u)) continue;
+				if (ut_worker(u) || ut_building(u) || u_flying(u)) continue;
+				if (!ai_in_campaign_army(ai, (int)u->unit_type->id)) continue;
+				auto oid = u->order_type->id;
+				if (oid == Orders::EnterTransport || oid == Orders::PickupTransport) continue;
+				if (!unit_can_load_target(ship, u)) continue;
+				set_unit_order(u, get_order_type(Orders::EnterTransport), ship);
+				slots -= (int)u->unit_type->space_required;
+			}
+			// Ferry once full, or once it holds some cargo and we have waited.
+			bool full = unit_space_left(ship) == 0;
+			bool has_cargo = unit_space_left(ship) < ship->unit_type->space_provided;
+			if (full || (has_cargo && (int)st.current_frame - ai.transport_since > 450)) {
+				ai.transport_phase = 2; ai.transport_since = (int)st.current_frame;
+			}
+			return;
+		}
+		if (ai.transport_phase == 2) { // ferry + unload
+			if (!ship) { ai.transport_phase = 0; return; } // shot down (cargo lost)
+			if (unit_space_left(ship) == ship->unit_type->space_provided) {
+				// empty -> just unloaded on the far shore; send the drop at target.
+				for (unit_t* u : find_units_noexpand(square_at(ship->sprite->position, 32 * 16))) {
+					if (u->owner != owner || u_flying(u) || ut_building(u) || ut_worker(u)) continue;
+					if (!u_completed(u) || unit_dying(u)) continue;
+					if (unit_can_receive_order(u, get_order_type(Orders::AttackMove), owner))
+						set_unit_order(u, get_order_type(Orders::AttackMove), target);
+				}
+				ai.transport_phase = 0; ai.transport_ship = unit_id{};
+				return;
+			}
+			if (ship->order_type->id != Orders::MoveUnload)
+				set_unit_order(ship, get_order_type(Orders::MoveUnload), target);
+			return;
+		}
+	}
+
+	void ai_attack_do(int owner, bool clear_group = true) {
+		auto& ai = st.ai_players[owner];
+		if (ai.attack_group.empty()) return;
+		xy target = ai_enemy_target(owner);
+		if (target.x < 0) {
+			ai.attack_group.clear();
+			return;
+		}
+		ai.last_attack_frame = (int)st.current_frame; // S2: script drove a wave
+
+		ai_advance_target(owner);
+		// v0.83: max_force caps how many units one wave may contain. Counted
+		// across the whole group, not per type, which is what "force" means.
+		int force_budget = ai.max_force > 0 ? ai.max_force : std::numeric_limits<int>::max();
+		// v0.83.015: hold defense-listed units home ONLY when the wave also has
+		// non-defense attackers to send. The old guard was attack_group.size()>1,
+		// but a campaign Zerg reserves its ENTIRE army (terran03 Desperate
+		// Alliance: gg=Zergling, ag=Hydralisk, ga/aa=Mutalisk), so every wave was
+		// held home and the AI never attacked -- measured with aitrace: military
+		// 94-111, attacking ~0, every wave logged "holding ... at home (defense)".
+		// If the whole wave is defense-typed the script is attacking WITH its
+		// defenders, so send it; the per-group count still leaves the surplus
+		// home as the reserve, so the base is not left naked.
+		bool wave_has_offense = false;
+		for (auto& g : ai.attack_group) {
+			if (!ai_is_defense_unit(ai, g.unit_id)) { wave_has_offense = true; break; }
+		}
+		// open1161HD: melee keeps ground_ok=true (byte-identical); a campaign
+		// attacker across water diverts its ground wave to the transport op.
+		bool ground_ok = !ai.campaign || ai_target_ground_reachable(owner, target);
+		for (auto& g : ai.attack_group) {
+			if (force_budget <= 0) break;
+			if (ai_is_defense_unit(ai, g.unit_id) && wave_has_offense) {
+				if (trigger_tracing()) {
+					trigger_trace_sink()(format(
+					    "aitrace f%d p%d attack wave: holding %d x unit %d at home (defense)\n",
+					    (int)st.current_frame, owner, g.count, g.unit_id));
+				}
+				continue;
+			}
+			int n = g.count;
+			if (n > force_budget) n = force_budget;
+			for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end() && n; ++i) {
+				unit_t* u = &*i;
+				if (!unit_is(u, (UnitTypes)g.unit_id)) continue;
+				if (!u_completed(u) || unit_dying(u)) continue;
+				if (ut_worker(u) || ut_building(u)) continue;
+				auto oid = u->order_type->id;
+				if (oid != Orders::Guard && oid != Orders::PlayerGuard && oid != Orders::Nothing) continue;
+				if (unit_can_receive_order(u, get_order_type(Orders::AttackMove), owner)) {
+					// ground units cannot walk across water -- hand the ground wave
+					// to the transport op; air (u_flying) crosses on its own.
+					if (!ground_ok && !u_flying(u)) ai_transport_request(owner, target);
+					else set_unit_order(u, get_order_type(Orders::AttackMove), target);
+					--n;
+					--force_budget;
+				}
+			}
+		}
+		// v0.83.033: the campaign manager keeps attack_group as a STANDING
+		// composition that drives continuous production, so it launches waves
+		// without clearing it (clear_group=false). The melee/attack_do path
+		// clears as before.
+		if (clear_group) ai.attack_group.clear();
+	}
+
+	// v0.83.033: the campaign army composition = the types the script declared
+	// for home defense (defenseuse_*, which for a campaign attacker ARE its army:
+	// terran03 zerg = Zergling 37 / Hydralisk 38 / Mutalisk 43) plus any
+	// attack_add types. Measured from the terran03 script via aitrace.
+	bool ai_in_campaign_army(const state::ai_player_t& ai, int unit_id) const {
+		for (int id : ai.defense_units) if (id == unit_id) return true;
+		for (auto& g : ai.attack_group) if (g.unit_id == unit_id) return true;
+		return false;
+	}
+
+	// v0.83.033: idle, at-home combat units of the campaign composition. The
+	// campaign manager waits for a pool of these before launching a wave, so the
+	// AI attacks in coherent waves instead of feeding freshly hatched units in
+	// one at a time.
+	int ai_campaign_idle_offense(int owner) {
+		auto& ai = st.ai_players[owner];
+		int r = 0;
+		for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end(); ++i) {
+			unit_t* u = &*i;
+			if (!u_completed(u) || unit_dying(u)) continue;
+			if (ut_worker(u) || ut_building(u)) continue;
+			auto oid = u->order_type->id;
+			if (oid != Orders::Guard && oid != Orders::PlayerGuard && oid != Orders::Nothing) continue;
+			if (ai_in_campaign_army(ai, (int)u->unit_type->id)) ++r;
+		}
+		return r;
+	}
+
+	// v0.83.033: send the gathered campaign army at the enemy, capped by
+	// max_force. Unlike ai_attack_do this needs no attack_group -- campaign zerg
+	// scripts declare their army via the defense list, not attack_add, so the
+	// wave is drawn from the composition directly.
+	void ai_campaign_attack(int owner, int wave_cap = 0) {
+		auto& ai = st.ai_players[owner];
+		xy target = ai_enemy_target(owner);
+		if (target.x < 0) return;
+		ai_advance_target(owner); // S1: next wave -> next scripted region
+		// open1161HD: measured (aitrace terran03) that our VM does NOT execute the
+		// script's own attack_add/attack_do schedule -- only max_force is read -- so
+		// this synthetic wave is the ONLY thing that attacks; removing it (as an early
+		// analysis suggested) would leave the campaign army idle. But sending the WHOLE
+		// army at once (budget == max_force == 600) is the "mass rush at ~1:30" the user
+		// reported. wave_cap (a small, escalating number derived from the frame by the
+		// caller -- no extra state) approximates StarCraft's small escalating waves and
+		// keeps the surplus home as a reserve. 0 = uncapped (ai_send_suicide-style).
+		int budget = ai.max_force > 0 ? ai.max_force : 60;
+		if (wave_cap > 0 && wave_cap < budget) budget = wave_cap;
+		// open1161HD: ai.campaign is always true here, so honour water separation.
+		bool ground_ok = ai_target_ground_reachable(owner, target);
+		for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end() && budget; ++i) {
+			unit_t* u = &*i;
+			if (!u_completed(u) || unit_dying(u)) continue;
+			if (ut_worker(u) || ut_building(u)) continue;
+			if (!ai_in_campaign_army(ai, (int)u->unit_type->id)) continue;
+			auto oid = u->order_type->id;
+			if (oid != Orders::Guard && oid != Orders::PlayerGuard && oid != Orders::Nothing) continue;
+			if (unit_can_receive_order(u, get_order_type(Orders::AttackMove), owner)) {
+				// ground wave across water -> transport op; air crosses directly.
+				if (!ground_ok && !u_flying(u)) ai_transport_request(owner, target);
+				else set_unit_order(u, get_order_type(Orders::AttackMove), target);
+				--budget;
+			}
+		}
+	}
+
+	// v1.0.17: attack_prepare of a campaign script. Measured (real game, Terran 3, idle
+	// player): the Zerg army stays at ~116-122 for 17000 frames and what gets trained is
+	// exactly the script's attack_add list, wave after wave (2 zerglings; 4; 4 + 1
+	// hydralisk; 2 hydralisks + 1 mutalisk; 6 zerglings; 2 mutalisks). So: ask for
+	// `count` more of each listed type than the player owns now.
+	void ai_campaign_wave_prepare(int owner) {
+		auto& ai = st.ai_players[owner];
+		for (auto& g : ai.attack_group) {
+			int free_units = 0;
+			for (unit_t* u : ptr(st.player_units[owner])) {
+				if (!unit_is(u, (UnitTypes)g.unit_id) || unit_dying(u)) continue;
+				if (u->index < 1700 && ai.garrison.test(u->index)) continue;
+				auto oid = u->order_type->id;
+				if (u_completed(u) && oid != Orders::Guard && oid != Orders::PlayerGuard && oid != Orders::Nothing) continue; // already out on a wave
+				++free_units;
+			}
+			if (free_units < g.count) ai_add_goal(ai, g.unit_id, ai_owned_count(owner, g.unit_id, false) + (g.count - free_units), ai.town_pos);
+		}
+	}
+
+	// v1.0.17: attack_do of a campaign script: the units trained for the wave go, up to
+	// `count` per listed type. The garrison is only drawn on when the wave could not be
+	// trained at all (the real game, at its supply limit in Brood War Terran 1, sent
+	// units it already had).
+	void ai_campaign_wave_do(int owner) {
+		auto& ai = st.ai_players[owner];
+		if (ai.attack_group.empty()) return;
+		if (!ai.wave_order.empty()) ai_campaign_wave_launch(owner); // an earlier order goes as it is
+		for (auto& g : ai.attack_group) ai.wave_order.push_back(g);
+		ai.attack_group.clear();
+		ai.wave_order_deadline = (int)st.current_frame + 1500;
+		ai_campaign_wave_order_tick(owner);
+	}
+
+	// The ordered wave is launched once nothing of its types is still in training (or
+	// at the deadline). Found by aiscan (EMPTY_WAVE): scripts that run attack_do right
+	// after attack_prepare sent nobody and the units trained for the wave stayed home.
+	void ai_campaign_wave_order_tick(int owner) {
+		auto& ai = st.ai_players[owner];
+		if (ai.wave_order.empty()) return;
+		if ((int)st.current_frame < ai.wave_order_deadline) {
+			for (auto& g : ai.wave_order) {
+				const unit_type_t* ut = get_unit_type((UnitTypes)g.unit_id);
+				int ready = 0;
+				bool pending = false;
+				for (unit_t* u : ptr(st.player_units[owner])) {
+					if (unit_dying(u)) continue;
+					if (!u->build_queue.empty() && u->build_queue.front() == ut) pending = true; // egg, larva or a building training it
+					if (!unit_is(u, (UnitTypes)g.unit_id)) continue;
+					if (u->index < 1700 && ai.garrison.test(u->index)) continue;
+					if (!u_completed(u)) { pending = true; continue; }
+					auto oid = u->order_type->id;
+					if (oid == Orders::Guard || oid == Orders::PlayerGuard || oid == Orders::Nothing) ++ready;
+				}
+				if (ready >= g.count) continue;
+				if (pending) return; // still coming
+				// not ready and nothing in training: is it still wanted by a build goal?
+				for (auto& bg : ai.build_goals) if (bg.unit_id == g.unit_id && ai_owned_count(owner, g.unit_id, false) < bg.count) return;
+			}
+		}
+		ai_campaign_wave_launch(owner);
+	}
+
+	void ai_campaign_wave_launch(int owner) {
+		auto& ai = st.ai_players[owner];
+		if (ai.wave_order.empty()) return;
+		xy target = ai_enemy_target(owner);
+		if (target.x < 0) {
+			ai.wave_order.clear();
+			return;
+		}
+		ai_campaign_wave_tick(owner, true); // an earlier wave still gathering leaves now
+		ai.last_attack_frame = (int)st.current_frame;
+		ai_advance_target(owner);
+		int force_budget = ai.max_force > 0 ? ai.max_force : std::numeric_limits<int>::max();
+		bool ground_ok = ai_target_ground_reachable(owner, target);
+		for (auto& g : ai.wave_order) {
+			int n = std::min(g.count, force_budget);
+			int in_training = 0;
+			for (int pass = 0; pass != 2 && n > 0; ++pass) {
+				// pass 0: units trained since the mission began; pass 1: the garrison, only
+				// if nothing of this type was or is being trained for the wave
+				if (pass == 1 && (n < std::min(g.count, force_budget) || in_training)) break;
+				for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end() && n > 0; ++i) {
+					unit_t* u = &*i;
+					if (!unit_is(u, (UnitTypes)g.unit_id) || unit_dying(u)) continue;
+					if (ut_worker(u) || ut_building(u)) continue;
+					bool garrison = u->index < 1700 && ai.garrison.test(u->index);
+					if (garrison != (pass == 1)) continue;
+					if (!u_completed(u)) { ++in_training; continue; }
+					auto oid = u->order_type->id;
+					if (oid != Orders::Guard && oid != Orders::PlayerGuard && oid != Orders::Nothing) continue;
+					if (!unit_can_receive_order(u, get_order_type(Orders::AttackMove), owner)) continue;
+					if (!ground_ok && !u_flying(u)) ai_transport_request(owner, target);
+					else if (u->index < 1700) ai.wave.set(u->index);
+					else set_unit_order(u, get_order_type(Orders::AttackMove), target);
+					--n;
+					--force_budget;
+				}
+			}
+			// the wave is gone: stop asking for more of this type than exist now
+			int owned = ai_owned_count(owner, g.unit_id, false);
+			for (auto& bg : ai.build_goals) if (bg.unit_id == g.unit_id && bg.count > owned) bg.count = owned;
+		}
+		ai.wave_order.clear();
+		ai.wave_order_deadline = 0;
+		// Gather first: the units meet at the one nearest to their common centre, then
+		// go together (ai_campaign_wave_tick).
+		long sx = 0, sy = 0; int cnt = 0;
+		for (unit_t* u : ptr(st.player_units[owner])) {
+			if (u->index >= 1700 || !ai.wave.test(u->index)) continue;
+			sx += u->sprite->position.x; sy += u->sprite->position.y; ++cnt;
+		}
+		if (trigger_tracing()) trigger_trace_sink()(format("aiscan f%d p%d WAVE units=%d\n", (int)st.current_frame, owner, cnt));
+		if (!cnt) { ai.wave_deadline = 0; return; }
+		xy centre((int)(sx / cnt), (int)(sy / cnt));
+		unit_t* anchor = nullptr; int32_t best = 0;
+		for (unit_t* u : ptr(st.player_units[owner])) {
+			if (u->index >= 1700 || !ai.wave.test(u->index) || u_flying(u)) continue;
+			int32_t d = xy_length(u->sprite->position - centre);
+			if (!anchor || d < best) { anchor = u; best = d; }
+		}
+		ai.wave_target = target;
+		ai.wave_gather = anchor ? anchor->sprite->position : centre;
+		ai.wave_deadline = (int)st.current_frame + 900;
+		for (unit_t* u : ptr(st.player_units[owner])) {
+			if (u->index >= 1700 || !ai.wave.test(u->index) || u == anchor) continue;
+			set_unit_order(u, get_order_type(Orders::Move), ai.wave_gather);
+		}
+		if (cnt == 1) ai_campaign_wave_tick(owner, true);
+	}
+
+	// The gathering wave leaves when every unit has arrived, or at the deadline.
+	void ai_campaign_wave_tick(int owner, bool now = false) {
+		auto& ai = st.ai_players[owner];
+		if (!ai.wave_deadline) return;
+		bool all_in = true; int alive = 0;
+		for (unit_t* u : ptr(st.player_units[owner])) {
+			if (u->index >= 1700 || !ai.wave.test(u->index)) continue;
+			if (unit_dying(u)) continue;
+			++alive;
+			if (xy_length(u->sprite->position - ai.wave_gather) > 160) all_in = false;
+		}
+		if (alive && !now && !all_in && (int)st.current_frame < ai.wave_deadline) return;
+		for (unit_t* u : ptr(st.player_units[owner])) {
+			if (u->index >= 1700 || !ai.wave.test(u->index) || unit_dying(u)) continue;
+			if (unit_can_receive_order(u, get_order_type(Orders::AttackMove), owner)) set_unit_order(u, get_order_type(Orders::AttackMove), ai.wave_target);
+		}
+		ai.wave.reset();
+		ai.wave_deadline = 0;
+	}
+
+	void ai_send_suicide(int owner) {
+		xy target = ai_enemy_target(owner);
+		if (target.x < 0) return;
+		ai_advance_target(owner); // S1: next wave -> next scripted region
+		st.ai_players[owner].last_attack_frame = (int)st.current_frame; // S2
+		for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end(); ++i) {
+			unit_t* u = &*i;
+			if (!u_completed(u) || unit_dying(u) || ut_building(u) || ut_worker(u)) continue;
+			if (unit_can_receive_order(u, get_order_type(Orders::AttackMove), owner)) {
+				set_unit_order(u, get_order_type(Orders::AttackMove), target);
+			}
+		}
+	}
+
+	// v0.83.036 (B): aiscript enter_bunker (0x29). Load the AI's idle infantry
+	// into its bunkers so a defensive campaign AI actually mans them (measured
+	// Revolution/terran05: the enemy left 10 bunkers empty). One infantry per
+	// bunker per call; ai_manage calls this each tick while garrison_bunkers is
+	// set, so bunkers refill as units are produced or die. unit_can_load_target
+	// is the engine's own eligibility check (terran, space_required <= 1, not
+	// already loaded); the engine gracefully no-ops if a bunker fills up first.
+	void ai_enter_bunkers(int owner) {
+		// open1161HD (measured Revolution/terran05): only infantry ALREADY next to
+		// a bunker is loaded -- the pre-staged ~4-per-bunker garrison. The earlier
+		// version scanned the owner's WHOLE unit list per bunker and, with
+		// garrison_bunkers persisting every ai_manage tick, dragged every combat
+		// unit map-wide (incl. freshly built ones at the barracks and units with
+		// their own guard posts) toward the bunkers -- the user's "everything
+		// swarms the bunkers, sliding around, can't reach them". A bunker sits at
+		// the front line, so its garrison is whatever stands within ~6 tiles; this
+		// scope leaves distant/produced units doing their real job.
+		const int32_t bunker_reach = 32 * 6; // ~6 tiles: the pre-staged garrison
+		for (auto bi = st.player_units[owner].begin(); bi != st.player_units[owner].end(); ++bi) {
+			unit_t* bunker = &*bi;
+			if (!unit_is(bunker, UnitTypes::Terran_Bunker)) continue;
+			if (!u_completed(bunker) || unit_dying(bunker)) continue;
+			if (unit_space_left(bunker) == 0) continue;
+			for (unit_t* u : find_units_noexpand(square_at(bunker->sprite->position, bunker_reach))) {
+				if (u->owner != owner) continue;
+				if (!u_completed(u) || unit_dying(u) || u_loaded(u)) continue;
+				// SCVs pass unit_can_load_target (space_required 1), so the whole
+				// worker line used to pile in too. Bunkers are for combat infantry;
+				// keep workers mining (measured Revolution/terran05).
+				if (ut_worker(u)) continue;
+				auto oid = u->order_type->id;
+				// don't re-order one already heading into a bunker
+				if (oid == Orders::EnterTransport || oid == Orders::PickupTransport) continue;
+				if (!unit_can_load_target(bunker, u)) continue;
+				set_unit_order(u, get_order_type(Orders::EnterTransport), bunker);
+				break; // one per bunker per pass; ai_manage repeats each tick
+			}
+		}
+	}
+
+	// Run the bytecode interpreter for one AI thread until it blocks.
+	void ai_interpret_thread(int owner, state::ai_thread_t& th) {
+		auto& ai = st.ai_players[owner];
+		auto& data = ai_script_data(th.bw);
+		if (data.empty()) {
+			th.active = false;
+			return;
+		}
+		for (int steps = 0; steps != 64; ++steps) {
+			if (th.pc >= data.size()) {
+				th.active = false;
+				return;
+			}
+			uint32_t insn_pc = th.pc;
+			uint8_t op = data[th.pc++];
+#ifdef BWGAME_AI_STEP_TRACE
+			// AITR per-step event (tool-only). insn_pc is an ABSOLUTE offset into
+			// the .bin file (data == whole aiscript_bin/bwscript_bin), so it lines
+			// up 1:1 with grp-toolkit's static disassembler pc coordinates.
+			if (trigger_tracing())
+				trigger_trace_sink()(format("aistep f%d p%d b%d t%d pc%u op%d\n",
+				    st.current_frame, owner, ai.bw ? 1 : 0,
+				    (int)(&th - ai.threads.data()), (unsigned)insn_pc, (int)op));
+#endif
+			const char* sig = ai_op_args(op);
+			if (!sig) {
+				th.active = false;
+				return;
+			}
+			// Decode arguments (up to 3 numeric + optional trailing string).
+			uint32_t args[3] = {};
+			size_t nargs = 0;
+			bool bad = false;
+			for (const char* c = sig; *c; ++c) {
+				if (*c == 'b') {
+					if (th.pc + 1 > data.size()) { bad = true; break; }
+					if (nargs < 3) args[nargs++] = data[th.pc];
+					th.pc += 1;
+				} else if (*c == 'w' || *c == 'j') {
+					if (th.pc + 2 > data.size()) { bad = true; break; }
+					if (nargs < 3) args[nargs++] = data[th.pc] | ((uint32_t)data[th.pc + 1] << 8);
+					th.pc += 2;
+				} else if (*c == 'd') {
+					if (th.pc + 4 > data.size()) { bad = true; break; }
+					th.pc += 4;
+				} else if (*c == 's') {
+					while (th.pc < data.size() && data[th.pc]) ++th.pc;
+					if (th.pc < data.size()) ++th.pc;
+				}
+			}
+			if (bad) {
+				th.active = false;
+				return;
+			}
+			switch (op) {
+			case 0x00: // goto
+				th.pc = args[0];
+				break;
+			case 0x01: // notowns_jump
+				if (ai_owned_count(owner, (int)args[0], true) == 0) th.pc = args[1];
+				break;
+			case 0x02: // wait (frames)
+				th.wait_until_frame = (int)st.current_frame + (int)args[0];
+				return;
+			case 0x03: // start_town: main base at the owner's start location
+				th.town = game_st.start_locations[owner];
+				ai.town_pos = th.town; // keep the legacy primary anchor in sync
+				break;
+			case 0x04: // start_areatown: town at the RunAIScriptAtLocation region
+				// (the AI's own secondary base). Oracle-measured: 20 aiscript + 35
+				// bwscript scripts use this; without the location they all collapsed
+				// onto the main base. Falls back to the start location when the
+				// script was not invoked at a location (so melee is unchanged). The
+				// primary anchor (ai.town_pos) stays the main base.
+				th.town = th.loc != xy() ? th.loc : game_st.start_locations[owner];
+				break;
+			case 0x05: // expand (num, block): claim expansion #num
+				ai_expand(owner, (int)args[0], th.town);
+				break;
+			case 0x06: // build (count, unit, priority)
+				ai_add_goal(ai, (int)args[1], (int)args[0], th.town);
+				break;
+			case 0x07: // upgrade (level, upgrade, priority)
+				for (auto& g : ai.upgrade_goals) {
+					if (g.unit_id == (int)args[1]) { if ((int)args[0] > g.count) g.count = (int)args[0]; goto upgrade_added; }
+				}
+				if (ai.upgrade_goals.size() < 16) ai.upgrade_goals.push_back({(int)args[1], (int)args[0]});
+				upgrade_added:
+				break;
+			case 0x08: // tech (tech, priority)
+				for (int t : ai.tech_goals) if (t == (int)args[0]) goto tech_added;
+				if (ai.tech_goals.size() < 16) ai.tech_goals.push_back((int)args[0]);
+				tech_added:
+				break;
+			case 0x09: // wait_build (completed)
+				if (ai_owned_count(owner, (int)args[1], true) < (int)args[0]) {
+					// S2b: give up if parked on this same wait too long (the AI can't
+					// make what it's waiting for -- e.g. a Starport/Factory add-on) so
+					// the attack loop that follows still runs.
+					if (th.block_pc == insn_pc && (int)st.current_frame - th.block_since > 2400) {
+						if (trigger_tracing()) trigger_trace_sink()(format("aiscan f%d p%d WAIT_GIVEUP op=0x%02x need=%d unit=%d have=%d\n", (int)st.current_frame, owner, (int)op, (int)args[0], (int)args[1], ai_owned_count(owner, (int)args[1], false)));
+						break;
+					}
+					if (th.block_pc != insn_pc) { th.block_pc = insn_pc; th.block_since = (int)st.current_frame; }
+					th.pc = insn_pc;
+					th.wait_until_frame = (int)st.current_frame + 30;
+					return;
+				}
+				th.block_pc = 0;
+				break;
+			case 0x0a: case 0x4e: // wait_buildstart / wait_train (incomplete counts too)
+				if (ai_owned_count(owner, (int)args[1], false) < (int)args[0]) {
+					if (th.block_pc == insn_pc && (int)st.current_frame - th.block_since > 2400) {
+						if (trigger_tracing()) trigger_trace_sink()(format("aiscan f%d p%d WAIT_GIVEUP op=0x%02x need=%d unit=%d have=%d\n", (int)st.current_frame, owner, (int)op, (int)args[0], (int)args[1], ai_owned_count(owner, (int)args[1], false)));
+						break;
+					}
+					if (th.block_pc != insn_pc) { th.block_pc = insn_pc; th.block_since = (int)st.current_frame; }
+					th.pc = insn_pc;
+					th.wait_until_frame = (int)st.current_frame + 30;
+					return;
+				}
+				th.block_pc = 0;
+				break;
+			case 0x3e: // wait_force (count, military): block the thread until the AI
+				// commands `count` completed of the unit. This is a BLOCKING wait in
+				// BW (grp-toolkit ai_runtime `_WAITS`); a no-op here lets the attack
+				// loop that follows race ahead of the army it is supposed to gather,
+				// launching waves before the force exists. Same (completed) count and
+				// block-timeout safety as wait_build (0x09) so a script waiting on an
+				// un-makeable unit (missing tech/addon) still frees itself after
+				// ~2400 frames instead of deadlocking the thread.
+				if (ai_owned_count(owner, (int)args[1], true) < (int)args[0]) {
+					if (th.block_pc == insn_pc && (int)st.current_frame - th.block_since > 2400) {
+						if (trigger_tracing()) trigger_trace_sink()(format("aiscan f%d p%d WAIT_GIVEUP op=0x%02x need=%d unit=%d have=%d\n", (int)st.current_frame, owner, (int)op, (int)args[0], (int)args[1], ai_owned_count(owner, (int)args[1], false)));
+						break;
+					}
+					if (th.block_pc != insn_pc) { th.block_pc = insn_pc; th.block_since = (int)st.current_frame; }
+					th.pc = insn_pc;
+					th.wait_until_frame = (int)st.current_frame + 30;
+					return;
+				}
+				th.block_pc = 0;
+				break;
+			case 0x2e: // max_force (count): cap on one attack wave
+				ai.max_force = (int)args[0];
+				if (trigger_tracing()) {
+					trigger_trace_sink()(format("aitrace f%d p%d max_force = %d\n",
+					    (int)st.current_frame, owner, ai.max_force));
+				}
+				break;
+			case 0x4b: { // define_max (count, unit): ceiling for that unit type
+				// Signature is "bw", and the same (count, unit) order the
+				// defense opcodes use -- define_max(10, 65) is "at most 10
+				// Zealots", which only reads correctly this way round.
+				int count = (int)args[0], unit_id = (int)args[1];
+				if ((size_t)unit_id >= 228) break;
+				bool found = false;
+				for (auto& m : ai.max_counts) {
+					if (m.unit_id == unit_id) { m.count = count; found = true; break; }
+				}
+				if (!found && ai.max_counts.size() < 32) ai.max_counts.push_back({unit_id, count});
+				// Bring any goal the script already raised back under the new
+				// ceiling, otherwise a cap declared after the goal does nothing.
+				for (auto& g : ai.build_goals) {
+					if (g.unit_id == unit_id && g.count > count) g.count = count;
+				}
+				if (trigger_tracing()) {
+					trigger_trace_sink()(format("aitrace f%d p%d define_max unit %d = %d\n",
+					    (int)st.current_frame, owner, unit_id, count));
+				}
+				break;
+			}
+			case 0x38: // start_campaign: enable continuous campaign production +
+				// attack waves (see ai_manage campaign block). The real work is
+				// there; the opcode just flips the flag on.
+				if (!ai.campaign) {
+					for (unit_t* gu : ptr(st.player_units[owner])) {
+						if (ut_building(gu) || ut_worker(gu) || gu->index >= 1700) continue;
+						ai.garrison.set(gu->index);
+					}
+				}
+				ai.campaign = true;
+				if (trigger_tracing()) {
+					trigger_trace_sink()(format("aitrace f%d p%d start_campaign\n",
+					    (int)st.current_frame, owner));
+				}
+				break;
+			case 0x25: { // switch_rescue (SwitchComputerToRescuable): hand this
+				// rescuable AI player's units to the HUMAN immediately. Both missions
+				// that fire 'Rscu' want it: Revolution/terran05 (after the player reaches
+				// the Antiga base -- the user's "the whole base must defect, not just the
+				// CC") and Norad II/terran06 (at frame ~1, since its condition "Command
+				// Force2 Gauss Rifle >=1" is already true -- the crash-site garrison +
+				// Norad II are the player's defectors and must be RED AT ONCE, else a
+				// nearby computer zerg rescues them first by proximity: the user's "zergai
+				// puldami perima kontrolę"). Give ALL of the player's units to the nearest
+				// occupied (human) player; a computer never receives. trigger_give_unit_to
+				// carries loaded units (bunkered marines). Campaign-only: melee/replay
+				// never emit 0x25, so their determinism is untouched.
+				if (owner >= 0 && owner < 8) {
+					int rcv = -1; int32_t best = std::numeric_limits<int32_t>::max();
+					for (int p = 0; p < 8; ++p) {
+						if (p == owner) continue;
+						if (st.players[p].controller != player_t::controller_occupied) continue;
+						if (st.player_units[p].empty()) { if (rcv < 0) rcv = p; continue; }
+						int32_t d = xy_length(st.player_units[p].front().sprite->position - ai.town_pos);
+						if (d < best) { best = d; rcv = p; }
+					}
+					if (rcv >= 0) {
+						a_vector<unit_t*> give;
+						for (unit_t* u : ptr(st.player_units[owner])) give.push_back(u);
+						for (unit_t* u : give) trigger_give_unit_to(u, rcv);
+					}
+					st.players[owner].controller = player_t::controller_rescue_passive;
+				}
+				break;
+			}
+			case 0x29: // enter_bunker: garrison the AI's bunkers with its infantry.
+				// The real work is in ai_manage (keeps them topped up as units are
+				// produced/lost); the opcode just flips the flag and does one pass.
+				ai.garrison_bunkers = true;
+				ai_enter_bunkers(owner);
+				break;
+			case 0x10: // capt_expand: grab an expansion. Mapped to our simple
+				// expansion helper, capped at 3 bases so a script that loops the
+				// opcode cannot over-expand (ai_expand no-ops once depots > num or
+				// one is already pending).
+				ai_expand(owner, 2, th.town);
+				break;
+			case 0x22: // default_min (b): default minimum unit counts. We have no
+			case 0x23: // defaultbuild_off: ...default build set to toggle, so these
+				// are recognized no-ops -- acknowledged so they stop logging
+				// UNIMPLEMENTED. Production is driven by the script's explicit
+				// build/train goals + the campaign manager, not a default set.
+				break;
+			case 0x0b: // attack_clear
+				ai.attack_group.clear();
+				break;
+			case 0x0c: // attack_add
+				if (ai.attack_group.size() < 24) ai.attack_group.push_back({(int)args[1], (int)args[0]});
+				break;
+			case 0x3d: // place_guard (unit, count): keep guards trained
+				ai_add_goal(ai, (int)args[0], (int)args[1], th.town);
+				break;
+			// v0.81: defense lists. Argument order (count, unit) is not a
+			// guess -- define_max(10, 65) decodes as "at most 10 Zealots",
+			// which only reads correctly this way round.
+			case 0x13: case 0x14: case 0x15: case 0x16: // defensebuild_gg/ag/ga/aa
+				// Build the defenders, and reserve them: a script that asks
+				// for them clearly does not want them in the next attack wave.
+				ai_add_goal(ai, (int)args[1], (int)args[0], th.town);
+				// fallthrough
+			case 0x17: case 0x18: case 0x19: case 0x1a: // defenseuse_gg/ag/ga/aa
+				if (!ai_is_defense_unit(ai, (int)args[1]) && ai.defense_units.size() < 16) {
+					ai.defense_units.push_back((int)args[1]);
+				}
+				break;
+			case 0x1b: case 0x1c: case 0x1d: case 0x1e: // defenseclear_gg/ag/ga/aa
+				// BW clears one of the four lists; we keep one, so a clear of
+				// any category releases the whole reserve. Scripts issue the
+				// four clears together, so in practice this matches.
+				ai.defense_units.clear();
+				break;
+			case 0x0d: case 0x0e: // attack_prepare / attack_do
+				// v1.0.17: a campaign script (start_campaign) trains its wave at
+				// attack_prepare and sends it at attack_do, the garrison stays home.
+				if (ai.campaign) {
+					if (op == 0x0d) ai_campaign_wave_prepare(owner);
+					else ai_campaign_wave_do(owner);
+					break;
+				}
+				// In BW the military manager launches the wave once
+				// attack_prepare finishes grouping; melee scripts never
+				// execute attack_do themselves, so both send the wave here.
+				ai_attack_do(owner);
+				break;
+			case 0x1f: // send_suicide
+				ai_send_suicide(owner);
+				break;
+			case 0x24: case 0x61: // stop / kill_thread
+				th.active = false;
+				return;
+			case 0x27: // debug (block, text): jump to block
+				th.pc = args[0];
+				break;
+			case 0x30: // random_jump (chance/256)
+				if ((uint32_t)(lcg_rand(52) & 0xff) < args[0]) th.pc = args[1];
+				break;
+			case 0x31: // time_jump (game minutes)
+				if (trigger_elapsed_seconds() / 60 >= (int)args[0]) th.pc = args[1];
+				break;
+			case 0x39: // race_jump (zerg block, terran block, protoss block)
+				if (owner < 12) {
+					race_t r = st.players[owner].race;
+					th.pc = r == race_t::zerg ? args[0] : r == race_t::terran ? args[1] : args[2];
+				}
+				break;
+			case 0x3c: { // groundmap_jump (EnemyReachableByGroundGoto): jump to
+				// the ground-attack block if an enemy start location is reachable
+				// over LAND from the AI's start. is_reachable = same region
+				// group_index = same walkable landmass; a static map-topology test
+				// scripts use to pick a ground army vs. an air/transport strategy.
+				// Affirmative (jump = reachable), per the canonical label.
+				xy my_start = game_st.start_locations[owner];
+				for (int p = 0; p != 8; ++p) {
+					if (p == owner || !player_slot_active(p) || st.alliances[owner][p] != 0) continue;
+					if (is_reachable(my_start, game_st.start_locations[p])) { th.pc = args[0]; break; }
+				}
+				break;
+			}
+			case 0x44: { // panic (AttackedGoto): jump to the defensive block when
+				// the AI town is under attack -- a hostile (non-allied) ARMED,
+				// non-worker unit within ~10 tiles of one of the AI's buildings.
+				// Melee macro loops guard economy/production on this to bail into
+				// defense the instant the base is hit; a no-op left the AI passive
+				// under attack. AITR cannot validate this branch direction (the
+				// Oracle runtime models no predicate), so it is determinism-gated
+				// (replay/campaign unaffected -- panic is melee-only).
+				bool under_attack = false;
+				for (unit_t* b : ptr(st.player_units[owner])) {
+					if (!ut_building(b)) continue;
+					for (unit_t* e : find_units_noexpand(square_at(b->sprite->position, 320))) {
+						if (e->owner >= 8 || e->owner == owner) continue;
+						if (st.alliances[owner][e->owner] != 0) continue;
+						if (ut_building(e) || ut_worker(e)) continue;
+						if (!unit_or_subunit_ground_weapon(e) && !unit_or_subunit_air_weapon(e)) continue;
+						under_attack = true;
+						break;
+					}
+					if (under_attack) break;
+				}
+				if (under_attack) th.pc = args[0];
+				break;
+			}
+			case 0x40: // call (block) — one-deep return stack per thread
+				th.return_pc = th.pc;
+				th.pc = args[0];
+				break;
+			case 0x41: // return
+				if (th.return_pc) {
+					th.pc = th.return_pc;
+					th.return_pc = 0;
+				} else {
+					th.active = false;
+					return;
+				}
+				break;
+			case 0x45: // player_need (count, building): ensure the town has `count`
+				// of the building, building one only if below. Melee-only (146x),
+				// core production. ai_add_goal is idempotent (raises the goal to at
+				// most `count`, honours define_max, never stacks) -- exactly
+				// player_need's semantics -- so it shares the build/train path.
+			case 0x46: case 0x4c: // do_morph / train (count, unit)
+				ai_add_goal(ai, (int)args[1], (int)args[0], th.town);
+				break;
+			case 0x48: // multirun (block): spawn a parallel script thread
+				// open1161HD S3: a multirun child manages the SAME town as its parent,
+				// so it inherits the parent thread's location + town anchor.
+				if (ai.threads.size() < state::ai_max_threads) ai.threads.push_back({true, args[0], 0, 0, 0, 0, th.loc, th.town, th.bw});
+				break;
+			case 0x54: // resources_jump (minerals, gas, block)
+				if (st.current_minerals[owner] >= (int)args[0] && st.current_gas[owner] >= (int)args[1]) th.pc = args[2];
+				break;
+			case 0x57: // sharedvision_on (player)
+				if (args[0] < 8) st.shared_vision[args[0]] |= 1 << owner;
+				break;
+			case 0x58: // sharedvision_off
+				if (args[0] < 8) st.shared_vision[args[0]] &= ~(1 << owner);
+				break;
+			case 0x5d: // enemyowns_jump
+				for (int p = 0; p != 8; ++p) {
+					if (p == owner || !player_slot_active(p) || st.alliances[owner][p] != 0) continue;
+					if (st.unit_counts[p].at((UnitTypes)args[0]) > 0) { th.pc = args[1]; break; }
+				}
+				break;
+			case 0x5e: // enemyresources_jump (minerals, gas, block)
+				for (int p = 0; p != 8; ++p) {
+					if (p == owner || !player_slot_active(p) || st.alliances[owner][p] != 0) continue;
+					if (st.current_minerals[p] >= (int)args[0] && st.current_gas[p] >= (int)args[1]) { th.pc = args[2]; break; }
+				}
+				break;
+			case 0x6a: // if_owned (unit, block)
+				if (ai_owned_count(owner, (int)args[0], false) > 0) th.pc = args[1];
+				break;
+			case 0x6f: // allies_watch / 0x70 try_townpoint — expansion logic not
+			case 0x70: // implemented yet: fall through (no jump) so scripts continue.
+				break;
+			default:
+				// Recognized-but-unimplemented opcode: arguments already
+				// skipped, just continue.
+				//
+				// Diagnostic (v0.81): with --ai-trace, report each distinct
+				// (player, opcode) once with its decoded arguments. Which
+				// opcodes a script actually reaches is a question about data,
+				// not about the opcode table -- melee and campaign scripts
+				// use very different subsets, and guessing which is which is
+				// how you implement something nobody executes.
+				if (trigger_tracing()) {
+					// Not part of `state`: diagnostics must never influence
+					// the simulation, so this cannot live in st.
+					static bool seen[12][0x72] = {};
+					if (owner < 12 && op < 0x72 && !seen[owner][op]) {
+						seen[owner][op] = true;
+						a_string as;
+						for (size_t i = 0; i != nargs; ++i) {
+							as += format(i ? ", %d" : "%d", (int)args[i]);
+						}
+						trigger_trace_sink()(format(
+						    "aitrace f%d p%d op 0x%02x UNIMPLEMENTED args(%s)\n",
+						    (int)st.current_frame, owner, (int)op, as));
+					}
+				}
+				break;
+			}
+		}
+	}
+
+	unit_t* ai_find_trainer(int owner, const unit_type_t* ut) {
+		for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end(); ++i) {
+			unit_t* u = &*i;
+			if (!u_completed(u) || unit_dying(u)) continue;
+			if (!unit_can_build(u, ut)) continue;
+			if (!u->build_queue.empty()) continue;
+			return u;
+		}
+		return nullptr;
+	}
+
+	// Find a free spot near the AI town for a building and order a worker to
+	// construct it. Returns true if an order was issued.
+	bool ai_place_building(int owner, const unit_type_t* ut, xy base_override = xy()) {
+		// Pick a worker (idle or gathering).
+		unit_t* worker = nullptr;
+		for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end(); ++i) {
+			unit_t* u = &*i;
+			if (!ut_worker(u) || !u_completed(u) || unit_dying(u)) continue;
+			auto oid = u->order_type->id;
+			bool busy = oid == Orders::ConstructingBuilding || oid == Orders::PlaceBuilding
+				|| oid == Orders::PlaceProtossBuilding || oid == Orders::DroneStartBuild
+				|| oid == Orders::DroneBuild || oid == Orders::DroneLand;
+			if (busy) continue;
+			worker = u;
+			if (oid == Orders::Guard || oid == Orders::PlayerGuard || oid == Orders::Nothing) break;
+		}
+		if (!worker) return false;
+		const order_type_t* build_order;
+		auto r = unit_race(worker);
+		if (r == race_t::zerg) build_order = get_order_type(Orders::DroneStartBuild);
+		else if (r == race_t::protoss) build_order = get_order_type(Orders::PlaceProtossBuilding);
+		else build_order = get_order_type(Orders::PlaceBuilding);
+		if (!unit_build_order_valid(worker, build_order, ut, owner)) return false;
+		xy base = base_override != xy() ? base_override : st.ai_players[owner].town_pos;
+		if (base == xy()) base = worker->sprite->position;
+		// Gas buildings snap onto a geyser.
+		if (unit_is_refinery(ut)) {
+			for (auto i = st.player_units[11].begin(); i != st.player_units[11].end(); ++i) {
+				unit_t* g = &*i;
+				if (!unit_is(g, UnitTypes::Resource_Vespene_Geyser)) continue;
+				if (xy_length(g->sprite->position - base) > 32 * 24) continue;
+				if (can_place_building(worker, owner, ut, g->sprite->position, false, false)) {
+					place_building(worker, build_order, ut, g->sprite->position);
+					return true;
+				}
+			}
+			return false;
+		}
+		// Ring search on the tile grid around the town center.
+		for (int radius = 2; radius <= 14; radius += 2) {
+			for (int dy = -radius; dy <= radius; dy += 2) {
+				for (int dx = -radius; dx <= radius; dx += 2) {
+					if (std::abs(dx) != radius && std::abs(dy) != radius) continue;
+					xy pos = base + xy(dx * 32, dy * 32);
+					if (!is_in_map_bounds(pos)) continue;
+					pos.x = pos.x / 32 * 32 + ut->placement_size.x / 2;
+					pos.y = pos.y / 32 * 32 + ut->placement_size.y / 2;
+					if (can_place_building(worker, owner, ut, pos, false, false)) {
+						place_building(worker, build_order, ut, pos);
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	// Claim expansion #num: build a resource depot at the nearest unclaimed
+	// mineral cluster. No-op if we already have num+1 depots or one is on
+	// the way.
+	bool ai_expand(int owner, int num, xy town = xy()) {
+		race_t r = st.players[owner].race;
+		UnitTypes depot_id = r == race_t::zerg ? UnitTypes::Zerg_Hatchery
+			: r == race_t::protoss ? UnitTypes::Protoss_Nexus : UnitTypes::Terran_Command_Center;
+		int depots = 0;
+		for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end(); ++i) {
+			unit_t* u = &*i;
+			if (unit_dying(u)) continue;
+			if (ut_resource_depot(u)) {
+				if (!u_completed(u)) return false;
+				++depots;
+			}
+			// A worker already on its way to found the town counts too.
+			if (ut_worker(u) && !u->build_queue.empty() && u->build_queue.front() == get_unit_type(depot_id)) return false;
+		}
+		if (depots > num) return false;
+		// Nearest mineral field that is not near any of our depots.
+		unit_t* seed = nullptr;
+		int32_t best_d = std::numeric_limits<int32_t>::max();
+		// open1161HD S3: expand relative to the calling town when one was given
+		// (start_areatown region), else the player's main anchor as before.
+		xy home = town != xy() ? town : st.ai_players[owner].town_pos;
+		for (auto m = st.player_units[11].begin(); m != st.player_units[11].end(); ++m) {
+			unit_t* n = &*m;
+			if (!unit_is_mineral_field(n)) continue;
+			bool claimed = false;
+			for (int p = 0; p != 8 && !claimed; ++p) {
+				if (!player_slot_active(p)) continue;
+				for (auto i = st.player_units[p].begin(); i != st.player_units[p].end(); ++i) {
+					unit_t* u = &*i;
+					if (!ut_resource_depot(u) || unit_dying(u)) continue;
+					if (xy_length(n->sprite->position - u->sprite->position) < 32 * 16) { claimed = true; break; }
+				}
+			}
+			if (claimed) continue;
+			int32_t d = xy_length(n->sprite->position - home);
+			if (d < best_d) {
+				best_d = d;
+				seed = n;
+			}
+		}
+		if (!seed) return false;
+		return ai_place_building(owner, get_unit_type(depot_id), seed->sprite->position);
+	}
+
+	// Periodic macro management: keep workers gathering and work toward
+	// outstanding build/train goals. One production order per tick.
+	void ai_manage(int owner) {
+		auto& ai = st.ai_players[owner];
+		// v0.83.033: campaign production/attack manager (aiscript start_campaign,
+		// opcode 0x38). A campaign script sets an attack composition (attack_add)
+		// + max_force but relies on start_campaign to (a) keep producing that
+		// composition and (b) launch waves; without it the starting army only
+		// declines (measured terran03 zerg: military 111->84, attacks petering
+		// out). Melee/LAN never set ai.campaign, so this block is inert there and
+		// cannot affect that determinism.
+		if (ai.campaign) {
+			// (a) Standing production. The campaign script leaves only token
+			// count=1 build goals for its army and parks the surplus (measured
+			// terran03: 5000+ idle minerals, larva free, supply headroom), relying
+			// on start_campaign to keep producing. Raise each composition type's
+			// goal to stay ahead of its live count while supply allows, so the
+			// production manager spends the surplus and rebuilds losses. ai_add_goal
+			// only ratchets up and honours define_max, so this cannot overshoot the
+			// script's own ceilings. The +4 lead keeps a steady trickle into the
+			// larva without flooding a single type.
+			int su = st.supply_used[owner][(size_t)st.players[owner].race].integer_part();
+			int sa = st.supply_available[owner][(size_t)st.players[owner].race].integer_part();
+			// open1161HD: while a transport op is waiting to afford its Dropship,
+			// pause army goal-raising so the gas the standing production would spend
+			// on the composition banks up for the ferry (100 gas). Without this the
+			// wave never crosses water -- the army drains gas below the Dropship cost
+			// every tick. Brief (only until the ferry is queued), transport-only.
+			bool saving_for_transport = ai.transport_phase == 1
+			    && ai_owned_count(owner, (int)UnitTypes::Terran_Dropship, false) == 0;
+			// The army composition is raised toward `owned + 4` so the production
+			// manager keeps replacing losses; the actual ceiling is enforced at the
+			// training point (CAMPAIGN_ARMY_CAP in the goal-advance below), which
+			// binds every goal source -- without it this ran to the supply cap
+			// (measured Norad II/terran06 zerg: 150-200 hoarded).
+			// v1.0.17: the standing "owned + 4 of every composition type" production is
+			// gone. It was a guess ("start_campaign keeps producing the composition"); the
+			// real game trains what attack_add asks for and nothing else (Terran 3: army
+			// 116 -> 120 over 17000 frames). Waves are trained in ai_campaign_wave_prepare.
+			(void)su; (void)sa; (void)saving_for_transport;
+			// (b) Periodic wave. ai_manage runs at frames where
+			// current_frame % 30 == owner*3; 3600/3000 are multiples of 30 and
+			// owner*3 < 30, so this fires exactly once per 3000-frame window and
+			// always coincides with a manage tick -- deterministic, no extra timing
+			// state. open1161HD (measured, aitrace terran03): the first wave used to
+			// fire at frame 1800 (~1:15-1:30) with the WHOLE army -> the user's "mass
+			// attack at 1:30". Push the first wave later (frame 3600) and space waves
+			// 3000 frames apart, and cap each wave to a small escalating size derived
+			// from the frame (no new state), so the AI attacks in vanilla-like growing
+			// waves and keeps a home reserve instead of one all-in dump.
+			// open1161HD S2: this synthetic wave is now a FALLBACK, not the primary
+			// attacker. Measured (aitrace, Ter3/Zer6/Pro7) the campaign scripts DO
+			// run their own attack_add/attack_prepare/attack_do cadence -- Ter3 sends
+			// its first wave at f754 and keeps waving ~every 2000f. So only fire the
+			// synthetic wave when the script has gone quiet for a long stretch
+			// (>4000f since its last wave), i.e. it stalled before/between its attack
+			// loop. A script running its own vanilla cadence never trips this, so it
+			// no longer gets doubled-up non-vanilla pressure; a stalled one still
+			// gets a safety net so no mission goes passively trivial.
+			// v1.0.17: only for a script that has not attacked at all by frame 9000 --
+			// with waves trained per attack_add a script's own long waits (4875 frames in
+			// Brood War Terran 1) must not draw an extra wave out of the garrison.
+			if (st.current_frame >= 9000 && st.current_frame % 2400 == (uint32_t)owner * 3
+			    && ai.last_attack_frame < 0
+			    && ai_campaign_idle_offense(owner) >= 12) {
+				uint32_t wave_index = (st.current_frame - 3600) / 2400; // 0,1,2,...
+				int wave_cap = 8 + (int)wave_index * 4;                 // 8,12,16,... growing pressure
+				if (wave_cap > 40) wave_cap = 40;                       // ceiling, still not the whole 600 army
+				ai_campaign_attack(owner, wave_cap);
+			}
+		}
+		// v0.83.036 (B): keep bunkers manned once the script asked for it (0x29).
+		if (ai.garrison_bunkers) ai_enter_bunkers(owner);
+		ai_campaign_wave_order_tick(owner);
+		ai_campaign_wave_tick(owner);
+		// open1161HD: advance a campaign transport-drop op (ferry ground wave over
+		// water). No-op unless ai.campaign + an op is active, so melee is untouched.
+		ai_transport_tick(owner);
+		// Idle workers go mine the nearest mineral patch.
+		for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end(); ++i) {
+			unit_t* u = &*i;
+			if (!ut_worker(u) || !u_completed(u) || unit_dying(u)) continue;
+			auto oid = u->order_type->id;
+			if (oid != Orders::Guard && oid != Orders::PlayerGuard && oid != Orders::Nothing) continue;
+			unit_t* best = nullptr;
+			int32_t best_d = 32 * 40;
+			for (auto m = st.player_units[11].begin(); m != st.player_units[11].end(); ++m) {
+				unit_t* n = &*m;
+				if (!unit_is_mineral_field(n)) continue;
+				int32_t d = xy_length(n->sprite->position - u->sprite->position);
+				if (d < best_d) {
+					best_d = d;
+					best = n;
+				}
+			}
+			if (best && unit_can_receive_order(u, get_order_type(Orders::MoveToMinerals), owner)) {
+				u->order_target.unit = best;
+				u->order_target.pos = best->sprite->position;
+				set_unit_order(u, get_order_type(Orders::MoveToMinerals), best);
+			}
+		}
+		// Keep ~3 workers on gas per completed refinery (the original AI's
+		// worker manager does this outside the script).
+		{
+			int gas_workers = 0;
+			unit_t* refinery = nullptr;
+			int refineries = 0;
+			for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end(); ++i) {
+				unit_t* u = &*i;
+				if (unit_is_refinery(u) && u_completed(u) && !unit_dying(u)) {
+					++refineries;
+					if (!refinery) refinery = u;
+				}
+				if (ut_worker(u)) {
+					auto oid = u->order_type->id;
+					if (oid == Orders::MoveToGas || oid == Orders::WaitForGas || oid == Orders::HarvestGas || oid == Orders::ReturnGas) ++gas_workers;
+				}
+			}
+			if (refinery && gas_workers < 3 * refineries) {
+				for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end(); ++i) {
+					unit_t* u = &*i;
+					if (!ut_worker(u) || !u_completed(u) || unit_dying(u)) continue;
+					auto oid = u->order_type->id;
+					if (oid != Orders::MoveToMinerals && oid != Orders::WaitForMinerals && oid != Orders::MiningMinerals) continue;
+					if (unit_can_receive_order(u, get_order_type(Orders::MoveToGas), owner)) {
+						u->order_target.unit = refinery;
+						u->order_target.pos = refinery->sprite->position;
+						set_unit_order(u, get_order_type(Orders::MoveToGas), refinery);
+						break;
+					}
+				}
+			}
+		}
+		// Auto-supply (the original AI builds farms outside the script; our
+		// scripts deadlock on supply without this): when close to the cap,
+		// ensure one more supply provider is on the way.
+		{
+			race_t r = st.players[owner].race;
+			int su = st.supply_used[owner][(size_t)r].integer_part();
+			int sa = st.supply_available[owner][(size_t)r].integer_part();
+			if (sa < 200 && su >= sa - 3) {
+				UnitTypes provider = r == race_t::zerg ? UnitTypes::Zerg_Overlord
+					: r == race_t::protoss ? UnitTypes::Protoss_Pylon
+					: UnitTypes::Terran_Supply_Depot;
+				const unit_type_t* put = get_unit_type(provider);
+				// Only add one at a time: count includes incomplete ones.
+				int have = st.unit_counts[owner].at(provider);
+				int want = have + 1;
+				bool pending = false;
+				for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end(); ++i) {
+					unit_t* u = &*i;
+					if (!u->build_queue.empty() && u->build_queue.front() == put) pending = true;
+					auto oid = u->order_type->id;
+					if ((oid == Orders::PlaceBuilding || oid == Orders::PlaceProtossBuilding || oid == Orders::ConstructingBuilding) && u->build_queue.size() && u->build_queue.front() == put) pending = true;
+				}
+				if (!pending) {
+					if (provider == UnitTypes::Zerg_Overlord) {
+						unit_t* larva = ai_find_trainer(owner, put);
+						if (larva && build_queue_push(larva, put)) set_unit_order(larva, get_order_type(Orders::ZergUnitMorph));
+					} else {
+						ai_place_building(owner, put);
+					}
+				}
+				(void)want;
+			}
+		}
+		// One research/upgrade attempt per tick.
+		for (int t : ai.tech_goals) {
+			const tech_type_t* tech = get_tech_type((TechTypes)t);
+			if (player_has_researched(owner, tech->id) || player_is_researching(owner, tech->id)) continue;
+			for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end(); ++i) {
+				unit_t* u = &*i;
+				if (!u_completed(u) || unit_dying(u)) continue;
+				if (!unit_can_research(u, tech, owner)) continue;
+				if (!has_available_resources_for(owner, tech, false)) break;
+				st.current_minerals[owner] -= tech->mineral_cost;
+				st.current_gas[owner] -= tech->gas_cost;
+				u->building.researching_type = tech;
+				u->building.upgrade_research_time = tech->research_time;
+				st.tech_researching[owner][tech->id] = true;
+				sprite_run_anim(u->sprite, iscript_anims::IsWorking);
+				set_unit_order(u, get_order_type(Orders::ResearchTech));
+				break;
+			}
+			break;
+		}
+		for (auto& g : ai.upgrade_goals) {
+			const upgrade_type_t* up = get_upgrade_type((UpgradeTypes)g.unit_id);
+			if (player_upgrade_level(owner, up->id) >= g.count || player_is_upgrading(owner, up->id)) continue;
+			for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end(); ++i) {
+				unit_t* u = &*i;
+				if (!u_completed(u) || unit_dying(u)) continue;
+				if (!unit_can_upgrade(u, up, owner)) continue;
+				if (!has_available_resources_for(owner, up, false)) break;
+				st.current_minerals[owner] -= upgrade_mineral_cost(owner, up);
+				st.current_gas[owner] -= upgrade_gas_cost(owner, up);
+				u->building.upgrading_type = up;
+				u->building.upgrade_research_time = upgrade_time_cost(owner, up);
+				u->building.upgrading_level = player_upgrade_level(owner, up->id) + 1;
+				st.upgrade_upgrading[owner][up->id] = true;
+				sprite_run_anim(u->sprite, iscript_anims::IsWorking);
+				set_unit_order(u, get_order_type(Orders::Upgrade));
+				break;
+			}
+			break;
+		}
+		// Advance one unmet goal.
+		for (auto& g : ai.build_goals) {
+			const unit_type_t* ut = get_unit_type((UnitTypes)g.unit_id);
+			if (ai_owned_count(owner, g.unit_id, false) >= g.count) continue;
+			// v1.0.17: a campaign wave asks for an exact number, so count what is already
+			// morphing: an egg is not yet a unit of its target type, and without this a
+			// request for 2 zerglings queued an egg on every tick until the first hatched
+			// (measured Terran 3: 8 zerglings where the real game makes 2).
+			if (ai.campaign && !ut_building(ut) && unit_race(ut) == race_t::zerg) {
+				int morphing = 0;
+				for (unit_t* e : ptr(st.player_units[owner])) {
+					if (e->build_queue.empty() || e->build_queue.front() != ut) continue;
+					if (!unit_is(e, UnitTypes::Zerg_Egg) && !unit_is(e, UnitTypes::Zerg_Larva)) continue;
+					morphing += ut_two_units_in_one_egg(ut) ? 2 : 1;
+				}
+				if (ai_owned_count(owner, g.unit_id, false) + morphing >= g.count) continue;
+			}
+			// open1161HD: HARD ceiling on a campaign AI's standing combat army,
+			// enforced at the training point so it binds whatever set the goal
+			// (standing production, the script's own train opcodes, attack_add).
+			// Vanilla scripts keep a small army + small waves; ours hoarded to the
+			// supply cap -- measured Norad II/terran06 zerg ~150-200 composition
+			// units. Only the AI's own composition (defense + attack types) counts,
+			// so buildings/workers/supply/overlords are unaffected and losses are
+			// still replaced up to the cap. Melee never sets ai.campaign.
+			// v1.0.17: the hand-set ceiling of 20 composition units is gone with the
+			// standing production it was there to contain. It also stopped every wave of
+			// a player whose pre-placed army was already larger (Brood War Terran 1: 105).
+			if (ut_addon(ut)) {
+				// Addons attach to an idle parent building. If the addon slot
+				// is blocked, order PlaceAddon at a free spot instead — the
+				// engine lifts off, flies there, lands and builds the addon.
+				unit_t* parent = nullptr;
+				for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end(); ++i) {
+					unit_t* u = &*i;
+					if (!ut_building(u) || !u_completed(u) || unit_dying(u)) continue;
+					if (!u_grounded_building(u) || unit_addon(u)) continue;
+					if (!unit_can_build(u, ut)) continue;
+					if (u->secondary_order_type->id == Orders::BuildAddon) continue;
+					parent = u;
+					break;
+				}
+				if (parent) {
+					auto addon_pos_for = [&](xy bpos) {
+						xy p = bpos - parent->unit_type->placement_size / 2;
+						p += ut->addon_position;
+						p += ut->placement_size / 2;
+						return p;
+					};
+					xy cur = parent->sprite->position;
+					if (can_place_building(parent, owner, ut, addon_pos_for(cur), false, false)) {
+						place_building(parent, get_order_type(Orders::PlaceAddon), ut, cur);
+					} else {
+						xy base = g.town != xy() ? g.town : st.ai_players[owner].town_pos;
+						if (base == xy()) base = cur;
+						bool done = false;
+						for (int radius = 2; radius <= 16 && !done; radius += 2) {
+							for (int dy = -radius; dy <= radius && !done; dy += 2) {
+								for (int dx = -radius; dx <= radius; dx += 2) {
+									if (std::abs(dx) != radius && std::abs(dy) != radius) continue;
+									xy pos = base + xy(dx * 32, dy * 32);
+									if (!is_in_map_bounds(pos)) continue;
+									pos.x = pos.x / 32 * 32 + parent->unit_type->placement_size.x / 2;
+									pos.y = pos.y / 32 * 32 + parent->unit_type->placement_size.y / 2;
+									if (!can_place_building(parent, owner, parent->unit_type, pos, false, false)) continue;
+									if (!can_place_building(parent, owner, ut, addon_pos_for(pos), false, false)) continue;
+									place_building(parent, get_order_type(Orders::PlaceAddon), ut, pos);
+									done = true;
+									break;
+								}
+							}
+						}
+					}
+				}
+				break;
+			}
+			if (ut_building(ut)) {
+				// Building-from-building morphs (lair/hive/sunken/spore/greater
+				// spire) go through the trainer path; anything a WORKER builds
+				// (including drone-morphed buildings) goes through placement.
+				unit_t* trainer = ai_find_trainer(owner, ut);
+				if (trainer && ut_building(trainer)) {
+					if (build_queue_push(trainer, ut)) {
+						if (unit_is_zerg_building(ut)) set_unit_order(trainer, get_order_type(Orders::ZergBuildingMorph));
+					}
+					break;
+				}
+				if (ai_place_building(owner, ut, g.town)) break;
+			} else {
+				unit_t* trainer = ai_find_trainer(owner, ut);
+				if (trainer) {
+					if (build_queue_push(trainer, ut)) {
+						if (unit_race(ut) == race_t::zerg && unit_is(trainer, UnitTypes::Zerg_Larva)) {
+							set_unit_order(trainer, get_order_type(Orders::ZergUnitMorph));
+						} else {
+							set_secondary_order(trainer, get_order_type(Orders::Train));
+						}
+					}
+					break;
+				}
+			}
+		}
+	}
+
+	void process_ai() {
+		for (int owner = 0; owner != 8; ++owner) {
+			auto& ai = st.ai_players[owner];
+			if (!ai.active) continue;
+			if (!player_slot_active(owner)) {
+				ai.active = false;
+				continue;
+			}
+			for (size_t i = 0; i != ai.threads.size(); ++i) {
+				auto& th = ai.threads[i];
+				if (!th.active) continue;
+				if ((int)st.current_frame >= th.wait_until_frame) ai_interpret_thread(owner, th);
+			}
+			if (st.current_frame % 30 == (uint32_t)owner * 3) ai_manage(owner);
 		}
 	}
 
 	void execute_trigger(execute_trigger_struct& ets, int owner, running_trigger& rt, const trigger& t) {
+		if (trigger_tracing() && !(rt.flags & 1)) {
+			a_string types;
+			for (auto& a : t.actions) {
+				if (a.type == 0) break;
+				types += format("%d ", a.type);
+			}
+			trigger_trace_sink()(format("trace f%d p%d TRIGGER FIRES, actions: %s\n",
+			    (int)st.current_frame, owner, types));
+		}
 		rt.flags |= 1;
 		size_t index = rt.current_action_index;
 		for (;index != 64; ++index) {
 			auto& a = t.actions[index];
 			if (a.flags & 2) continue;
 			if (a.type == 0) index = 63;
-			else if (!execute_trigger_action(ets, owner, rt, rt.actions[index], a)) break;
+			else {
+				// Per-action trace: when an action throws, the last line printed
+				// names the action type, which is the only cheap way to find
+				// which one did it from a headless sweep.
+				if (trigger_tracing()) {
+					trigger_trace_sink()(format("trace f%d p%d action type=%d loc=%d unit=%d grp=%d/%d\n",
+					    (int)st.current_frame, owner, a.type, a.location, a.extra_n, a.group_n, a.group2_n));
+				}
+				if (!execute_trigger_action(ets, owner, rt, rt.actions[index], a)) break;
+			}
 		}
 		rt.current_action_index = index;
 		if (index == 64) {
@@ -19483,8 +22446,8 @@ struct state_functions {
 		unit_area.from.y = pos.y / 32u - unit_type->placement_size.y / 32u / 2;
 		unit_area.to.x = unit_area.from.x + unit_type->placement_size.x / 32u;
 		unit_area.to.y = unit_area.from.y + unit_type->placement_size.y / 32u;
-		(void)st.tiles.at(unit_area.from.y * game_st.map_tile_width + unit_area.from.x);
-		if (unit_area.from != unit_area.to) (void)st.tiles.at((unit_area.to.y - 1) * game_st.map_tile_width + unit_area.to.x - 1);
+		st.tiles.at(unit_area.from.y * game_st.map_tile_width + unit_area.from.x);
+		if (unit_area.from != unit_area.to) st.tiles.at((unit_area.to.y - 1) * game_st.map_tile_width + unit_area.to.x - 1);
 		for (size_t y = unit_area.from.y; y != unit_area.to.y; ++y) {
 			for (size_t x = unit_area.from.x; x != unit_area.to.x; ++x) {
 				if (!tile_can_have_creep({x, y})) continue;
@@ -19560,10 +22523,11 @@ struct state_copier {
 	state_copier(const state&st, state& r) : st(st), r(r), funcs(r) {}
 
 	std::array<bool, 1700> unit_copied{};
-	std::array<bool, 100> bullet_copied{};
-	std::array<bool, 2500> sprite_copied{};
-	std::array<bool, 5000> image_copied{};
-	std::array<bool, 2000> order_copied{};
+	// sized by the pools' capacities, which an SC:R game may have raised
+	a_vector<char> bullet_copied = a_vector<char>(st.bullets_container.capacity);
+	a_vector<char> sprite_copied = a_vector<char>(st.sprites_container.capacity);
+	a_vector<char> image_copied = a_vector<char>(st.images_container.capacity);
+	a_vector<char> order_copied = a_vector<char>(st.orders_container.capacity);
 	unit_t* unit(const unit_t* v) {
 		size_t index = v->index;
 		auto* u = r.units_container.get(index, false);
@@ -19597,6 +22561,7 @@ struct state_copier {
 			remap_unit(u->worker.gather_target);
 			remap_unit(u->building.addon);
 			remap_unit(u->building.rally.unit);
+			remap_unit(u->building.worker_rally.unit);
 			if (u->unit_type) {
 				if (funcs.ut_resource(u)) {
 					assemble(u->building.resource.gather_queue, v->building.resource.gather_queue, &state_copier::unit);
@@ -19712,6 +22677,10 @@ struct state_copier {
 
 	void operator()() {
 		(state_base_copyable&)r = (state_base_copyable&)st;
+		r.bullets_container.set_capacity(st.bullets_container.capacity);
+		r.sprites_container.set_capacity(st.sprites_container.capacity);
+		r.images_container.set_capacity(st.images_container.capacity);
+		r.orders_container.set_capacity(st.orders_container.capacity);
 
 		assemble(r.free_thingies, st.free_thingies, &state_copier::thingy);
 		assemble(r.active_thingies, st.active_thingies, &state_copier::thingy);
@@ -19906,6 +22875,21 @@ struct game_load_functions : state_functions {
 
 		st.unit_score = {};
 		st.building_score = {};
+
+		st.trigger_switches = {};
+		st.unit_deaths = {};
+		st.unit_kills = {};
+		st.eud_deaths.clear();
+		st.countdown_timer_ms = 0;
+		st.countdown_paused = false;
+		st.custom_score = {};
+		st.kills_score = {};
+		st.razings_score = {};
+		st.trigger_speech_muted = 0;
+		st.mission_objectives_string = {};
+		st.leaderboard = {};
+		st.next_scenario_string = 0;
+		st.ai_players = {};
 
 		st.supply_used = {};
 		st.supply_available = {};
@@ -21253,6 +24237,12 @@ struct game_load_functions : state_functions {
 				tag_t tag = std::get<0>(v);
 				auto i = chunks.find(tag);
 				if (i == chunks.end()) {
+					// SC:R maps ship "STRx" (32-bit string table) instead of classic
+					// "STR "; route a required "STR " to the extended handler.
+					if (tagstr(tag) == "STR ") {
+						auto x = chunks.find(tag_t("STRx"));
+						if (x != chunks.end()) { for (auto& c : x->second) tag_funcs[tag_t("STRx")](c); continue; }
+					}
 					if (std::get<1>(v)) error("map is missing required chunk '%s'", tagstr(tag));
 				} else {
 					if (!tag_funcs[tag]) error("tag '%s' is missing a function", tagstr(tag));
@@ -21307,6 +24297,31 @@ struct game_load_functions : state_functions {
 				}
 			}
 		};
+		// SC:R "extended" string table (Remastered 1.21+ map format): identical to
+		// "STR " but the count and every offset are 32-bit instead of 16-bit, so it
+		// can index >65535 strings. Populates the same game_st.map_strings, so SPRP/
+		// FORC/etc read from it unchanged. Protected/observer maps saved by the SC:R
+		// editor ship only "STRx" (no classic "STR "); read_chunks routes a required
+		// "STR " to this handler when only the extended form is present.
+		tag_funcs["STRx"] = [&](data_reader_le r) {
+			if (r.left() < 4) return;
+			auto start = r;
+			size_t num = r.get<uint32_t>();
+			game_st.map_strings.clear();
+			game_st.map_strings.resize(num);
+			for (size_t i = 0; i != num; ++i) {
+				size_t offset = r.get<uint32_t>();
+				auto t = start;
+				if (offset < t.left()) {
+					t.skip(offset);
+					char* b = (char*)t.ptr;
+					while (t.get<char>());
+					game_st.map_strings[i] = a_string(b, (char*)t.ptr - b - 1);
+				} else {
+					game_st.map_strings[i] = "<invalid string offset>";
+				}
+			}
+		};
 		tag_funcs["SPRP"] = [&](data_reader_le r) {
 			game_st.scenario_name = get_map_string(r.get<uint16_t>());
 			game_st.scenario_description = get_map_string(r.get<uint16_t>());
@@ -21317,16 +24332,22 @@ struct game_load_functions : state_functions {
 				game_st.forces[i].name = "";
 				game_st.forces[i].flags = 0;
 			}
-			if (r.left()) {
-				for (size_t i = 0; i != 8; ++i) {
-					st.players[i].force = r.get<uint8_t>();
-				}
-				for (size_t i = 0; i != 4; ++i) {
-					game_st.forces[i].name = get_map_string(r.get<uint16_t>());
-				}
-				for (size_t i = 0; i != 4; ++i) {
-					game_st.forces[i].flags = r.get<uint8_t>();
-				}
+			// v0.83.002: FORC is 20 bytes when complete (8 force assignments,
+			// 4 name string ids, 4 flag bytes) but it is legal for it to stop
+			// early -- several original campaign maps ship a 16-byte FORC with
+			// no flags at all, and reading the missing tail threw
+			// "data_reader: attempt to read past end" and killed the whole map
+			// load. Measured, not guessed: `aidump chunks` shows FORC len 16 on
+			// terran07, terran10 and the zerg/protoss tutorials, and len 20 on
+			// every map that loaded. Anything absent keeps the zeroed default.
+			for (size_t i = 0; i != 8 && r.left(); ++i) {
+				st.players[i].force = r.get<uint8_t>();
+			}
+			for (size_t i = 0; i != 4 && r.left() >= 2; ++i) {
+				game_st.forces[i].name = get_map_string(r.get<uint16_t>());
+			}
+			for (size_t i = 0; i != 4 && r.left(); ++i) {
+				game_st.forces[i].flags = r.get<uint8_t>();
 			}
 		};
 		tag_funcs["VCOD"] = [&](data_reader_le r) {
@@ -21337,6 +24358,7 @@ struct game_load_functions : state_functions {
 
 		tag_funcs["MTXM"] = [&](data_reader_le r) {
 			game_st.gfx_tiles.resize(game_st.map_tile_width * game_st.map_tile_height);
+			game_st.tiles_beyond_tileset = 0;
 			for (size_t i = 0; r.left(); ++i) {
 				if (r.left() == 1) {
 					game_st.gfx_tiles.at(i).raw_value &= 0xff00;
@@ -21348,7 +24370,7 @@ struct game_load_functions : state_functions {
 			}
 			for (size_t i = 0; i != game_st.gfx_tiles.size(); ++i) {
 				tile_id tile_id = game_st.gfx_tiles[i];
-				if (tile_id.group_index() >= game_st.cv5.size()) tile_id = {};
+				if (tile_id.group_index() >= game_st.cv5.size()) { tile_id = {}; ++game_st.tiles_beyond_tileset; }
 				size_t megatile_index = game_st.cv5.at(tile_id.group_index()).mega_tile_index[tile_id.subtile_index()];
 				int cv5_flags = game_st.cv5.at(tile_id.group_index()).flags & ~(tile_t::flag_walkable | tile_t::flag_unwalkable | tile_t::flag_very_high | tile_t::flag_middle | tile_t::flag_high | tile_t::flag_partially_walkable);
 				st.tiles_mega_tile_index[i] = (uint16_t)megatile_index;
@@ -21392,8 +24414,14 @@ struct game_load_functions : state_functions {
 					if (unit_type == UnitTypes::Special_Pit_Door) owner = 11;
 					if (unit_type == UnitTypes::Special_Right_Pit_Door) owner = 11;
 					if (use_map_settings || owner == 11) {
-						create_initial_unit(get_unit_type(unit_type), xy(x, y), owner);
-						if (flags & 0x80) error("disable thingy unit");
+						unit_t* tu = create_initial_unit(get_unit_type(unit_type), xy(x, y), owner);
+						// v0.83.002: flag 0x80 means "this unit starts disabled".
+						// It used to throw, aborting the whole map load -- The
+						// Jacobs Installation, The Amerigo, protoss06 and
+						// expterran07 all died right here, and all four are door
+						// maps. Starting disabled is the normal state for a door;
+						// trigger action 42 is what opens it.
+						if (flags & 0x80) set_unit_doodad_state(tu, false);
 					}
 				}
 			}
@@ -21646,10 +24674,6 @@ struct game_load_functions : state_functions {
 					make_unit_hallucination(u);
 				}
 
-				if (valid_flags & 0x10 && flags & 0x10) {
-					u_set_status_flag(u, unit_t::status_flag_invincible);
-				}
-
 				if (unit_is(u, UnitTypes::Zerg_Broodling)) {
 					set_remove_timer(u);
 				}
@@ -21664,25 +24688,17 @@ struct game_load_functions : state_functions {
 
 		tag_funcs["UPRP"] = [&](data_reader_le r) {
 			for (int i = 0; i < 64; ++i) {
-				int valid_flags = r.get<uint16_t>();
-				int valid_properties = r.get<uint16_t>();
-				int owner = r.get<uint8_t>();
-				int hp_percent = r.get<uint8_t>();
-				int shield_percent = r.get<uint8_t>();
-				int energy_percent = r.get<uint8_t>();
-				int resources = r.get<uint32_t>();
-				int units_in_hangar = r.get<uint16_t>();
-				int flags = r.get<uint16_t>();
+				auto& p = game_st.uprp[i];
+				p.valid_flags = r.get<uint16_t>();
+				p.valid_properties = r.get<uint16_t>();
+				p.owner = r.get<uint8_t>();
+				p.hp_percent = r.get<uint8_t>();
+				p.shield_percent = r.get<uint8_t>();
+				p.energy_percent = r.get<uint8_t>();
+				p.resources = r.get<uint32_t>();
+				p.units_in_hangar = r.get<uint16_t>();
+				p.unit_flags = r.get<uint16_t>();
 				r.get<uint32_t>();
-				(void)valid_flags;
-				(void)valid_properties;
-				(void)owner;
-				(void)hp_percent;
-				(void)shield_percent;
-				(void)energy_percent;
-				(void)resources;
-				(void)units_in_hangar;
-				(void)flags;
 			}
 		};
 
@@ -21745,12 +24761,41 @@ struct game_load_functions : state_functions {
 			}
 			for (auto& t : game_st.triggers) {
 				for (int i = 0; i != 8; ++i) {
-					if (st.players[i].controller != player_t::controller_occupied) continue;
-					if (!t.enabled[i] && !t.enabled.at(17 + st.players[i].force) && !t.enabled[17]) continue;
+					// Must match player_slot_active(), which is what
+					// process_triggers() iterates: registering a narrower set
+					// than the executor walks silently drops every trigger
+					// owned by a neutral or rescuable slot, and campaign maps
+					// use those constantly.
+					auto c = st.players[i].controller;
+					if (c != player_t::controller_occupied
+					    && c != player_t::controller_computer_game
+					    && c != player_t::controller_neutral
+					    && c != player_t::controller_rescue_passive
+					    && c != player_t::controller_unused_rescue_active) continue;
+					// enabled[] group indices: 18-21 = Force 1-4; player force
+					// is stored 0-based from the FORC chunk.
+					if (!t.enabled[i] && !t.enabled.at(18 + st.players[i].force) && !t.enabled[17]) continue;
 					st.running_triggers[i].emplace_back();
 					auto& rt = st.running_triggers[i].back();
 					rt.t = &t;
 					rt.flags = t.execution_flags;
+				}
+			}
+			if (trigger_tracing()) {
+				trigger_trace_sink()(format("trace: TRIG parsed %d triggers\n", (int)game_st.triggers.size()));
+				for (int i = 0; i != 8; ++i) {
+					trigger_trace_sink()(format("trace: player %d controller %d force %d -> %d triggers\n",
+					    i, (int)st.players[i].controller, st.players[i].force,
+					    (int)st.running_triggers[i].size()));
+				}
+				// Which execution-flag groups the map actually uses. A trigger
+				// enabled only for a slot we treat as inactive is silently
+				// inert, and that is invisible from inside the game.
+				int ti = 0;
+				for (auto& t : game_st.triggers) {
+					a_string bits;
+					for (int k = 0; k != 28; ++k) if (t.enabled[k]) bits += format("%d ", k);
+					trigger_trace_sink()(format("trace: trigger %d enabled for: %s\n", ti++, bits));
 				}
 			}
 		};
@@ -21787,11 +24832,6 @@ struct game_load_functions : state_functions {
 					st.alliances[i2][i] = 1;
 				}
 			}
-			if (!use_map_settings) {
-				if (st.players[i].controller == player_t::controller_open || st.players[i].controller == player_t::controller_computer) {
-					st.players[i].race = (race_t)5;
-				}
-			}
 		}
 
 		if (setup_f) {
@@ -21805,16 +24845,70 @@ struct game_load_functions : state_functions {
 
 		use_map_settings = setup_info.victory_condition == 0 && setup_info.tournament_mode == 0 && setup_info.starting_units == 0;
 
-		if (version == 59 || version == 63) {
+		// open1161HD task 6: in a use-map-settings game (campaign/UMS) the enemy AI
+		// players are coordinated against the HUMAN, not against each other. StarCraft
+		// campaign missions routinely place rival computer bases point-blank -- e.g.
+		// "Agents of the Swarm" seats the enemy Terran's units ~3 tiles from Raynor's
+		// lone Command Center -- and rely on them NOT razing each other. Our default
+		// all-enemies matrix let the enemy Terran auto-acquire and destroy Raynor's CC
+		// in ~30s, firing the "Raynor's CC destroyed -> Victory" trigger before the
+		// mission could play (user-confirmed: "Blue Terran keeps killing teal Raynor
+		// from the start"). Make computer-controlled players non-aggressive toward each
+		// other so they focus the human; humans stay hostile to every computer (and
+		// vice-versa), so the mission's real objectives are unchanged. Gated on a human
+		// being present and on use_map_settings, so melee / skirmish-vs-AI / the replay
+		// + LAN determinism path are byte-identical (they are never use_map_settings).
+		// NOTE: a mission with a FRIENDLY AI meant to actively fight an enemy AI would
+		// also be quieted here -- flagged for on-device validation.
+		if (use_map_settings) {
+			bool any_human = false;
+			for (size_t i = 0; i != 12; ++i)
+				if (st.players[i].controller == player_t::controller_occupied) { any_human = true; break; }
+			auto is_computer = [&](size_t i) {
+				return st.players[i].controller == player_t::controller_computer
+				    || st.players[i].controller == player_t::controller_computer_game;
+			};
+			if (any_human) {
+				for (size_t i = 0; i != 12; ++i)
+					for (size_t j = 0; j != 12; ++j)
+						if (i != j && is_computer(i) && is_computer(j))
+							st.alliances[i][j] = 1;
+			}
+		}
+
+		// Melee-style games take races from the lobby, not the map, so open and
+		// computer slots are reset to "random". This must happen AFTER setup_f
+		// and the use_map_settings decision: UMS/campaign games keep the SIDE
+		// races (previously the reset ran unconditionally and clobbered them).
+		if (!use_map_settings) {
+			for (size_t i = 0; i != 12; ++i) {
+				if (st.players[i].controller == player_t::controller_open || st.players[i].controller == player_t::controller_computer) {
+					st.players[i].race = (race_t)5;
+				}
+			}
+		}
+
+		// v0.83.002: version 57 is the original 1.00-1.03 scenario format and
+		// four campaign missions still ship in it -- terran07, terran10 and the
+		// zerg/protoss tutorials -- so "unsupported map version 57" meant those
+		// missions could never start. It is the same chunk set as 59 minus the
+		// per-map unit/upgrade/tech override tables, which did not exist yet;
+		// `aidump chunks` on all four shows STR/MTXM/THG2/MASK/PUNI/UPGR/PTEC/
+		// UNIT/UPRP/MRGN/TRIG present and UNIS/UPGS/TECS absent. Those three are
+		// therefore optional here: a map without them simply keeps units.dat's
+		// own values, which is exactly what the original game did.
+		// v1.0.7: 64 is SC:R's counterpart of 63 (as 206 is of 205): the same chunk
+		// set, with the 32-bit string table (STRx) and the optional player colours.
+		if (version == 57 || version == 59 || version == 63 || version == 64) {
 			if (use_map_settings) {
 				read_chunks({
 					{"STR ", true},
 					{"MTXM", true},
 					{"THG2", true},
 					{"MASK", true},
-					{"UNIS", true},
-					{"UPGS", true},
-					{"TECS", true},
+					{"UNIS", false},
+					{"UPGS", false},
+					{"TECS", false},
 					{"PUNI", true},
 					{"UPGR", true},
 					{"PTEC", true},
@@ -21826,17 +24920,22 @@ struct game_load_functions : state_functions {
 					{"UNIT", true},
 					{"UPRP", true},
 					{"MRGN", true},
-					{"TRIG", true}
+					{"TRIG", true},
+					{"COLR", false}
 				});
 			} else {
 				read_chunks({
 					{"STR ", true},
 					{"MTXM", true},
 					{"THG2", true},
-					{"UNIT", true}
+					{"UNIT", true},
+					{"COLR", false}
 				});
 			}
-		} else if (version == 205) {
+		} else if (version == 205 || version == 206) {
+			// 205 = Brood War; 206 = SC:R "Remastered" map version. Same CHK chunk
+			// layout (SC:R just adds the extended STRx/UNIx/... sections, already
+			// handled), so it loads through the identical path.
 			if (use_map_settings) {
 				read_chunks({
 					{"STR ", true},
@@ -21895,8 +24994,12 @@ struct game_load_functions : state_functions {
 		}
 		for (size_t i = 0; i != 12; ++i) {
 			if (st.players[i].controller != player_t::controller_occupied) continue;
-			if (st.players[i].force >= 1 && st.players[i].force <= 4) {
-				if (game_st.forces[st.players[i].force - 1].flags & 8) {
+			// FORC stores the force 0-based (0-3), which is how the trigger
+			// group predicate reads it (group 18 == force 0). This used to
+			// test 1..4 and index [force-1], which both skipped Force 1
+			// entirely and gave every other force its neighbour's flags.
+			if (st.players[i].force < 4) {
+				if (game_st.forces[st.players[i].force].flags & 8) {
 					for (size_t i2 = 0; i2 != 12; ++i2) {
 						if (st.players[i2].controller != player_t::controller_occupied) continue;
 						if (st.players[i2].force == st.players[i].force) st.shared_vision[i] |= 1 << i2;
@@ -22117,6 +25220,24 @@ void global_init(global_state& st, load_data_file_F&& load_data_file) {
 						}
 						int opcode = r.get<uint8_t>();
 						if ((size_t)opcode >= ins_data.size()) error("iscript load: at 0x%04x: invalid instruction %d", cur_address, opcode);
+#ifdef BWGAME_ISCRIPT_CENSUS
+						// Measurement hooks, compiled out unless asked for.
+						// -DBWGAME_ISCRIPT_CENSUS=<opcode> reports every script
+						// carrying that opcode; -DBWGAME_ISCRIPT_DUMP=<script id>
+						// disassembles one script with its animation table. Both
+						// read from the decoder that already knows the operand
+						// widths, so neither can disagree with the engine about
+						// where an instruction starts. This is how opcode 35 was
+						// traced to a single unit; see set_unit_doodad_state().
+						if (opcode == BWGAME_ISCRIPT_CENSUS) {
+							auto peek = r;
+							std::printf("census: opcode %d in script %d at 0x%04x, operand %d\n",
+								opcode, id, (unsigned)cur_address, (int)peek.get<uint8_t>());
+						}
+#endif
+#ifdef BWGAME_ISCRIPT_DUMP
+						size_t dump_first = program_data.size();
+#endif
 						program_data.push_back(opcode + 0x808091);
 						const char* c = ins_data[opcode];
 						while (*c) {
@@ -22150,6 +25271,14 @@ void global_init(global_state& st, load_data_file_F&& load_data_file) {
 							}
 							++c;
 						}
+#ifdef BWGAME_ISCRIPT_DUMP
+						if (id == BWGAME_ISCRIPT_DUMP) {
+							std::printf("0x%04x  op %-3d", (unsigned)cur_address, opcode);
+							for (size_t k = dump_first; k < program_data.size(); ++k)
+								std::printf(" %d", program_data[k]);
+							std::printf("\n");
+						}
+#endif
 					}
 					return initial_pc;
 				};
@@ -22176,6 +25305,10 @@ void global_init(global_state& st, load_data_file_F&& load_data_file) {
 				}
 				auto anim_r = base_r;
 				anim_r.skip(anim_address);
+#ifdef BWGAME_ISCRIPT_DUMP
+				if (id == BWGAME_ISCRIPT_DUMP)
+					std::printf("== script %d animation %d at 0x%04x\n", id, (int)i, (unsigned)anim_address);
+#endif
 				anim_funcs.push_back(decode_at(anim_address));
 			}
 		}
@@ -22292,6 +25425,8 @@ void global_init(global_state& st, load_data_file_F&& load_data_file) {
 	load_data_file(st.techdata_dat, "arr/techdata.dat");
 
 	load_data_file(st.melee_trg, "triggers/Melee.trg");
+	load_data_file(st.aiscript_bin, "scripts/aiscript.bin");
+	load_data_file(st.bwscript_bin, "scripts/bwscript.bin");
 
 	a_vector<uint8_t> buf;
 	load_data_file(buf, "arr/flingy.dat");

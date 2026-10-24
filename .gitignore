@@ -1,0 +1,13 @@
+# Android build outputs and fetched build inputs
+android/.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/local.properties
+android/app/jni/SDL/
+android/app/jni/SDL_mixer/
+android/app/src/main/java/org/libsdl/
+
+# Game data is never part of the repository
+*.mpq
+*.MPQ

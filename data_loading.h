@@ -232,6 +232,11 @@ struct file_reader {
 		if (f) fclose(f);
 		f = fopen(filename.c_str(), "rb");
 		if (!f) error("file_reader: failed to open %s for reading", filename.c_str());
+		// MPQ loading issues thousands of small reads; on Android the data
+		// dir is behind FUSE where the default 4K stdio buffer makes startup
+		// slow. A larger buffer cuts the syscall count. (stdio frees it on
+		// fclose.)
+		setvbuf(f, nullptr, _IOFBF, 256 * 1024);
 		this->filename = std::move(filename);
 	}
 
@@ -280,7 +285,7 @@ struct file_reader {
 		return (size_t)ftell(f);
 	}
 
-	size_t size() {
+	size_t size() const {   // const: left() is const and calls it (replay qol trailer probe)
 		auto prev_pos = ftell(f);
 		fseek(f, 0, SEEK_END);
 		auto r = ftell(f);
@@ -964,7 +969,7 @@ size_t decompress_adpcm(uint8_t* input, size_t input_size, uint8_t* output, size
 	for (size_t i = 0; i != channels; ++i) {
 		auto sample = r.template get<int16_t>();
 		previous_sample[i] = sample;
-		if (out_pos - output_size < 2) error("decompress_adpcm: attempt to write past end");
+		if (output_size - out_pos < 2) return out_pos; // output full: done (Storm stops here too)
 		set_value_at<little_endian, int16_t>(output + out_pos, sample);
 		out_pos += 2;
 	}
@@ -991,7 +996,7 @@ size_t decompress_adpcm(uint8_t* input, size_t input_size, uint8_t* output, size
 				}
 				
 				previous_sample[channel] = sample;
-				if (out_pos - output_size < 2) error("decompress_adpcm: attempt to write past end");
+				if (output_size - out_pos < 2) return out_pos; // output full: done (Storm stops here too)
 				set_value_at<true, int16_t>(output + out_pos, sample);
 				out_pos += 2;
 				
@@ -1003,7 +1008,7 @@ size_t decompress_adpcm(uint8_t* input, size_t input_size, uint8_t* output, size
 				int n = in_value & 0x7f;
 				if (n == 0) {
 					if (step_index[channel] != 0) --step_index[channel];
-					if (out_pos - output_size < 2) error("decompress_adpcm: attempt to write past end");
+					if (output_size - out_pos < 2) return out_pos; // output full: done (Storm stops here too)
 					set_value_at<little_endian, int16_t>(output + out_pos, previous_sample[channel]);
 					out_pos += 2;
 				} else if (n == 1) {
@@ -1049,12 +1054,19 @@ struct mpq_archive_file_reader {
 	size_t file_position = 0;
 	mpq_archive_file_reader(a_string arg_filename, base_reader_T& r, size_t sector_size, block_table_entry be, uint32_t key, const crypt_table_t& crypt_table) : filename(std::move(arg_filename)), r(r), sector_size(sector_size), be(be), key(key), crypt_table(crypt_table) {
 
-		if (~be.flags & 0x200 && ~be.flags & 0x100) {
-			error("mpq: %s: file is not compressed", filename);
-		}
-
 		sector_data.resize(sector_size);
 		r.seek(be.data_offset);
+
+		if (~be.flags & 0x200 && ~be.flags & 0x100) {
+			// Stored (uncompressed) file: there is no sector-offset table in
+			// the archive; synthesize one over raw sector_size chunks. The
+			// raw-read path in read_sector (sector_data_size == expected
+			// size) then handles it, including per-sector decryption.
+			size_t n = ((size_t)be.size + sector_size - 1) / sector_size;
+			for (size_t i = 0; i != n; ++i) compressed_sectors.push_back(i * sector_size);
+			compressed_sectors.push_back(be.size);
+			return;
+		}
 
 		auto read_sectors = [&](auto&& sectors_r) {
 			while (true) {
@@ -1079,6 +1091,15 @@ struct mpq_archive_file_reader {
 		r.seek(be.data_offset + compressed_sectors[current_sector]);
 
 		int compression_flags;
+		// How many bytes of compressed_data are actually payload. With the
+		// 0x200 (multi-compression) flag the first byte of the sector is the
+		// compression mask, so the payload is one byte SHORTER than the sector.
+		// Passing the full sector length on to the decompressors made them read
+		// one uninitialised byte past the data: PKWARE and the ADPCM paths stop
+		// on their own and never noticed, but huffman keeps consuming until its
+		// output is full and threw "data_reader: attempt to read past end".
+		// That is what killed Backwater Station -- on one briefing WAV.
+		size_t payload_size = sector_data_size;
 		auto get_data = [&](auto&& sector_data_r) {
 			if (~be.flags & 0x200) {
 				compression_flags = 8;
@@ -1086,14 +1107,15 @@ struct mpq_archive_file_reader {
 				sector_data_r.get_bytes(compressed_data.data(), sector_data_size);
 			} else {
 				compression_flags = sector_data_r.template get<uint8_t>();
-	
+				payload_size = sector_data_size - 1;
 				if (compressed_data.size() < sector_data_size) compressed_data.resize(sector_data_size);
-				sector_data_r.get_bytes(compressed_data.data(), sector_data_size - 1);
+				sector_data_r.get_bytes(compressed_data.data(), payload_size);
 			}
 		};
 
 		size_t current_sector_size = sector_data.size();
 		if (current_sector == compressed_sectors.size() - 2) current_sector_size = be.size % sector_size;
+		if (current_sector_size == 0) current_sector_size = sector_size; // size an exact multiple of sector_size
 
 		if (sector_data_size == current_sector_size && sector_data_size <= sector_size) {
 			if (be.flags & 0x10000) make_encrypted_reader(r, sector_data_size, key + (uint32_t)current_sector, crypt_table).get_bytes(sector_data.data(), sector_data_size);
@@ -1101,9 +1123,9 @@ struct mpq_archive_file_reader {
 		} else {
 			if (be.flags & 0x10000) get_data(make_encrypted_reader(r, sector_data_size, key + (uint32_t)current_sector, crypt_table));
 			else get_data(r);
-			if (compression_flags == 8) decompress(compressed_data.data(), sector_data_size, sector_data.data(), current_sector_size);
+			if (compression_flags == 8) decompress(compressed_data.data(), payload_size, sector_data.data(), current_sector_size);
 			else {
-				size_t input_size = sector_data_size;
+				size_t input_size = payload_size;
 				auto swap_buffers = [&](size_t new_input_size) {
 					input_size = new_input_size;
 					std::swap(compressed_data, sector_data);
@@ -1166,11 +1188,26 @@ struct mpq_archive_reader {
 	base_reader_T& r;
 
 	size_t sector_size;
+	size_t base_offset = 0; // MPQ header position within the file (MZ-stub archives)
 	a_vector<hash_table_entry> hash_table;
 	a_vector<block_table_entry> block_table;
 	explicit mpq_archive_reader(base_reader_T& r) : r(r) {
 		auto mpq_signature = r.template get<uint32_t>();
-		if (mpq_signature != 0x1a51504d) error("signature mismatch; file is not an mpq archive");
+		// Self-executing archives (e.g. the CD StarCraft.mpq / BroodWar.mpq,
+		// which carry the game music) have an MZ stub before the MPQ data.
+		// Like Storm, scan for the header at 512-byte boundaries; all archive
+		// offsets are then relative to the header, so record the base.
+		size_t base = 0;
+		if (mpq_signature != 0x1a51504d) {
+			size_t limit = r.size();
+			if (limit > 16 * 1024 * 1024) limit = 16 * 1024 * 1024;
+			for (size_t pos = 512; pos + 4 <= limit; pos += 512) {
+				r.seek(pos);
+				if (r.template get<uint32_t>() == 0x1a51504d) { base = pos; break; }
+			}
+			if (base == 0) error("signature mismatch; file is not an mpq archive");
+		}
+		base_offset = base;
 
 		r.template get<uint32_t>();
 		r.template get<uint32_t>();
@@ -1180,8 +1217,8 @@ struct mpq_archive_reader {
 
 		sector_size = (size_t)512 * 1<<block_size;
 
-		size_t hash_table_offset = (size_t)r.template get<uint32_t>();
-		size_t block_table_offset = (size_t)r.template get<uint32_t>();
+		size_t hash_table_offset = base + (size_t)r.template get<uint32_t>();
+		size_t block_table_offset = base + (size_t)r.template get<uint32_t>();
 
 		size_t hash_table_size = (size_t)(r.template get<uint32_t>() * 16 / 16);
 		size_t block_table_size = (size_t)(r.template get<uint32_t>() * 16 / 16);
@@ -1209,7 +1246,9 @@ struct mpq_archive_reader {
 			auto compressed_size = block_table_r.template get<uint32_t>();
 			auto size = block_table_r.template get<uint32_t>();
 			auto flags = block_table_r.template get<uint32_t>();
-			block_table.push_back({data_offset, compressed_size, size, flags});
+			// data_offset is relative to the MPQ header; rebase it here so the
+			// file readers never need to know about the MZ stub.
+			block_table.push_back({(uint32_t)(base + data_offset), compressed_size, size, flags});
 		}
 	}
 
@@ -1255,7 +1294,9 @@ struct mpq_archive_reader {
 
 		uint32_t file_key = string_hash(c, 3, crypt_table);
 		if (be.flags & 0x20000) {
-			file_key = (file_key + be.data_offset) ^ be.size;
+			// The adjusted key uses the block position relative to the MPQ
+			// header (data_offset was rebased to the file at load time).
+			file_key = (file_key + (uint32_t)(be.data_offset - base_offset)) ^ be.size;
 		}
 
 		return mpq_archive_file_reader<base_reader_T, default_little_endian>(std::move(filename), r, sector_size, be, file_key, crypt_table);
@@ -1312,6 +1353,13 @@ struct data_files_loader {
 			}
 		}
 		error("data_files_loader: %s: file not found", filename);
+	}
+
+	bool file_exists(const a_string& filename) {
+		for (auto& v : mpqs) {
+			if (v.mpq.file_exists(filename)) return true;
+		}
+		return false;
 	}
 };
 

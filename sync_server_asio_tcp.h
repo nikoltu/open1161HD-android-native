@@ -15,7 +15,13 @@ struct sync_server_asio_tcp: sync_server_asio_socket<asio::ip::tcp::socket> {
 	};
 
 	void accept_handler(const asio::error_code& ec, std::shared_ptr<acceptor_t> acceptor) {
-		if (!ec) new_connection_handler(std::move(acceptor->socket));
+		if (!ec) {
+			// Lockstep sends tiny per-frame packets; without TCP_NODELAY, Nagle +
+			// delayed-ACK stalls each round-trip ~40ms and the sim crawls at ~15fps.
+			asio::error_code ig;
+			acceptor->socket.set_option(asio::ip::tcp::no_delay(true), ig);
+			new_connection_handler(std::move(acceptor->socket));
+		}
 		auto* a = &*acceptor;
 		a->acceptor.async_accept(a->socket, std::bind(&sync_server_asio_tcp::accept_handler, this, std::placeholders::_1, std::move(acceptor)));
 	}
@@ -56,6 +62,9 @@ struct sync_server_asio_tcp: sync_server_asio_socket<asio::ip::tcp::socket> {
 		auto* s = &*socket;
 		s->async_connect(ep, [this, socket = std::move(socket)](const asio::error_code& ec) {
 			if (!ec) {
+				// See accept_handler: disable Nagle so lockstep runs at full rate.
+				asio::error_code ig;
+				socket->set_option(asio::ip::tcp::no_delay(true), ig);
 				new_connection_handler(std::move(*socket));
 			}
 		});

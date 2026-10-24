@@ -40,8 +40,22 @@ struct action_functions: state_functions {
 	action_state& action_st;
 	explicit action_functions(state& st, action_state& action_st) : state_functions(st), action_st(action_st) {}
 
+	// v0.52 (Android LAN): when set, a networked human leaving a melee game
+	// hands their units to the built-in aiscript AI instead of neutralizing
+	// them. Only the LAN net sim enables this, and ai_takeover_left_player()
+	// only acts when at most one human will remain - the sole case where a
+	// player-leave is determinism-safe (a single simulator, no peer to diverge
+	// against). Campaigns / single-player never set it, so their leave/defeat
+	// paths are untouched.
+	bool ai_takeover_on_leave = false;
+
 	bool unit_can_be_multi_selected(const unit_t* u) const {
-		if (ut_building(u)) return false;
+		// Vanilla BW allows only ONE building in a selection. The SCBW2 "multi-building
+		// select" house rule lifts that (SC2-style MBS + group rally). Off by default,
+		// so this branch is byte-identical to vanilla for the determinism gates; when
+		// the host enables it, every peer loaded the same game_state.qol so the lockstep
+		// selection is identical across the network.
+		if (ut_building(u) && !st.game->qol.multi_building_select) return false;
 		if (ut_flag(u, (unit_type_t::flags_t)0x800)) return false;
 		if (unit_is_disabled(u)) return false;
 		auto tid = u->unit_type->id;
@@ -504,8 +518,23 @@ struct action_functions: state_functions {
 				if (unit_is_factory(u)) {
 					retval = true;
 					if (!target) target = u;
-					u->building.rally.unit = target;
-					u->building.rally.pos = target->sprite->position;
+					// open1161HD split rally: a rally onto a RESOURCE sets the
+					// worker-only rally (spawned workers auto-gather it); a rally onto
+					// anything else is the vanilla unit rally. Independent fields, so
+					// one town hall can auto-mine its workers AND rally its army
+					// elsewhere. This is the command path the UI actually uses (opcode
+					// 21); the order_RightClickAction path mirrors it.
+					bool is_resource = st.game->qol.worker_rally_split
+					    && (unit_is_mineral_field(target)
+					    || unit_is(target, UnitTypes::Resource_Vespene_Geyser)
+					    || unit_is_refinery(target));
+					if (is_resource && target != u) {
+						u->building.worker_rally.unit = target;
+						u->building.worker_rally.pos = target->sprite->position;
+					} else {
+						u->building.rally.unit = target;
+						u->building.rally.pos = target->sprite->position;
+					}
 				}
 				u->user_action_flags |= 2;
 			} else if (order->id == Orders::RallyPointTile) {
@@ -978,7 +1007,31 @@ struct action_functions: state_functions {
 		return retval;
 	}
 	
+	// Convert a leaving human into an aiscript computer that keeps its units.
+	// Returns false (caller falls back to the normal leave/neutralize path)
+	// when takeover is disabled, the slot is not an active human, or more than
+	// one human would remain (unsafe for lockstep determinism).
+	bool ai_takeover_left_player(int owner) {
+		if (owner < 0 || owner >= 8) return false;
+		auto& p = st.players.at(owner);
+		if (p.controller != player_t::controller_occupied) return false;
+		int humans = 0;
+		for (int i = 0; i != 8; ++i)
+			if (st.players[i].controller == player_t::controller_occupied) ++humans;
+		if (humans > 2) return false; // leaver still counted: >2 means 2+ remain
+		p.controller = player_t::controller_computer_game;
+		uint32_t id;
+		switch (p.race) {
+		case race_t::zerg:    id = (uint32_t)'Z' | ((uint32_t)'M' << 8) | ((uint32_t)'C' << 16) | ((uint32_t)'u' << 24); break;
+		case race_t::protoss: id = (uint32_t)'P' | ((uint32_t)'M' << 8) | ((uint32_t)'C' << 16) | ((uint32_t)'u' << 24); break;
+		default:              id = (uint32_t)'T' | ((uint32_t)'M' << 8) | ((uint32_t)'C' << 16) | ((uint32_t)'u' << 24); break;
+		}
+		ai_start_script(owner, id);
+		return true;
+	}
+
 	bool action_player_leave(int owner, int reason) {
+		if (ai_takeover_on_leave && ai_takeover_left_player(owner)) return true;
 		if (reason == 6) player_dropped(owner);
 		else player_left(owner);
 		return true;
@@ -1007,8 +1060,31 @@ struct action_functions: state_functions {
 		if (n > 12) error("invalid selection of %d units", n);
 		static_vector<unit_t*, 12> units;
 		for (size_t i = 0; i != n; ++i) {
-			auto uid = unit_id(r.template get<uint16_t>());
-			units.push_back(get_unit(uid));
+			uint16_t raw = r.template get<uint16_t>();
+			unit_t* u = get_unit(unit_id(raw));
+			// Harness-only (same test as the SC:R select): a multi-selection holding a
+			// foreign unit or a building means our unit ids drifted from the recording.
+			if (u && n > 1 && !st.player_units[owner].empty() && (u->owner != owner || ut_building(u))) {
+				if (!st.scr_dbg_sel_odd++) st.scr_dbg_sel_odd_first_frame = (int)st.current_frame;
+				st.scr_dbg_sel_odd_last_tag = raw;
+			}
+			if (!u && raw) {
+				if (st.scr_dbg_first_null_frame < 0) {   // capture the first divergence
+					st.scr_dbg_first_null_frame = (int)st.current_frame;
+					st.scr_dbg_first_null_tag = raw;
+					st.scr_dbg_first_null_owner = owner;
+					// what does OUR container hold at the missed slot? recycled (a live
+					// unit of another owner) vs empty tells count-shift from order-shift.
+					unit_id rid(raw);
+					unit_t* slot = rid.index() ? get_unit(rid.index() - 1) : nullptr;
+					st.scr_dbg_first_null_slot_owner = slot ? slot->owner : -2;
+					st.scr_dbg_first_null_slot_gen = slot ? (int)(slot->unit_id_generation % 32) : -1;
+					st.scr_dbg_first_null_want_gen = (int)rid.generation();
+				}
+				++st.scr_dbg_sel_null;   // classic select miss = sim divergence
+				if (owner >= 0 && owner < 12) ++st.scr_dbg_sel_null_by_owner[owner];
+			}
+			units.push_back(u);
 		}
 		return action_select(owner, units);
 	}
@@ -1019,8 +1095,31 @@ struct action_functions: state_functions {
 		if (n > 12) error("invalid selection of %d units", n);
 		static_vector<unit_t*, 12> units;
 		for (size_t i = 0; i != n; ++i) {
-			auto uid = unit_id(r.template get<uint16_t>());
-			units.push_back(get_unit(uid));
+			uint16_t raw = r.template get<uint16_t>();
+			unit_t* u = get_unit(unit_id(raw));
+			// Harness-only (same test as the SC:R select): a multi-selection holding a
+			// foreign unit or a building means our unit ids drifted from the recording.
+			if (u && n > 1 && !st.player_units[owner].empty() && (u->owner != owner || ut_building(u))) {
+				if (!st.scr_dbg_sel_odd++) st.scr_dbg_sel_odd_first_frame = (int)st.current_frame;
+				st.scr_dbg_sel_odd_last_tag = raw;
+			}
+			if (!u && raw) {
+				if (st.scr_dbg_first_null_frame < 0) {   // capture the first divergence
+					st.scr_dbg_first_null_frame = (int)st.current_frame;
+					st.scr_dbg_first_null_tag = raw;
+					st.scr_dbg_first_null_owner = owner;
+					// what does OUR container hold at the missed slot? recycled (a live
+					// unit of another owner) vs empty tells count-shift from order-shift.
+					unit_id rid(raw);
+					unit_t* slot = rid.index() ? get_unit(rid.index() - 1) : nullptr;
+					st.scr_dbg_first_null_slot_owner = slot ? slot->owner : -2;
+					st.scr_dbg_first_null_slot_gen = slot ? (int)(slot->unit_id_generation % 32) : -1;
+					st.scr_dbg_first_null_want_gen = (int)rid.generation();
+				}
+				++st.scr_dbg_sel_null;   // classic select miss = sim divergence
+				if (owner >= 0 && owner < 12) ++st.scr_dbg_sel_null_by_owner[owner];
+			}
+			units.push_back(u);
 		}
 		return action_shift_select(owner, units);
 	}
@@ -1034,6 +1133,196 @@ struct action_functions: state_functions {
 			auto uid = unit_id(r.template get<uint16_t>());
 			units.push_back(get_unit(uid));
 		}
+		return action_deselect(owner, units);
+	}
+
+	// --- SC:R "121" command variants (0x60-0x65) --------------------------
+	// Identical to their classic counterparts except unit tags are 4 bytes (u32).
+	// Only Remastered (seRS) replays emit these -- classic (reRS) replays never do,
+	// so the melee-determinism gate is unaffected (purely additive).
+	//
+	// The SC:R tag is NOT a classic index|generation value: it is a DENSE GLOBAL
+	// MONOTONIC per-creation counter (measured on real 2v2 seRS replays: 24
+	// starting units get 24 consecutive tags in slot order 0,1,2,3 = our creation
+	// order). So SC:R_tag = our_creation_ordinal + K for a single global constant K.
+	// create_unit records each unit's ordinal in st.scr_seq_to_uid (see bwgame.h);
+	// K is calibrated once (scr_calibrate_tag) from the first multi-unit select-121.
+	// Resolution is then a direct table lookup. Before calibration, or for a tag
+	// outside the table (e.g. a neutral gather target created before tracking, or a
+	// tag=0 "no target" sentinel), it returns null -- exactly as an unresolved
+	// target should. Classic reRS never sets scr_tag_mode -> the classic branch is
+	// byte-for-byte the old behavior.
+	// Resolve a right-click / targeted-order TARGET by position -- what BW does on a
+	// click. Needed for seRS replays because the 0x60/0x61 commands carry the target
+	// as an SC:R tag with target-type None (228), and neutral resources are outside
+	// the player-unit tag table we calibrate. The command records the exact click
+	// (x,y), so the resource/enemy under it is the intended target: pick the unit
+	// whose sprite bounds contain pos, preferring a resource (a gather click lands on
+	// the mineral, not a worker on top of it). seRS-only; classic reRS never calls it.
+	unit_t* scr_target_at_pos(xy pos) {
+		unit_t* best = nullptr;
+		unit_t* res = find_unit_noexpand({pos - xy(64, 64), pos + xy(64, 64)}, [&](unit_t* n) {
+			if (!is_in_bounds(pos, unit_sprite_bounding_box(n))) return false;
+			if (ut_resource(n)) return true;      // stop: a resource under the click
+			if (!best) best = n;                  // remember a non-resource hit
+			return false;                         // keep scanning for a resource
+		});
+		return res ? res : best;
+	}
+	unit_t* get_unit_by_scr_tag(uint32_t tag) {
+		if (!st.scr_tag_mode) return get_unit(unit_id((uint16_t)(tag & 0xffff)));
+		// SC:R "121" tag = classic index|generation in a WIDER bitfield (13-bit
+		// index + 3-bit generation), with SC:R's ~3400-slot unit array offset +1700
+		// from the classic 1700-slot array. So the classic 1-based index is
+		// (tag & 0x1FFF) - 1700 and the generation is tag >> 13. Because SC:R is the
+		// patched 1.16.1 engine (all sim .dat byte-identical) with the same unit
+		// allocator, that index maps DIRECTLY onto our pool slot -- no creation-order
+		// reproduction, no calibration. (Source: imbateam-gg/downgrade-replay
+		// unit-tag-to-bw.js, which feeds SC:R replays into OpenBW; verified against
+		// grp-toolkit measurement on rep2v2_*.rep.) Neutral resources sit at slots
+		// that don't line up (SC:R makes internal objects we don't), so their tags
+		// fall through to null here and the order handlers resolve them by position.
+		uint16_t t = (uint16_t)(tag & 0xffff);   // high 16 bits are always 0
+		if (t == 0 || t == 0xffff) return nullptr;   // no-target (move to ground etc) -- not a miss
+		if (st.scr_tag_format == 0) st.scr_tag_format = t < 0x2000 ? 2 : 1;
+		if (st.scr_tag_format == 2) {
+			// classic index|generation in the wide field: resolve like a reRS tag
+			unit_t* cu = get_unit(unit_id(t));
+			if (cu) ++st.scr_dbg_resolved; else ++st.scr_dbg_null;
+			return cu;
+		}
+		size_t fld = t & 0x1fff;
+		// v1.0.6: the very first unit slot is the exception to the +1700 offset. Both
+		// engines hand out slot 0 first (then the top of the array downwards), so the
+		// first unit of the map -- usually a start location's geyser, later the
+		// refinery built on it -- is field 1 in SC:R as well, not 1701. Measured: 12
+		// of 12 such orders in one replay point at our slot 0 with the same generation
+		// and the click inside it. Unresolved, "gather gas" orders were dropped and
+		// the workers stood idle.
+		if (fld == 1) fld = 1701;
+		if (fld < 1700) { ++st.scr_dbg_null; return nullptr; }
+		size_t idx1 = fld - 1700;                // classic 1-based index (0 = none)
+		if (!idx1 || idx1 > 1700) { ++st.scr_dbg_null; return nullptr; }
+		unit_t* u = get_unit(idx1 - 1);          // 0-based; get_unit rejects dead slots
+		if (u && (u->unit_id_generation & 7u) != (unsigned)(t >> 13)) u = nullptr; // 3-bit gen check
+		if (u) ++st.scr_dbg_resolved; else { ++st.scr_dbg_null; st.scr_dbg_last_null_tag = t; }
+		return u;
+	}
+	// v1.0.12: an order aimed at a unit that died a moment before the command ran. Its slot
+	// is still held while the death plays out and the real game still finds the unit -- the
+	// ATTACK order then ends at once and the units stand idle until they pick a target
+	// themselves. Upstream resolved the tag to nothing and treated the command as one on
+	// the ground (the attack became an attack-move). Measured against SC:R 1.23.9, replay
+	// c06 frame 11795: ten marines ordered onto a mutalisk dead for two frames are idle
+	// five frames later; upstream had them firing at the next mutalisk. Only the attack
+	// command: for repair, a reaver's attack and a scanner sweep the same change made
+	// clean replays diverge (rep1v1_b, d29, d18), and so did applying it to right-clicks.
+	bool scr_tag_names_dying_unit(uint32_t tag) const {
+		uint16_t t = (uint16_t)(tag & 0xffff);
+		if (t == 0 || t == 0xffff || st.scr_tag_format == 2) return false;
+		size_t fld = t & 0x1fff;
+		if (fld == 1) fld = 1701;
+		if (fld <= 1700 || fld > 3400) return false;
+		const unit_t* u = st.units_container.try_get(fld - 1701);
+		if (!u || !u->sprite || !u->order_type || !unit_dead(u)) return false;
+		return (u->unit_id_generation & 7u) == (unsigned)(t >> 13);
+	}
+	bool action_order_on_dead_target(int owner, const order_type_t* input_order, bool queue) {
+		if (queue) return false;
+		bool retval = false;
+		for (unit_t* u : selected_units(owner)) {
+			if (input_order && input_order->tech_type == TechTypes::None && !unit_can_receive_order(u, input_order, owner)) continue;
+			if (u->order_type->id == Orders::NukeLaunch) continue;
+			if (default_action(u) == 0) continue;
+			retval = true;
+			issue_order(u, false, u->unit_type->return_to_idle, order_target_t{});
+			if (u->subunit) issue_order(u->subunit, false, u->subunit->unit_type->return_to_idle, order_target_t{});
+			u->user_action_flags |= 2;
+		}
+		return retval;
+	}
+	// Read n 4-byte tags and resolve each to a unit. Shared by the three select-121
+	// variants (0x63/0x64/0x65). Owner is unused now that resolution is stateless.
+	template<typename reader_T>
+	void scr_read_select_tags(reader_T&& r, size_t n, int owner, static_vector<unit_t*, 12>& units) {
+		(void)owner;
+		for (size_t i = 0; i < n; ++i) {
+			uint32_t tag = r.template get<uint32_t>();
+			unit_t* u = get_unit_by_scr_tag(tag);
+			// A select references the player's OWN units, which always live in our
+			// index space -- a real (non-zero) tag that fails to resolve is a genuine
+			// miss (sim divergence), unlike an order target that may be a neutral.
+			uint16_t t = (uint16_t)(tag & 0xffff);
+			if (!u && t != 0 && t != 0xffff) ++st.scr_dbg_sel_null;
+			// Harness-only: a MULTI-selection can only hold the player's own, non-building
+			// units. When the tag resolves to something else here, OUR unit indices have
+			// drifted from the recording (e.g. a building and a unit created in the other
+			// order) -- a divergence that never shows up as a missing unit.
+			if (u && n > 1 && !st.player_units[owner].empty() && (u->owner != owner || ut_building(u))) {
+				if (!st.scr_dbg_sel_odd++) st.scr_dbg_sel_odd_first_frame = (int)st.current_frame;
+				st.scr_dbg_sel_odd_last_tag = t;
+			}
+			units.push_back(u);
+		}
+	}
+	template<typename reader_T>
+	bool read_action_default_order_121(int owner, reader_T&& r) {   // 0x60 right_click_121
+		int x = r.template get<int16_t>();
+		int y = r.template get<int16_t>();
+		uint32_t tag = r.template get<uint32_t>();
+		unit_t* target = get_unit_by_scr_tag(tag);
+		// v1.0.13: the tag of a unit that has just died is a miss too, but NOT a reason to look
+		// for another unit under the click -- the real game treats the command as one on the
+		// ground (measured: SC:R 1.23.9, replay d21 frame 16881, six vultures right-clicked onto
+		// a probe dead for two frames MOVE there; we had them attack the probe next to it).
+		if (!target && tag && st.scr_tag_mode && !scr_tag_names_dying_unit(tag)) { target = scr_target_at_pos({x, y}); if (target) ++st.scr_dbg_tgt_recovered; }
+		UnitTypes tt = (UnitTypes)r.template get<uint16_t>();
+		const unit_type_t* target_unit_type = tt == UnitTypes::None ? nullptr : get_unit_type(tt);
+		bool queue = r.template get<uint8_t>() != 0;
+		return action_default_order(owner, {x, y}, target, target_unit_type, queue);
+	}
+	template<typename reader_T>
+	bool read_action_order_121(int owner, reader_T&& r) {           // 0x61 targeted_order_121
+		int x = r.template get<int16_t>();
+		int y = r.template get<int16_t>();
+		uint32_t tag = r.template get<uint32_t>();
+		unit_t* target = get_unit_by_scr_tag(tag);
+		const bool dead_target = !target && tag && st.scr_tag_mode && scr_tag_names_dying_unit(tag);
+		if (!target && tag && st.scr_tag_mode && !dead_target) { target = scr_target_at_pos({x, y}); if (target) ++st.scr_dbg_tgt_recovered; }
+		UnitTypes tt = (UnitTypes)r.template get<uint16_t>();
+		const unit_type_t* target_unit_type = tt == UnitTypes::None ? nullptr : get_unit_type(tt);
+		const order_type_t* order_type = get_order_type((Orders)r.template get<uint8_t>());
+		bool queue = r.template get<uint8_t>() != 0;
+		if (dead_target && order_type->id == Orders::AttackDefault) return action_order_on_dead_target(owner, order_type, queue);
+		return action_order(owner, order_type, {x, y}, target, target_unit_type, queue);
+	}
+	template<typename reader_T>
+	bool read_action_unload_121(int owner, reader_T&& r) {          // 0x62 unload_121
+		unit_t* target = get_unit_by_scr_tag(r.template get<uint32_t>());
+		return action_unload(owner, target);
+	}
+	template<typename reader_T>
+	bool read_action_select_121(int owner, reader_T&& r) {          // 0x63 select_121
+		size_t n = r.template get<uint8_t>();
+		if (n > 12) error("invalid selection of %d units", n);
+		static_vector<unit_t*, 12> units;
+		scr_read_select_tags(r, n, owner, units);
+		return action_select(owner, units);
+	}
+	template<typename reader_T>
+	bool read_action_shift_select_121(int owner, reader_T&& r) {    // 0x64 select_add_121
+		size_t n = r.template get<uint8_t>();
+		if (n > 12) error("invalid selection of %d units", n);
+		static_vector<unit_t*, 12> units;
+		scr_read_select_tags(r, n, owner, units);
+		return action_shift_select(owner, units);
+	}
+	template<typename reader_T>
+	bool read_action_deselect_121(int owner, reader_T&& r) {        // 0x65 select_remove_121
+		size_t n = r.template get<uint8_t>();
+		if (n > 12) error("invalid deselection of %d units", n);
+		static_vector<unit_t*, 12> units;
+		scr_read_select_tags(r, n, owner, units);
 		return action_deselect(owner, units);
 	}
 
@@ -1162,12 +1451,17 @@ struct action_functions: state_functions {
 
 	template<typename reader_T>
 	bool read_action_chat(int owner, reader_T&& r) {
+		// Retail layout: one player byte, then up to 80 characters. The player
+		// byte is below 32 so the printable filter below skips it, but read it
+		// out explicitly rather than relying on that.
 		auto buf = r.template get<std::array<uint8_t, 81>>();
 		a_string str;
-		for (auto& v : buf) {
+		for (size_t i = 1; i != buf.size(); ++i) {
+			uint8_t v = buf[i];
 			if (v == 0) break;
 			if (v >= 32) str += (char)v;
 		}
+		if (!str.empty()) on_chat_message(owner, str);
 		return true;
 	}
 
@@ -1229,8 +1523,9 @@ struct action_functions: state_functions {
 
 	template<typename reader_T>
 	bool read_action_ping_minimap(int owner, reader_T&& r) {
-		r.template get<uint16_t>();
-		r.template get<uint16_t>();
+		int x = r.template get<uint16_t>();
+		int y = r.template get<uint16_t>();
+		on_ping_minimap(owner, x, y);
 		return true;
 	}
 
@@ -1336,6 +1631,18 @@ struct action_functions: state_functions {
 	virtual void on_action(int owner, int action) {
 	}
 
+	// Android port: a minimap ping arrived (from any client via the action
+	// stream). The UI overrides this to show it to allied players.
+	virtual void on_ping_minimap(int owner, int x, int y) {
+	}
+
+	// Android port: a chat line arrived over the action stream (opcode 92).
+	// read_action_chat already decoded it and then dropped it on the floor,
+	// which is why typing in a LAN game only ever showed on the sender's
+	// screen. The UI overrides this to append it to the chat history.
+	virtual void on_chat_message(int owner, const a_string& text) {
+	}
+
 	template<typename reader_T>
 	bool read_action(reader_T&& r) {
 		int player_id = r.template get<uint8_t>();
@@ -1435,6 +1742,19 @@ struct action_functions: state_functions {
 			return read_action_morph_dark_archon(owner, r);
 		case 92:
 			return read_action_chat(owner, r);
+		// SC:R "121" variants (0x60-0x65) -- only in Remastered (seRS) replays.
+		case 96:
+			return read_action_default_order_121(owner, r);
+		case 97:
+			return read_action_order_121(owner, r);
+		case 98:
+			return read_action_unload_121(owner, r);
+		case 99:
+			return read_action_select_121(owner, r);
+		case 100:
+			return read_action_shift_select_121(owner, r);
+		case 101:
+			return read_action_deselect_121(owner, r);
 		case 210:
 			return read_action_ext_cheat(owner, r);
 		default:
