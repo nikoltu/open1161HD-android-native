@@ -73,7 +73,6 @@ launcher:
 ## License & attribution
 
 Engine code is open source under the terms of its upstream components (OpenBW, SDL,
-Asio, stb, libsmacker; third-party notices in `android/app/src/main/assets/licenses/`
-and `ui/libsmacker/COPYING`). This is an independent, non-commercial project, **not
+Asio, stb, libsmacker; see `deps/asio/LICENSE_1_0.txt` and `ui/libsmacker/COPYING`). This is an independent, non-commercial project, **not
 affiliated with or endorsed by Blizzard Entertainment**, and includes no game assets.
 StarCraft and Brood War are trademarks of Blizzard Entertainment, Inc.

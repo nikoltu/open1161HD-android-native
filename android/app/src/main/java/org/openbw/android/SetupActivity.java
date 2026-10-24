@@ -4026,19 +4026,18 @@ public class SetupActivity extends Activity {
                   + "Naudoja jūsų paties žaidimo duomenų failus.") + "\n\n"
                 + S.t("Įrenginys: ") + android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL
                 + "  (Android " + android.os.Build.VERSION.RELEASE + ")");
-        // Bundled-bot attribution: Steamhammer and UAlbertaBot/BOSS are third-party MIT
-        // and their copyright + licence notice must ship with any copy (the MIT term).
         setNote(abt, S.t("Įtaisyti botai:") + "\n"
-                + "• UnifiedAI — open1161HD\n"
-                + "• Steamhammer — © 2017 Hannes Bredberg (MIT)\n"
-                + "• BOSS, UAlbertaBot — © 2016 David Churchill (MIT)\n\n"
-                + "Steamhammer, BOSS and UAlbertaBot are used under the MIT License. "
-                + "Permission notice: the above copyright notices and this permission "
-                + "notice are included; the software is provided \"as is\", without warranty "
-                + "of any kind.");
-        LinearLayout licRow = setRow(S.t("Licencijos"), null);
-        licRow.addView(kit.smallButton(S.t("Rodyti"), this::showLicenses), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)));
-        abt.addView(licRow);
+                + "• UnifiedAI — open1161HD");
+        // Third-party licence texts (assets/licenses/) -- the row shows only when some ship.
+        try {
+            String[] lic = getAssets().list("licenses");
+            if (lic != null && lic.length > 0) {
+                LinearLayout licRow = setRow(S.t("Licencijos"), null);
+                licRow.addView(kit.smallButton(S.t("Rodyti"), this::showLicenses), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)));
+                abt.addView(licRow);
+            }
+        } catch (java.io.IOException ignored) {
+        }
 
         // ---- the sub-tab strip + one visible section; wide screens: two columns ----
         if (settingsTab < 0 || settingsTab >= setTabBoxes.size()) settingsTab = 0;
