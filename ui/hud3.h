@@ -47,10 +47,23 @@
 	// Buffer pixels per dp = buffer height / surface height in dp, so a pinch-zoom
 	// that resizes the buffer leaves the HUD the same size on the glass, and the
 	// FULL HD tier (buffer = device pixels) gets twice the pixels for the same dp.
-	int hud3_ppd_milli() const {
+	// A surface too narrow for the bottom row (minimap, SHIFT, the 560 dp info card,
+	// the dock: 1176 dp) -- a phone -- shrinks the whole HUD until the row fits, the
+	// text with it (hud3_fit_milli), so nothing is squeezed out of its frame.
+	enum { hud3_row_dp = 2 * (12 + 200 + 12 + 72 + 12) + 560 };
+	int hud3_ppd_unfit_milli() const {
 		int sdh = hud3_surface_dp_h > 0 ? hud3_surface_dp_h : 879;
-		long long v = (long long)screen_height * 1000LL * hud3_scale_pct / (100LL * sdh);
+		return (int)((long long)screen_height * 1000LL * hud3_scale_pct / (100LL * sdh));
+	}
+	int hud3_ppd_milli() const {
+		long long v = hud3_ppd_unfit_milli();
+		const long long fit = (long long)screen_width * 1000LL / hud3_row_dp;
+		if (v > fit) v = fit;
 		return v < 250 ? 250 : (int)v;
+	}
+	int hud3_fit_milli() const {
+		const int u = hud3_ppd_unfit_milli();
+		return u > 0 && hud3_ppd_milli() < u ? (int)((long long)hud3_ppd_milli() * 1000 / u) : 1000;
 	}
 	int d3(int dp) const { long long v = (long long)dp * hud3_ppd_milli(); return (int)(v >= 0 ? (v + 500) / 1000 : (v - 500) / 1000); }
 	int W3() const { return (int)((long long)screen_width * 1000 / hud3_ppd_milli()); }

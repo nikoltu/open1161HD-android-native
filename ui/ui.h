@@ -5129,7 +5129,9 @@ struct ui_functions: ui_util_functions {
 	// hud_scale_text path so glyph size matches the usp_* layout metrics under zoom).
 	int hud_text_pct(int pct) {
 		int b = base_render_h ? base_render_h : (int)screen_height;
-		return (int)((long long)pct * hud_us() * (int)screen_height / (b ? b : 1));
+		long long v = (long long)pct * hud_us() * (int)screen_height / (b ? b : 1);
+		if (hud_v3) v = v * hud3_fit_milli() / 1000;   // v3 shrunk to fit a narrow surface: the text with it
+		return (int)v;
 	}
 	int hud2_bar_h() { int h = (int)screen_height * 24 / 100; int m = (int)screen_height * 32 / 100; int fl = hud_h_px(96); return h < fl ? fl : (h > m ? m : h); }
 	// ~1cm inset from the SIDE edges only, applied to the bottom-bar elements
@@ -8610,6 +8612,10 @@ struct ui_functions: ui_util_functions {
 		int gs = (int)(f + 0.5f); if (gs < 1) gs = 1; // integer glyph scale
 		int ow = W * gs, oh = H * gs;
 		int adv = (int)((W + 1) * f + 0.5f);
+		// Below the atlas size (HUD v3 shrunk to fit a phone) the body is box-filtered down to
+		// the advance instead: a 1:1 body wider than its advance runs the letters together.
+		const bool down = f < 0.95f;
+		if (down) { ow = std::max(1, (int)(W * f + 0.5f)); oh = std::max(1, (int)(H * f + 0.5f)); }
 		int cr = (color >> 16) & 0xff, cg = (color >> 8) & 0xff, cb = color & 0xff;
 		int cx = x;
 		for (; *s; ++s) {
@@ -8621,8 +8627,15 @@ struct ui_functions: ui_util_functions {
 				int py = y + oy;
 				if (py < 0 || py + 1 >= (int)screen_height) continue;
 				const unsigned char* grow = gl + row * W;
+				const int sy0 = oy * H / oh, sy1 = std::max(sy0 + 1, (oy + 1) * H / oh);
 				for (int ox = 0; ox != ow; ++ox) {
-					int cov = grow[ox / gs];
+					int cov;
+					if (down) {
+						const int sx0 = ox * W / ow, sx1 = std::max(sx0 + 1, (ox + 1) * W / ow);
+						int sum = 0;
+						for (int sy = sy0; sy < sy1; ++sy) for (int sx = sx0; sx < sx1; ++sx) sum += gl[sy * W + sx];
+						cov = sum / ((sy1 - sy0) * (sx1 - sx0));
+					} else cov = grow[ox / gs];
 					if (cov < 24) continue;
 					int px = cx + ox;
 					if (px < 0 || px + 1 >= (int)screen_width) continue;
@@ -14306,9 +14319,19 @@ struct ui_functions: ui_util_functions {
 		if (islot < 8) islot = 8;
 		if (out_islot) *out_islot = islot;
 		// v0.83.025 (hardware feedback): nudge the whole production block one more
-		// icon to the right and half an icon down, so it clears the wireframe/name.
+		// icon to the right so it clears the wireframe/name. Vertically the block
+		// (active slot, gap, queue row) is centred between the name line and the
+		// panel's bottom: the old fixed "half an icon lower" put the queue row on
+		// (or past) the bottom frame. Where even that does not fit, the slots shrink.
 		rcx += islot * 9 / 2;   // 4.5 icon widths
-		rtop += islot / 2;      // half an icon lower
+		{
+			const int avail = panel.to.y - pad - rtop;
+			const int rows = qcount > 0 ? 2 : 1;
+			if (rows == 2 && islot * 9 / 4 > avail) islot = std::max(8, avail * 4 / 9);
+			if (out_islot) *out_islot = islot;
+			const int block = rows == 2 ? islot * 2 + islot / 4 : islot;
+			if (avail > block) rtop += (avail - block) / 2;
+		}
 		int n = 0;
 		if (n < maxn) out[n++] = {{rcx, rtop}, {rcx + islot, rtop + islot}};
 		// Queue thumbnails are the same size as the active slot, by request.
