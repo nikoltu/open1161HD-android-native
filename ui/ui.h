@@ -2517,17 +2517,40 @@ struct ui_functions: ui_util_functions {
 	// tablet. It is drawn in the launcher's
 	// design language (loading_screen::pal), like the loading screen before it --
 	// no per-race accent any more.
-	int briefing_margin() const { return (int)screen_width / 24; }
+	// Phones (wider than 2.05:1 -- no tablet is): the briefing is laid out in
+	// columns -- portraits 2x2 on the left, the transcript in the middle,
+	// objectives over one row of lower buttons on the right -- because a row of
+	// portraits across the top leaves the transcript a single line there.
+	bool briefing_columns() const {
+		return screen_height > 0 && (long long)screen_width * 100 > (long long)screen_height * 205;
+	}
+	int briefing_margin() const { return briefing_columns() ? (int)screen_height / 24 : (int)screen_width / 24; }
+	// columns layout: the right column (objectives + buttons) and the button height
+	int briefing_col_right_w() const { return (int)screen_width * 29 / 100; }
+	int briefing_col_button_h() const {
+		int h = (int)screen_height / 10, lo = ui::unispace_h * 2 * (world_scale < 1 ? 1 : world_scale);
+		return h < lo ? lo : h;
+	}
 
 	rect briefing_start_button_rect() {
 		int us = hud_us(); // Faze 4.7: scale to the FULL HD buffer (draw + hit-test share this)
 		int m = briefing_margin();
+		if (briefing_columns()) {
+			int rw = briefing_col_right_w(), bh = briefing_col_button_h(), g = m / 2;
+			int rx0 = (int)screen_width - m - rw;
+			return rect{{rx0 + rw * 36 / 100 + g, (int)screen_height - m - bh}, {(int)screen_width - m, (int)screen_height - m}};
+		}
 		int w = (ui::unispace_w * 22 + 24) * us, h = ui::unispace_h * 3 * us;
 		return rect{{(int)screen_width - w - m, (int)screen_height - h - m},
 		            {(int)screen_width - m, (int)screen_height - m}};
 	}
 	rect briefing_skip_button_rect() {
 		int us = hud_us();
+		if (briefing_columns()) {
+			int m = briefing_margin(), rw = briefing_col_right_w(), bh = briefing_col_button_h();
+			int rx0 = (int)screen_width - m - rw;
+			return rect{{rx0, (int)screen_height - m - bh}, {rx0 + rw * 36 / 100, (int)screen_height - m}};
+		}
 		rect s = briefing_start_button_rect();
 		int w = (ui::unispace_w * 12 + 24) * us;
 		return rect{{s.from.x - w - 12 * us, s.from.y}, {s.from.x - 12 * us, s.to.y}};
@@ -2540,8 +2563,15 @@ struct ui_functions: ui_util_functions {
 	rect briefing_skip_tutorial_button_rect() {
 		if (!briefing_is_tutorial) return rect{};
 		int us = hud_us();
+		if (briefing_columns()) {   // its own full-width row above REPLAY / START
+			int m = briefing_margin(), rw = briefing_col_right_w(), bh = briefing_col_button_h(), g = m / 2;
+			int rx0 = (int)screen_width - m - rw, y1 = (int)screen_height - m - bh - g;
+			return rect{{rx0, y1 - bh}, {(int)screen_width - m, y1}};
+		}
 		rect s = briefing_skip_button_rect(); // REPLAY
-		int w = (ui::unispace_w * 14 + 24) * us;
+		// Wide enough for the translated label too ("PRALEISTI MOKYMUS" is 17).
+		int chars = std::max<int>(14, (int)std::strlen(L("SKIP TUTORIAL")) + 1);
+		int w = (ui::unispace_w * chars + 24) * us;
 		return rect{{s.from.x - w - 12 * us, s.from.y}, {s.from.x - 12 * us, s.to.y}};
 	}
 	// Faze 4.7 (user request): the second briefing button is REPLAY, not Skip --
@@ -2623,7 +2653,11 @@ struct ui_functions: ui_util_functions {
 		struct g_t { bool* f; bool p; ~g_t() { *f = p; } } _g{&hud_scale_text, _prev};
 		int sw = (int)screen_width, sh = (int)screen_height;
 		int m = briefing_margin();
-		int cw = (ui::unispace_w + 1) * us, lh = ui::unispace_h * us;
+		int lh = ui::unispace_h * us;
+		// The transcript / objectives glyphs are drawn at the HUD text scale (hud_us() AND
+		// the zoom factor, usp_*); wrap and step lines by the same metrics, or a zoomed-out
+		// buffer (phones) wraps at half the panel width. Equal to (unispace_w+1)*us / lh at rest.
+		const int tcw = usp_adv(), tgh = usp_h();
 		const int pad = 10 * us;   // panel inner padding (vertical)
 		const int tin = 12 * us;   // text inset from a panel's side edges
 		const int ft = 2 * us;     // portrait cell frame thickness
@@ -2635,6 +2669,7 @@ struct ui_functions: ui_util_functions {
 		// The original Ready Room shows up to four speaking characters. The cell of
 		// the slot that is speaking carries the live head and the green "selected"
 		// frame; the other assigned cells loop their idle clip in a steel frame.
+		const bool cols = briefing_columns();
 		int pgap = m / 3;
 		int pcell = (sw - 2 * m - 3 * pgap) / 4;
 		int prow_max = sh / 4; if (pcell > prow_max) pcell = prow_max; // never dominate the screen
@@ -2643,6 +2678,17 @@ struct ui_functions: ui_util_functions {
 		int prow_total = 4 * pcell + 3 * pgap;
 		int prow_x0 = (sw - prow_total) / 2;
 		int prow_bottom = prow_y + pcell;
+		if (cols) {                 // phones: a 2 x 2 grid in the left column
+			pgap = m / 2;
+			pcell = (sw * 21 / 100 - pgap) / 2;
+			int vmax = (sh - 2 * m - pgap) / 2; if (pcell > vmax) pcell = vmax;
+			prow_x0 = m;
+			prow_y = m;
+			prow_bottom = prow_y + 2 * pcell + pgap;
+		}
+		// top-left corner of portrait cell i (one row, or the phone's 2 x 2 grid)
+		auto cell_x = [&](int i) { return cols ? prow_x0 + (i % 2) * (pcell + pgap) : prow_x0 + i * (pcell + pgap); };
+		auto cell_y = [&](int i) { return cols ? prow_y + (i / 2) * (pcell + pgap) : prow_y; };
 
 		// --- buttons + objectives box geometry (bottom edge) --------------
 		rect startb = briefing_start_button_rect();
@@ -2652,26 +2698,47 @@ struct ui_functions: ui_util_functions {
 		a_vector<a_string> obj_lines;
 		int obj_w = buttons_left - 12 * us - m - m; // left margin .. just left of the buttons
 		if (obj_w < sw / 4) obj_w = sw / 4;
+		const int rcol_w = briefing_col_right_w(), rcol_x = sw - m - rcol_w;
+		if (cols) obj_w = rcol_w;
 		int obj_h = 0, obj_y = 0, obj_bottom = sh - m; // share the buttons' baseline
 		if (!briefing_objectives.empty()) {
-			a_string cur;
-			int maxw = (obj_w - 2 * tin) / cw; if (maxw < 8) maxw = 8;
+			// wrap at spaces, never inside a word (a word longer than the line is cut)
+			int maxw = (obj_w - 2 * tin) / tcw; if (maxw < 8) maxw = 8;
+			a_string para;
 			for (char c : briefing_objectives + a_string("\n")) {
-				if (c == '\n' || (int)cur.size() >= maxw) {
-					obj_lines.push_back(cur);
-					cur.clear();
-					if (c != '\n' && (unsigned char)c >= 0x20) cur += c;
-				} else if ((unsigned char)c >= 0x20) cur += c;
+				if (c != '\n') { if ((unsigned char)c >= 0x20) para += c; continue; }
+				if (para.empty()) { obj_lines.push_back(para); continue; }
+				size_t i = 0;
+				while (i < para.size()) {
+					size_t take = para.size() - i;
+					if ((int)take > maxw) {
+						size_t brk = 0;
+						for (size_t k = 0; k <= (size_t)maxw && i + k < para.size(); ++k)
+							if (para[i + k] == ' ') brk = k;
+						take = brk ? brk : (size_t)maxw;
+					}
+					obj_lines.push_back(para.substr(i, take));
+					i += take;
+					while (i < para.size() && para[i] == ' ') ++i;
+				}
+				para.clear();
 			}
-			obj_h = ((int)obj_lines.size() + 1) * (lh + 5 * us) + 2 * pad;
+			obj_h = (lh + 5 * us) + (int)obj_lines.size() * (tgh + 5 * us) + 2 * pad;
 			obj_y = obj_bottom - obj_h;
+			if (cols) {             // the right column, from the top down to the buttons
+				int top_btn = (briefing_is_tutorial ? tutb.from.y : startb.from.y) - m / 2;
+				obj_y = m;
+				obj_h = top_btn - obj_y;
+			}
 		}
-		rect ob = {{m, obj_y}, {m + obj_w, obj_y + obj_h}};
+		rect ob = {{cols ? rcol_x : m, obj_y}, {(cols ? rcol_x : m) + obj_w, obj_y + obj_h}};
 
 		// --- transcript panel geometry (full width, below the portrait row) ---
 		// Its bottom is whichever is higher of the objectives box top and the button
 		// row top, so the transcript never runs under either.
 		rect tp = {{m, prow_bottom + m / 2}, {sw - m, (obj_h ? obj_y : startb.from.y) - 8 * us}};
+		if (cols)                   // phones: the middle column, full height
+			tp = {{prow_x0 + 2 * pcell + pgap + m / 2, m}, {rcol_x - m / 2, sh - m}};
 		int head_y = tp.from.y + pad;
 		int rule_y = head_y + lh + pad * 7 / 10;
 		int text_y = rule_y + us + pad;
@@ -2686,7 +2753,7 @@ struct ui_functions: ui_util_functions {
 			uint64_t sig = 1469598103934665603ull;
 			auto mixi = [&](int64_t v) { for (int k = 0; k != 8; ++k) { sig ^= (uint8_t)(v >> (k * 8)); sig *= 1099511628211ull; } };
 			auto mixs = [&](const std::string& s) { for (char q : s) mixi((uint8_t)q); mixi(-1); };
-			mixi(sw); mixi(sh); mixi(us); mixi(m); mixi(pcell); mixi(prow_x0); mixi(prow_y);
+			mixi(sw); mixi(sh); mixi(us); mixi(m); mixi(pcell); mixi(prow_x0); mixi(prow_y); mixi(cols); mixi(tp.from.x);
 			mixi(tp.from.y); mixi(tp.to.y); mixi(obj_h); mixi(obj_w); mixi(obj_y);
 			mixi(startb.from.x); mixi(skipb.from.x); mixi(briefing_is_tutorial ? tutb.from.x : -1);
 			mixi(bs.backdrop ? (int64_t)bs.backdrop->size() : -1); mixi(bs.backdrop_w); mixi(bs.backdrop_h);
@@ -2700,10 +2767,10 @@ struct ui_functions: ui_util_functions {
 				for (int i = 0; i < 4; ++i) {
 					// An empty cell: an opaque dark plate (the stills captured from it must not
 					// carry the backdrop) in a dim steel frame.
-					int cx = prow_x0 + i * (pcell + pgap);
-					cc.frame(cx - us, prow_y - us, cx + pcell + us, prow_y + pcell + us, us, ls::pal::rim, 255);
-					cc.fill(cx, prow_y, cx + pcell, prow_y + pcell, ls::pal::panel, 255);
-					cc.frame(cx, prow_y, cx + pcell, prow_y + pcell, us, ls::mix(ls::pal::steel, 0x000000, 0.45f), 255);
+					int cx = cell_x(i), cy = cell_y(i);
+					cc.frame(cx - us, cy - us, cx + pcell + us, cy + pcell + us, us, ls::pal::rim, 255);
+					cc.fill(cx, cy, cx + pcell, cy + pcell, ls::pal::panel, 255);
+					cc.frame(cx, cy, cx + pcell, cy + pcell, us, ls::mix(ls::pal::steel, 0x000000, 0.45f), 255);
 				}
 				ls::draw_panel(cc, tp.from.x, tp.from.y, tp.to.x, tp.to.y, true);
 				ls::draw_text(cc, (float)(tp.from.x + tin), (float)head_y, heading, ls::pal::label, (float)lh, 0.12f);
@@ -2718,8 +2785,8 @@ struct ui_functions: ui_util_functions {
 					ls::draw_panel(cc, ob.from.x, ob.from.y, ob.to.x, ob.to.y, true);
 					ls::draw_text(cc, (float)(ob.from.x + tin), (float)(ob.from.y + pad), obj_label, ls::pal::label, (float)lh, 0.12f);
 				}
-				ls::draw_button(cc, skipb.from.x, skipb.from.y, skipb.to.x, skipb.to.y, "REPLAY", 0, (float)lh);
-				if (briefing_is_tutorial) ls::draw_button(cc, tutb.from.x, tutb.from.y, tutb.to.x, tutb.to.y, "SKIP TUTORIAL", 3, (float)lh);
+				ls::draw_button(cc, skipb.from.x, skipb.from.y, skipb.to.x, skipb.to.y, L("REPLAY"), 0, (float)lh);
+				if (briefing_is_tutorial) ls::draw_button(cc, tutb.from.x, tutb.from.y, tutb.to.x, tutb.to.y, L("SKIP TUTORIAL"), 3, (float)lh);
 				ls::draw_button(cc, startb.from.x, startb.from.y, startb.to.x, startb.to.y, start_label, 1, (float)lh);
 				ch.w = sw; ch.h = sh; ch.sig = sig;
 			}
@@ -2743,8 +2810,8 @@ struct ui_functions: ui_util_functions {
 		}
 		ls::canvas dc; dc.data = data; dc.pitch = pitch; dc.w = sw; dc.h = sh;
 		for (int i = 0; i < 4; ++i) {
-			int cx = prow_x0 + i * (pcell + pgap);
-			rect pr = {{cx, prow_y}, {cx + pcell, prow_y + pcell}};
+			int cx = cell_x(i), cy = cell_y(i);
+			rect pr = {{cx, cy}, {cx + pcell, cy + pcell}};
 			rect inner = {{pr.from.x + ft, pr.from.y + ft}, {pr.to.x - ft, pr.to.y - ft}};
 			bool assigned = (i < briefing_cell_count && briefing_cells[i].portrait_id >= 0);
 			if (!assigned) continue; // the empty plate is part of the cached chrome
@@ -2786,7 +2853,7 @@ struct ui_functions: ui_util_functions {
 		{
 			int tx = tp.from.x + tin;
 			int y = text_y;
-			int maxw = (tp.to.x - tp.from.x - 2 * tin) / cw; if (maxw < 8) maxw = 8;
+			int maxw = (tp.to.x - tp.from.x - 2 * tin) / tcw; if (maxw < 8) maxw = 8;
 			// Wrap everything first so the tail can be shown: a briefing keeps
 			// appending lines, and the newest ones are the ones being spoken.
 			a_vector<a_string> tlines;
@@ -2806,7 +2873,7 @@ struct ui_functions: ui_util_functions {
 				}
 			}
 			int bottom = tp.to.y - pad;
-			int tlh = lh + 6 * us;
+			int tlh = tgh + 6 * us;
 			int fits = (bottom - y) / tlh;
 			if (fits < 1) fits = 1;
 			size_t first = tlines.size() > (size_t)fits ? tlines.size() - fits : 0;
@@ -2820,8 +2887,9 @@ struct ui_functions: ui_util_functions {
 		if (obj_h) {
 			int y = obj_y + pad + lh + 5 * us;
 			for (auto& l : obj_lines) {
+				if (y + tgh > ob.to.y - pad / 2) break;
 				if (!l.empty()) draw_text_rgba(data, pitch, ob.from.x + tin, y, l.c_str(), 0xff000000u | ls::pal::text);
-				y += lh + 5 * us;
+				y += tgh + 5 * us;
 			}
 		}
 	}
@@ -13810,6 +13878,8 @@ struct ui_functions: ui_util_functions {
 			{"OBJECTIVES", "TIKSLAI"},
 			{"START MISSION", "PRADETI MISIJA"},
 			{"SKIP", "PRALEISTI"},
+			{"REPLAY", "KARTOTI"},
+			{"SKIP TUTORIAL", "PRALEISTI MOKYMUS"},
 			{"VICTORY!", "PERGALE!"},
 			{"DEFEAT!", "PRALAIMEJIMAS"},
 			{"Group assigned", "Grupe priskirta"},

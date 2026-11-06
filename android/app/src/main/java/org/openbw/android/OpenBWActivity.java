@@ -526,6 +526,10 @@ public class OpenBWActivity extends SDLActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         if (staleLaunch(savedInstanceState)) return;
+        // Phones: SDL opens a non-fullscreen window, which
+        // keeps the status bar over ~7 % of a 20:9 screen. Hide the system bars there (they
+        // come back with an edge swipe). Tablets keep their window as it was.
+        if (getResources().getConfiguration().smallestScreenWidthDp < 600) setWindowStyle(true);
         // A resumed disk save (EXTRA_LOAD_SAVE) carries its map inside the .sav
         // container args, not as an intent extra, so the map/campaign checks below
         // would misread it as a replay and stamp the replay-only top-right EXIT
@@ -769,7 +773,7 @@ public class OpenBWActivity extends SDLActivity {
     private Button lobbyReadyBtn;
     private boolean lobbyReadyState;
     private Handler lobbyHandler;
-    private static final String[] LOBBY_RACE = {"Zerg", "Terran", "Protoss", "?", "?", "Random"};
+    private static final String[] LOBBY_RACE = {"Zerg", "Terran", "Protoss", "?", "?", "Atsitiktinė"};
 
     private void startLobbyPolling() {
         lobbyHandler = new Handler(Looper.getMainLooper());
@@ -847,7 +851,7 @@ public class OpenBWActivity extends SDLActivity {
             // (a joiner sees it before start, so nobody is surprised by non-vanilla rules).
             int qol = o.optInt("qol", 0);
             String badge = qol != 0 ? "    SCBW2 ▸ " + Integer.bitCount(qol) : "";
-            lobbyTitle.setText((o.optBoolean("host") ? "LAN Lobby (Host)" : "LAN Lobby") + badge);
+            lobbyTitle.setText((o.optBoolean("host") ? S.t("LAN lobby (hostas)") : S.t("LAN lobby")) + badge);
             lobbyMap.setText(S.t("Žemėlapis:  ") + o.optString("map"));
             lobbyStatusTv.setText(o.optString("status"));
             JSONArray players = o.optJSONArray("players");
@@ -862,9 +866,9 @@ public class OpenBWActivity extends SDLActivity {
                 row.setTextSize(19);
                 row.setTextColor(loc ? 0xFFFFE090 : 0xFFE0E0E0);
                 row.setPadding(0, dp(7), 0, dp(7));
-                String raceS = (race >= 0 && race < 6) ? LOBBY_RACE[race] : "?";
+                String raceS = (race >= 0 && race < 6) ? S.t(LOBBY_RACE[race]) : "?";
                 row.setText(S.t("Slot ") + (p.optInt("slot") + 1) + "    " + p.optString("name")
-                        + "    [" + raceS + "]" + (loc ? "   (tu)" : "") + (rdy ? "    ✔ " + S.t("pasiruošęs") : ""));
+                        + "    [" + raceS + "]" + (loc ? "   " + S.t("(tu)") : "") + (rdy ? "    ✔ " + S.t("pasiruošęs") : ""));
                 lobbyPlayers.addView(row);
             }
             lobbyReadyBtn.setText(lobbyReadyState ? "✔ " + S.t("Pasiruošęs") : S.t("Pasiruošti"));

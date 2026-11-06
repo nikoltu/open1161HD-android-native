@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.png" alt="open1161HD" width="150"/>
+<img src=".github/banner.png" alt="open1161HD" width="100%"/>
 
 # open1161HD
 

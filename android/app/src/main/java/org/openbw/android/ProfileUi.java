@@ -47,7 +47,7 @@ final class ProfileUi extends Kit {
     }
 
     private static final int[] RACE_BAR = {0xFF4F9BD0, 0xFFC0603A, 0xFFD8A840, 0xFF9AA6A0};   // T Z P R
-    private static final String[] RACE_LABEL = {"Terran", "Zerg", "Protoss", "Random"};
+    private static final String[] RACE_LABEL_KEY = {"Terran", "Zerg", "Protoss", "Atsitiktinė"};
     private static final String[] RACE_STAT = {"T", "Z", "P", "R"};
 
     private final Host host;
@@ -69,10 +69,18 @@ final class ProfileUi extends Kit {
         final int screenW = a.getResources().getDisplayMetrics().widthPixels;
         final int screenH = a.getResources().getDisplayMetrics().heightPixels;
 
-        LinearLayout panel = new LinearLayout(a);
+        // never taller than the screen: the stats scroll, the action row stays put (phones)
+        final int maxH = screenH - dp(24);
+        LinearLayout panel = new LinearLayout(a) {
+            @Override protected void onMeasure(int w, int h) {
+                int lim = View.MeasureSpec.getMode(h) == View.MeasureSpec.UNSPECIFIED ? maxH : Math.min(maxH, View.MeasureSpec.getSize(h));
+                super.onMeasure(w, View.MeasureSpec.makeMeasureSpec(lim, View.MeasureSpec.AT_MOST));
+            }
+        };
         panel.setOrientation(LinearLayout.HORIZONTAL);
         panel.setBackground(box(PANEL, LINE));
-        panel.setPadding(dp(18), dp(18), dp(18), dp(18));
+        int pp = dp(compact ? 12 : 18);
+        panel.setPadding(pp, pp, pp, pp);
 
         // left: the big portrait
         LinearLayout left = new LinearLayout(a);
@@ -101,7 +109,7 @@ final class ProfileUi extends Kit {
         LinearLayout right = new LinearLayout(a);
         right.setOrientation(LinearLayout.VERTICAL);
         right.setPadding(dp(20), 0, 0, 0);
-        TextView name = text(profile, Color.WHITE, 24);
+        TextView name = text(profile, Color.WHITE, compact ? 20 : 24);
         name.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         right.addView(name);
 
@@ -113,7 +121,7 @@ final class ProfileUi extends Kit {
             int wins = stat(profile, "wins." + RACE_STAT[i]);
             int played = stat(profile, "games." + RACE_STAT[i]);      // counted since v0.106; older games have no per-race total
             float frac = played > 0 ? (float) wins / played : (float) wins / maxWins;
-            right.addView(barRow(RACE_LABEL[i], wins == 0 ? 0f : frac, RACE_BAR[i],
+            right.addView(barRow(S.t(RACE_LABEL_KEY[i]), wins == 0 ? 0f : frac, RACE_BAR[i],
                     played > 0 ? wins + " / " + played : String.valueOf(wins), 14, dp(84)));
         }
 
@@ -129,7 +137,7 @@ final class ProfileUi extends Kit {
         LinearLayout actions = new LinearLayout(a);
         actions.setOrientation(LinearLayout.HORIZONTAL);
         actions.setGravity(Gravity.CENTER_VERTICAL);
-        actions.setPadding(0, dp(14), 0, 0);
+        actions.setPadding(dp(20), dp(compact ? 8 : 14), 0, 0);
         LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         gap.rightMargin = dp(8);
         actions.addView(button(S.t("Pervardyti"), 0, () -> showRename(self)), gap);
@@ -137,11 +145,13 @@ final class ProfileUi extends Kit {
         actions.addView(button(S.t("Naujas profilis"), 0, () -> showCreate(self)), gap);
         actions.addView(new View(a), new LinearLayout.LayoutParams(0, 1, 1f));
         actions.addView(button(S.t("Uždaryti"), 2, () -> { if (self[0] != null) self[0].dismiss(); }));
-        right.addView(actions);
-
-        ScrollView sv = new ScrollView(a);   // short screens: the right column scrolls, the portrait stays
+        ScrollView sv = new ScrollView(a);   // short screens: the stats scroll; portrait and actions stay
         sv.addView(right);
-        panel.addView(sv, new LinearLayout.LayoutParams(Math.min(dp(640), screenW * 5 / 10), ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout rightCol = new LinearLayout(a);
+        rightCol.setOrientation(LinearLayout.VERTICAL);
+        rightCol.addView(sv, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        rightCol.addView(actions);
+        panel.addView(rightCol, new LinearLayout.LayoutParams(Math.min(dp(640), screenW * (compact ? 6 : 5) / 10), ViewGroup.LayoutParams.WRAP_CONTENT));
 
         self[0] = modal(panel, false);
         self[0].show();

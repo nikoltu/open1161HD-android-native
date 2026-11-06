@@ -199,6 +199,19 @@ public class SetupActivity extends Activity {
         super.onCreate(savedInstanceState);
         S.setLanguage(prefs().getString("lang", S.EN));
 
+        // Phones: the launcher is landscape like the game, so
+        // the two never fight over the rotation. Held upright at launch, the activity is
+        // recreated in landscape right away -- build nothing for the portrait instance.
+        if (getResources().getConfiguration().smallestScreenWidthDp < 600) {
+            setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+            if (getResources().getConfiguration().orientation == android.content.res.Configuration.ORIENTATION_PORTRAIT) {
+                rotatingToLandscape = true;
+                return;
+            }
+        }
+        compact = Kit.isCompact(this);
+        if (compact) applyImmersive();
+
         // v0.70 item 17: without the game's own data files there is nothing to
         // launch, so the first screen is the import gate rather than a launcher
         // full of empty lists. It also states plainly that the user must supply
@@ -264,7 +277,7 @@ public class SetupActivity extends Activity {
 
         LinearLayout outer = new LinearLayout(this);
         outer.setOrientation(wide ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
-        int pad = dp(wide ? 12 : 8);
+        int pad = dp(compact ? 6 : wide ? 12 : 8);
         outer.setPadding(pad, pad, pad, pad);
         shellRoot.addView(outer, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         setContentView(shellRoot);
@@ -273,19 +286,29 @@ public class SetupActivity extends Activity {
         // Fields, not locals: selectTab() switches screens from outside onCreate.
         pages = new LinearLayout[7];
         railEntries = new LinearLayout[7];
-        View rail = buildRail(wide);
+        View rail = wide && compact ? buildIconRail() : buildRail(wide);
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
 
-        screenTitle = kit.text("", Color.WHITE, 22);
+        screenTitle = kit.text("", Color.WHITE, compact ? 17 : 22);
         screenTitle.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
         screenTitle.setLetterSpacing(0.04f);
-        screenSub = kit.text("", Kit.TEXT2, 13);
-        screenSub.setPadding(dp(14), 0, 0, dp(2));
+        screenSub = kit.text("", Kit.TEXT2, compact ? 11 : 13);
+        screenSub.setPadding(dp(compact ? 10 : 14), 0, 0, dp(2));
+        screenTitle.setSingleLine(true);
         LinearLayout head = new LinearLayout(this);
         head.setOrientation(LinearLayout.HORIZONTAL);
         head.setGravity(Gravity.BOTTOM);
-        if (wide) {
+        if (wide && compact) {
+            // phone in landscape: a 64 dp icon rail, and the header row doubles as the action bar
+            outer.addView(rail, new LinearLayout.LayoutParams(dp(64), ViewGroup.LayoutParams.MATCH_PARENT));
+            LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
+            clp.leftMargin = dp(6);
+            outer.addView(content, clp);
+            head.setGravity(Gravity.CENTER_VERTICAL);
+            head.setMinimumHeight(dp(44));
+            head.setPadding(dp(4), 0, 0, dp(4));
+        } else if (wide) {
             outer.addView(rail, new LinearLayout.LayoutParams(dp(236), ViewGroup.LayoutParams.MATCH_PARENT));
             LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
             clp.leftMargin = dp(12);
@@ -317,7 +340,7 @@ public class SetupActivity extends Activity {
         pageScroll = scroll;
         scroll.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         scroll.setBackground(kit.box(Kit.PANEL, Kit.LINE));
-        scroll.setPadding(dp(12), dp(8), dp(12), dp(8));
+        scroll.setPadding(dp(compact ? 8 : 12), dp(compact ? 6 : 8), dp(compact ? 8 : 12), dp(compact ? 6 : 8));
         LinearLayout pageHolder = new LinearLayout(this);
         pageHolder.setOrientation(LinearLayout.VERTICAL);
         scroll.addView(pageHolder);
@@ -360,22 +383,25 @@ public class SetupActivity extends Activity {
         LinearLayout bottomBar = new LinearLayout(this);
         bottomBar.setOrientation(LinearLayout.HORIZONTAL);
         bottomBar.setGravity(Gravity.CENTER_VERTICAL);
-        bottomBar.setPadding(dp(4), dp(10), 0, 0);
-        actionSummary = kit.text("", Kit.TEXT2, 13);
+        bottomBar.setPadding(compact ? dp(10) : dp(4), compact ? 0 : dp(10), 0, 0);
+        actionSummary = kit.text("", Kit.TEXT2, compact ? 12 : 13);
         actionSummary.setSingleLine(true);
         actionSummary.setEllipsize(android.text.TextUtils.TruncateAt.END);
         bottomBar.addView(actionSummary, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         tertiaryAction = kit.button("", 0, () -> {});
         secondaryAction = kit.button("", 0, () -> {});
         primaryAction = kit.button("", 1, () -> {});
-        primaryAction.setMinWidth(dp(220));
-        primaryAction.setMinimumWidth(dp(220));
+        primaryAction.setMinWidth(dp(compact ? 150 : 220));
+        primaryAction.setMinimumWidth(dp(compact ? 150 : 220));
         for (TextView b : new TextView[]{tertiaryAction, secondaryAction, primaryAction}) {
-            LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(56));
-            blp.leftMargin = dp(12);
+            // phones: 40 dp primary, 36 dp others (the owner's "lower buttons, more room")
+            int bh = compact ? dp(b == primaryAction ? 40 : 36) : dp(56);
+            LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, bh);
+            blp.leftMargin = dp(compact ? 8 : 12);
             bottomBar.addView(b, blp);
         }
-        content.addView(bottomBar);
+        if (compact && wide) head.addView(bottomBar, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        else content.addView(bottomBar);
         startButton = bottomBar;
         selectTab(TAB_SINGLE);
 
@@ -389,7 +415,24 @@ public class SetupActivity extends Activity {
         if (restoreTab >= 0) { int rt = restoreTab; restoreTab = -1; selectTab(rt); }
     }
     private static int restoreTab = -1;      // screen to reopen after recreate() (language / reset)
+    /** Short screen (< 480 dp tall, i.e. a phone in landscape): see Kit.compact. */
+    private boolean compact;
+    private boolean rotatingToLandscape;     // portrait instance about to be replaced (phones)
+
+    // Phones: the status and navigation bars take a seventh of a 384 dp screen. Hide them
+    // (they come back with a swipe from the edge, as in the game).
+    @SuppressWarnings("deprecation")
+    private void applyImmersive() {
+        getWindow().getDecorView().setSystemUiVisibility(Kit.IMMERSIVE_FLAGS);
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && compact) applyImmersive();
+    }
     private static int settingsTab = 0;      // the Settings sub-tab last shown
+    private static int spCardTab = 0;        // phones: the single-player options card last shown
 
     @Override
     protected void onPause() {
@@ -400,6 +443,7 @@ public class SetupActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        if (rotatingToLandscape) return;
         if (prefs().getBoolean("inGame", false)) prefs().edit().putBoolean("inGame", false).apply();
         if (!gateMode) MenuAudio.resume();
         // v0.31: fold a finished melee/LAN game's result into profile stats.
@@ -457,6 +501,8 @@ public class SetupActivity extends Activity {
         if (returnToEpisodeIfPending()) return;
         refresh();
         returnToReplayIfPending();
+        // v1.0.24: in-app update from the public fork's GitHub releases (once per start, release-signed builds only).
+        if (!gateMode) { Updater.resumePending(this); Updater.maybeAutoCheck(this); }
     }
 
     private LinearLayout listColumn(String title, LinearLayout list) {
@@ -507,7 +553,7 @@ public class SetupActivity extends Activity {
     // cards -- verified on both tablets.
     static final int[] SPEED_PCT = {50, 75, 100, 150, 200, 300};
     static final String[] SPEED_NAMES =
-            {S.t("Lėtas"), S.t("Lėtesnis"), S.t("Normalus"), S.t("Greitas"), S.t("Greitesnis"), S.t("Greičiausias")};
+            {"Lėtas", "Lėtesnis", "Normalus", "Greitas", "Greitesnis", "Greičiausias"}; // raw keys: S.t() at display time (a static S.t() froze the language at class load)
 
     // Maps a game-speed percent to its Settings label (for the host-scan card).
     private String gameSpeedName(String pctStr) {
@@ -545,7 +591,9 @@ public class SetupActivity extends Activity {
         // control writes the same prefs as before; only the widgets changed (segments
         // and chips instead of dropdowns, radio buttons and checkboxes).
         final int wDp = getResources().getConfiguration().screenWidthDp;
-        final boolean three = wDp >= 900, two = wDp >= 600;
+        // phones in landscape get the preview back: the options
+        // column is split into card tabs instead, so nothing needs a long inner scroll
+        final boolean three = wDp >= 900 || compact && wDp >= 600, two = wDp >= 600;
         LinearLayout cols = new LinearLayout(this);
         cols.setOrientation(two ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
         cols.setBaselineAligned(false);
@@ -581,12 +629,31 @@ public class SetupActivity extends Activity {
         LinearLayout playersCol = spPanel();
         LinearLayout right = new LinearLayout(this);
         right.setOrientation(LinearLayout.VERTICAL);
+        // compact: three card tabs (players / AI and mode / SCBW2), one shown at a time
+        final LinearLayout[] cards = new LinearLayout[3];
+        for (int i = 0; i != 3; ++i) {
+            cards[i] = new LinearLayout(this);
+            cards[i].setOrientation(LinearLayout.VERTICAL);
+        }
+        if (compact) {
+            LinearLayout strip = kit.segmented(new String[]{S.t("Žaidėjai"), S.t("AI ir režimas"), "SCBW2"}, spCardTab, idx -> {
+                spCardTab = idx;
+                for (int k = 0; k != 3; ++k) cards[k].setVisibility(k == idx ? View.VISIBLE : View.GONE);
+            });
+            LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(30));
+            slp.bottomMargin = dp(6);
+            playersCol.addView(strip, slp);
+        }
+        for (int i = 0; i != 3; ++i) {
+            right.addView(cards[i]);
+            cards[i].setVisibility(!compact || i == spCardTab ? View.VISIBLE : View.GONE);
+        }
         TextView pl = kit.label(S.t("Žaidėjai"));
         pl.setPadding(0, 0, 0, dp(4));
-        right.addView(pl);
+        if (!compact) cards[0].addView(pl);
         playerRacesBox = new LinearLayout(this);
         playerRacesBox.setOrientation(LinearLayout.VERTICAL);
-        right.addView(playerRacesBox);
+        cards[0].addView(playerRacesBox);
 
         // player count 2..8 + two teams
         LinearLayout cntRow = new LinearLayout(this);
@@ -600,43 +667,45 @@ public class SetupActivity extends Activity {
             prefs().edit().putInt("playerCount", idx + 2).apply();
             rebuildPlayerRaces();
             if (mapList != null) populateMapList(mapList);
-        }), new LinearLayout.LayoutParams(0, dp(44), 1f));
+        }), new LinearLayout.LayoutParams(0, hdp(44), 1f));
         TextView teams = kit.chip(S.t("Dvi komandos"), prefs().getInt("teamMode", 0) == 1, on -> {
             prefs().edit().putInt("teamMode", on ? 1 : 0).apply();
             rebuildPlayerRaces();
         });
-        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44));
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(44));
         tlp.leftMargin = dp(10);
         cntRow.addView(teams, tlp);
-        right.addView(cntRow);
+        cards[0].addView(cntRow);
 
         // opponent: the built-in AI's four levels + the original AI as segments; other
         // bots, "no AI" and bot import behind "More"
-        right.addView(kit.label(S.t("AI lygis")));
+        TextView aiLab = kit.label(S.t("AI lygis"));
+        if (compact) aiLab.setPadding(0, 0, 0, dp(3));
+        cards[1].addView(aiLab);
         oppBox = new LinearLayout(this);
         oppBox.setOrientation(LinearLayout.HORIZONTAL);
         oppBox.setGravity(Gravity.CENTER_VERTICAL);
-        right.addView(oppBox, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)));
+        cards[1].addView(oppBox, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, hdp(48)));
         if (!prefs().contains("vsAi")) prefs().edit().putBoolean("vsAi", true).apply();
         rebuildOpponentRow();
 
         // game mode
-        right.addView(kit.label(S.t("Režimas")));
-        right.addView(kit.segmented(GAME_MODE_LABELS, indexOfGameMode(prefs().getString("gameMode", "melee")),
+        cards[1].addView(kit.label(S.t("Režimas")));
+        cards[1].addView(kit.segmented(GAME_MODE_LABELS, indexOfGameMode(prefs().getString("gameMode", "melee")),
                 idx -> prefs().edit().putString("gameMode", GAME_MODE_VALUES[idx]).apply()),
-                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)));
+                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, hdp(48)));
 
         // SCBW2 house rules: negotiated game rules (single player defaults them on for
         // touch comfort); the bitmask ships to the sim via the "qol" extra (qolBits()).
-        right.addView(kit.label(S.t("SCBW2 taisyklės")));
+        if (!compact) cards[2].addView(kit.label(S.t("SCBW2 taisyklės")));
         Kit.Flow chips = new Kit.Flow(this, dp(8));
-        addQolChip(chips, "Group rally", S.t("Group rally — visiems pažymėtiems pastatams"), "qol_grouprally", true);
+        addQolChip(chips, S.t("Grupinis rally"), S.t("Group rally — visiems pažymėtiems pastatams"), "qol_grouprally", true);
         addQolChip(chips, "MBS", S.t("MBS — gamyba iš visų pažymėtų pastatų"), "qol_mbs", true);
         addQolChip(chips, "Smart-cast", S.t("Smart-cast — burtą meta tik geriausios energijos casteris"), "qol_smartcast", true);
-        addQolChip(chips, ">12 selection", S.t("Iki 72 vienetų pažymėjime"), "qol_unlimitedsel", true);
-        addQolChip(chips, "Auto-worker", S.t("Auto-worker — automatiškai gamina darbininkus (tik SP)"), "qol_autoworker", false);
+        addQolChip(chips, S.t(">12 pažymėjimas"), S.t("Iki 72 vienetų pažymėjime"), "qol_unlimitedsel", true);
+        addQolChip(chips, S.t("Auto-darbininkai"), S.t("Auto-worker — automatiškai gamina darbininkus (tik SP)"), "qol_autoworker", false);
         addQolChip(chips, S.t("Kelių pastatų žymėjimas"), S.t("Kelių pastatų žymėjimas — pastatai vienoje selekcijoje"), "qol_multiselect", false);
-        right.addView(chips);
+        cards[2].addView(chips);
 
         ScrollView psv = new ScrollView(this);
         psv.setNestedScrollingEnabled(true);
@@ -648,15 +717,16 @@ public class SetupActivity extends Activity {
         rebuildPlayerRaces();
 
         if (two) {
+            int gap = dp(compact ? 6 : 10);
             LinearLayout.LayoutParams l1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
-            l1.rightMargin = dp(10);
+            l1.rightMargin = gap;
             cols.addView(mapsCol, l1);
             if (prevCol != null) {
-                LinearLayout.LayoutParams l2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
-                l2.rightMargin = dp(10);
+                LinearLayout.LayoutParams l2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, compact ? 0.87f : 1f);
+                l2.rightMargin = gap;
                 cols.addView(prevCol, l2);
             }
-            cols.addView(playersCol, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.45f));
+            cols.addView(playersCol, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, compact ? 1.35f : 1.45f));
             page.addView(cols, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(480)));
             fitToPanel(cols);
         } else {
@@ -673,7 +743,8 @@ public class SetupActivity extends Activity {
         LinearLayout p = new LinearLayout(this);
         p.setOrientation(LinearLayout.VERTICAL);
         p.setBackground(kit.box(0x8005080A, Kit.LINE));
-        p.setPadding(dp(10), dp(10), dp(10), dp(10));
+        int pp = dp(compact ? 6 : 10);
+        p.setPadding(pp, pp, pp, pp);
         return p;
     }
 
@@ -948,7 +1019,7 @@ public class SetupActivity extends Activity {
                 .show());
         raceBtn.setMinWidth(dp(96));
         raceBtn.setMinimumWidth(dp(96));
-        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40));
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(40));
         rlp.leftMargin = dp(8);
         row.addView(raceBtn, rlp);
         col.addView(row);
@@ -979,7 +1050,7 @@ public class SetupActivity extends Activity {
         return -1;
     }
     // Portraits in list rows: the whole multiple of the 56 px clip nearest to 44 dp.
-    private int rowPortraitScale() { return Math.max(1, Math.round(dp(44) / 56f)); }
+    private int rowPortraitScale() { return Math.max(1, Math.round(dp(compact ? 32 : 44) / 56f)); }
     private int indexOfRace(int raceValue) {
         for (int i = 0; i < RACE_VALUES.length; i++) if (RACE_VALUES[i] == raceValue) return i;
         return RACE_VALUES.length - 1; // random
@@ -1033,7 +1104,7 @@ public class SetupActivity extends Activity {
         // before; the primary actions (Create lobby / Join / Ready / Start / Leave)
         // live in the action bar.
         final int wDp = getResources().getConfiguration().screenWidthDp;
-        final boolean three = wDp >= 900, two = wDp >= 600;
+        final boolean three = wDp >= 900 || compact && wDp >= 600, two = wDp >= 600;
         mpSetup = new LinearLayout(this);
         mpSetup.setOrientation(LinearLayout.VERTICAL);
         page.addView(mpSetup);
@@ -1047,9 +1118,9 @@ public class SetupActivity extends Activity {
         LinearLayout top = new LinearLayout(this);
         top.setOrientation(LinearLayout.HORIZONTAL);
         top.setGravity(Gravity.CENTER_VERTICAL);
-        top.setPadding(0, 0, 0, dp(8));
+        top.setPadding(0, 0, 0, dp(compact ? 4 : 8));
         top.addView(kit.segmented(new String[]{S.t("Sukurti"), S.t("Prisijungti")}, mpSub, idx -> { mpSub = idx; applyMpSub(); }),
-                new LinearLayout.LayoutParams(dp(two ? 320 : 220), dp(44)));
+                new LinearLayout.LayoutParams(dp(compact ? 240 : two ? 320 : 220), hdp(44)));
         top.addView(new android.widget.Space(this), new LinearLayout.LayoutParams(0, 1, 1f));
         mpJoinTools = new LinearLayout(this);
         mpJoinTools.setOrientation(LinearLayout.HORIZONTAL);
@@ -1063,8 +1134,8 @@ public class SetupActivity extends Activity {
         joinIpField.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         joinIpField.setBackground(kit.box(0xFF05080A, Kit.STEEL));
         joinIpField.setPadding(dp(10), 0, dp(10), 0);
-        mpJoinTools.addView(joinIpField, new LinearLayout.LayoutParams(dp(200), dp(44)));
-        LinearLayout.LayoutParams jb = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44));
+        mpJoinTools.addView(joinIpField, new LinearLayout.LayoutParams(dp(200), hdp(44)));
+        LinearLayout.LayoutParams jb = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(44));
         jb.leftMargin = dp(8);
         mpJoinTools.addView(kit.smallButton(S.t("Jungtis"), this::mpJoinByIp), jb);
         top.addView(mpJoinTools);
@@ -1099,22 +1170,22 @@ public class SetupActivity extends Activity {
         rl.setPadding(0, 0, 0, dp(6));
         hc.addView(rl);
         mpRaceCreate = new LinearLayout(this);
-        hc.addView(mpRaceCreate, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44)));
+        hc.addView(mpRaceCreate, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, hdp(44)));
         hc.addView(kit.label(S.t("Žaidėjų skaičius")));
         hc.addView(kit.segmented(new String[]{"2", "3", "4", "5", "6", "7", "8"}, clampCount(prefs().getInt("playerCount", 2)) - 2, idx -> {
             prefs().edit().putInt("playerCount", idx + 2).apply();
             if (mapListMp != null) populateMapList(mapListMp);
             updateActionSummary();
-        }), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44)));
+        }), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, hdp(44)));
         // The HOST picks the SCBW2 house rules; native negotiates them to every peer at
         // start, so the whole LAN session runs the host's rules. (Auto-worker is
         // single-player only -- its injector is net-gated off -- so it is not offered.)
         hc.addView(kit.label(S.t("SCBW2 taisyklės")));
         Kit.Flow chips = new Kit.Flow(this, dp(8));
-        addQolChip(chips, "Group rally", S.t("Group rally — visiems pažymėtiems pastatams"), "qol_grouprally", true);
+        addQolChip(chips, S.t("Grupinis rally"), S.t("Group rally — visiems pažymėtiems pastatams"), "qol_grouprally", true);
         addQolChip(chips, "MBS", S.t("MBS — gamyba iš visų pažymėtų pastatų"), "qol_mbs", true);
         addQolChip(chips, "Smart-cast", S.t("Smart-cast — burtą meta tik geriausios energijos casteris"), "qol_smartcast", true);
-        addQolChip(chips, ">12 selection", S.t("Iki 72 vienetų pažymėjime"), "qol_unlimitedsel", true);
+        addQolChip(chips, S.t(">12 pažymėjimas"), S.t("Iki 72 vienetų pažymėjime"), "qol_unlimitedsel", true);
         addQolChip(chips, S.t("Kelių pastatų žymėjimas"), S.t("Kelių pastatų žymėjimas — pastatai vienoje selekcijoje"), "qol_multiselect", false);
         hc.addView(chips);
         ScrollView hsv = new ScrollView(this);
@@ -1134,7 +1205,7 @@ public class SetupActivity extends Activity {
             }
             mpCreateBox.addView(hostCol, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.45f));
             mpSetup.addView(mpCreateBox, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(430)));
-            fitToPanel(mpCreateBox, dp(52));
+            fitToPanel(mpCreateBox, dp(compact ? 40 : 52));
         } else {
             LinearLayout.LayoutParams l1 = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             l1.bottomMargin = dp(10);
@@ -1164,7 +1235,7 @@ public class SetupActivity extends Activity {
         rl2.setPadding(0, 0, 0, dp(6));
         meCol.addView(rl2);
         mpRaceJoin = new LinearLayout(this);
-        LinearLayout.LayoutParams rjl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
+        LinearLayout.LayoutParams rjl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, hdp(44));
         rjl.bottomMargin = dp(10);
         meCol.addView(mpRaceJoin, rjl);
         if (two) {
@@ -1175,7 +1246,7 @@ public class SetupActivity extends Activity {
             mpJoinBox.addView(hostsCol, l1);
             mpJoinBox.addView(meCol, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
             mpSetup.addView(mpJoinBox, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(430)));
-            fitToPanel(mpJoinBox, dp(52));
+            fitToPanel(mpJoinBox, dp(compact ? 40 : 52));
         } else {
             LinearLayout.LayoutParams l1 = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             l1.bottomMargin = dp(10);
@@ -1274,7 +1345,7 @@ public class SetupActivity extends Activity {
     }
 
     private void mpStartHosting() {
-        if (!mpqMissing().isEmpty()) { Toast.makeText(this, "Pirma importuokite MPQ.", Toast.LENGTH_LONG).show(); return; }
+        if (!mpqMissing().isEmpty()) { Toast.makeText(this, S.t("Pirma importuokite MPQ failus."), Toast.LENGTH_LONG).show(); return; }
         if (selectedMap == null && selectedMpqMap == null) {
             Toast.makeText(this, S.t("Pasirinkite žemėlapį."), Toast.LENGTH_LONG).show();
             return;
@@ -1378,8 +1449,8 @@ public class SetupActivity extends Activity {
 
     private void mpJoinHost(LanLobby.HostInfo h) {
         if (!mpHaveMap(h.map)) {
-            Toast.makeText(this, "Tu neturi parsisiuntęs šio žemėlapio: " + mapBasename(h.map)
-                    + ". Importuok jį arba pridėk MPQ.", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, S.t("Tu neturi parsisiuntęs šio žemėlapio: ") + mapBasename(h.map)
+                    + S.t(". Importuok jį arba pridėk MPQ."), Toast.LENGTH_LONG).show();
             return;
         }
         mpResolveMapSelection(h.map);
@@ -1445,7 +1516,7 @@ public class SetupActivity extends Activity {
         mpLobbyStatus.setText(mapBasename(s.map) + "  ·  " + S.t("greitis: ") + gameSpeedName(String.valueOf(s.speed)));
         if (lobbyPane != null && !s.map.equals(lobbyPreviewMap)) { lobbyPreviewMap = s.map; lobbyPane.showMapId(s.map); }
         if (screenTitle != null && activeTab == TAB_MULTI)
-            screenTitle.setText("LAN LOBBY");
+            screenTitle.setText(S.t("LAN LOBBY"));
         mpSlotsBox.removeAllViews();
         for (int i = 0; i < s.slots.size(); i++) {
             LanLobby.Slot sl = s.slots.get(i);
@@ -1515,7 +1586,7 @@ public class SetupActivity extends Activity {
                         .show());
                 raceBtn.setMinWidth(dp(96));
                 raceBtn.setMinimumWidth(dp(96));
-                LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40));
+                LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(40));
                 rlp.leftMargin = dp(8);
                 row.addView(raceBtn, rlp);
             }
@@ -2001,6 +2072,90 @@ public class SetupActivity extends Activity {
         return sv;
     }
 
+    // Phones: a 64 dp rail -- the portrait (tap = profile card)
+    // and all seven screens as icons with short labels, so nothing hides below the fold
+    // of a 384 dp screen. File status and the menu-sound switch live in Settings there.
+    private static final String[] RAIL_SHORT = {"Vienas", "LAN", "Kampanija", "Modai", "Replay'ai", "Išsaug.", "Nustatymai"};
+    private static final int[] RAIL_GLYPH = {RailIcon.SINGLE, RailIcon.LAN, RailIcon.CAMPAIGN, RailIcon.MODS,
+            RailIcon.REPLAYS, RailIcon.SAVES, RailIcon.SETTINGS};
+
+    private View buildIconRail() {
+        LinearLayout rail = new LinearLayout(this);
+        rail.setOrientation(LinearLayout.VERTICAL);
+        rail.setGravity(Gravity.CENTER_HORIZONTAL);
+        rail.setPadding(0, dp(6), 0, dp(4));
+        final File gameDir = getExternalFilesDir(null);
+        int pid = PortraitStore.activeId(prefs(), activeProfile(), gameDir);
+        if (prefs().getInt("activePortrait", -1) != pid) prefs().edit().putInt("activePortrait", pid).apply();
+        final PortraitView portrait = new PortraitView(this);
+        portrait.setScale(1);
+        portrait.setBorderColor(PLAYER_COLORS[spSlotColor(0) % PLAYER_COLORS.length]);
+        portrait.setPortrait(gameDir, pid);
+        portrait.setOnClickListener(v -> { portrait.speak(); profileUi().showProfileCard(); });
+        LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        plp.bottomMargin = dp(4);
+        rail.addView(portrait, plp);
+
+        java.util.Set<String> done = getCampaignDone();
+        int beaten = 0, missions = 0;
+        for (Episode ep : campaignEpisodes()) for (String[] m : ep.missions) { ++missions; if (done.contains(m[1])) ++beaten; }
+        String mods = enabledModsCsv();
+        int modCount = mods == null || mods.isEmpty() ? 0 : mods.split(",").length;
+        int[] order = {TAB_SINGLE, TAB_MULTI, TAB_KAMPANIJA, -1, TAB_SAVE, TAB_REPLAY, TAB_MODAI, -1, TAB_NUSTATYMAI};
+        for (int tab : order) {
+            if (tab < 0) {
+                View sep = new View(this);
+                sep.setBackgroundColor(Kit.LINE);
+                LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(dp(36), Math.max(1, dp(1)));
+                slp.topMargin = dp(2);
+                slp.bottomMargin = dp(2);
+                rail.addView(sep, slp);
+                continue;
+            }
+            String count = tab == TAB_KAMPANIJA ? (missions > 0 ? beaten + "/" + missions : null)
+                    : tab == TAB_SAVE ? countFiles(new File(gameDir, "saves"), ".sav")
+                    : tab == TAB_REPLAY ? countFiles(new File(gameDir, "replays"), ".rep")
+                    : tab == TAB_MODAI ? (modCount > 0 ? String.valueOf(modCount) : null) : null;
+            addIconRailEntry(rail, tab, count);
+        }
+        ScrollView sv = new ScrollView(this);
+        sv.setFillViewport(true);
+        sv.setVerticalScrollBarEnabled(false);
+        sv.setBackground(kit.box(Kit.PANEL, Kit.LINE));
+        sv.addView(rail, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        return sv;
+    }
+
+    private void addIconRailEntry(LinearLayout rail, final int tab, String count) {
+        LinearLayout e = new LinearLayout(this);
+        e.setOrientation(LinearLayout.HORIZONTAL);
+        View mark = new View(this);
+        e.addView(mark, new LinearLayout.LayoutParams(dp(3), ViewGroup.LayoutParams.MATCH_PARENT));
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setGravity(Gravity.CENTER_HORIZONTAL);
+        col.setPadding(0, dp(3), dp(3), dp(2));
+        FrameLayout ic = new FrameLayout(this);
+        ic.addView(new RailIcon(this, RAIL_GLYPH[tab]), new FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER));
+        if (count != null) {
+            TextView c = kit.text(count, Kit.ACCENT, 8);
+            c.setSingleLine(true);
+            ic.addView(c, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP | Gravity.END));
+        }
+        col.addView(ic, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(22)));
+        TextView t = kit.text(S.t(RAIL_SHORT[tab]), Kit.TEXT2, 10);
+        t.setGravity(Gravity.CENTER);
+        t.setSingleLine(true);
+        kit.fitWords(t);
+        col.addView(t, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        e.addView(col, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        e.setMinimumHeight(dp(40));
+        e.setOnClickListener(v -> { MenuAudio.play(MenuAudio.CLICK); selectTab(tab); });
+        railEntries[tab] = e;
+        rail.addView(e, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+    }
+
     private String countFiles(File dir, String ext) {
         int n = 0;
         File[] fs = dir.listFiles();
@@ -2045,8 +2200,13 @@ public class SetupActivity extends Activity {
             GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, new int[]{0xFF14401F, 0x40143C1E});
             e.setBackground(g);
         } else e.setBackground(null);
-        TextView t = (TextView) e.getChildAt(1);
-        t.setTextColor(on ? Color.WHITE : 0xFF9FB3A4);
+        View c1 = e.getChildAt(1);
+        if (c1 instanceof TextView) ((TextView) c1).setTextColor(on ? Color.WHITE : 0xFF9FB3A4);
+        else {                                    // icon rail entry: column = [icon frame, label]
+            LinearLayout col = (LinearLayout) c1;
+            ((RailIcon) ((FrameLayout) col.getChildAt(0)).getChildAt(0)).setColor(on ? Kit.LABEL : 0xFF9FB3A4);
+            ((TextView) col.getChildAt(1)).setTextColor(on ? Color.WHITE : 0xFF9FB3A4);
+        }
     }
 
     private View railSeparator() {
@@ -2220,14 +2380,70 @@ public class SetupActivity extends Activity {
             public void onTextChanged(CharSequence s, int a, int b, int c) { renderModList(); }
             public void afterTextChanged(android.text.Editable s) {}
         });
+        if (compact) {
+            // phones: ONE header row -- search, the filter as a drop-down, and the
+            // rarer actions behind a menu -- so the list gets the screen
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.addView(modSearch, new LinearLayout.LayoutParams(0, dp(34), 1f));
+            final String[] filters = {S.t("Visi"), S.t("Aktyvūs"), S.t("Įdiegtieji"), S.t("Talpykloje")};
+            final TextView[] filterBtn = new TextView[1];
+            filterBtn[0] = kit.smallButton(filters[modFilter] + "  \u25BE", () -> {
+                android.widget.PopupMenu pm = new android.widget.PopupMenu(this, filterBtn[0]);
+                for (int i = 0; i != filters.length; ++i) pm.getMenu().add(0, i, i, filters[i]);
+                pm.setOnMenuItemClickListener(it -> {
+                    modFilter = it.getItemId();
+                    filterBtn[0].setText(filters[modFilter] + "  \u25BE");
+                    renderModList();
+                    return true;
+                });
+                pm.show();
+            });
+            LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34));
+            flp.leftMargin = dp(6);
+            row.addView(filterBtn[0], flp);
+            final TextView[] more = new TextView[1];
+            more[0] = kit.smallButton("\u22EF", () -> {
+                android.widget.PopupMenu pm = new android.widget.PopupMenu(this, more[0]);
+                pm.getMenu().add(0, 0, 0, S.t("Atnaujinti sąrašą"));
+                pm.getMenu().add(0, 1, 1, S.t("+ Modas (.zip)"));
+                pm.getMenu().add(0, 2, 2, S.t("+ Botas (.so)"));
+                pm.getMenu().add(0, 3, 3, S.t("Talpykla…"));
+                pm.setOnMenuItemClickListener(it -> {
+                    switch (it.getItemId()) {
+                        case 0: reloadRepo(); break;
+                        case 1: pickFiles(REQ_PICK_MOD); break;
+                        case 2: pickFiles(REQ_PICK_BOT); break;
+                        default: configureRepo(); break;
+                    }
+                    return true;
+                });
+                pm.show();
+            });
+            more[0].setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+            LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(dp(44), dp(34));
+            mlp.leftMargin = dp(6);
+            row.addView(more[0], mlp);
+            LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            rlp.bottomMargin = dp(6);
+            root.addView(row, rlp);
+            LinearLayout[] ldc = listDetailPage(root, dp(40));
+            modListBox = ldc[0];
+            modDetailBox = ldc[1];
+            renderModList();
+            showModPlaceholder();
+            if (repoCache.isEmpty() && !repoAutoTried) { repoAutoTried = true; repoQuiet = true; reloadRepo(); }
+            return;
+        }
         bar.addView(modSearch, new ViewGroup.LayoutParams(dp(220), dp(44)));
-        bar.addView(kit.segmented(new String[]{S.t("Visi"), S.t("Aktyvūs"), S.t("Įdiegti"), S.t("Talpykloje")}, modFilter,
+        bar.addView(kit.segmented(new String[]{S.t("Visi"), S.t("Aktyvūs"), S.t("Įdiegtieji"), S.t("Talpykloje")}, modFilter,
                 idx -> { modFilter = idx; renderModList(); }), new ViewGroup.LayoutParams(dp(360), dp(44)));
-        bar.addView(kit.smallButton(S.t("Atnaujinti sąrašą").toUpperCase(Locale.ROOT), this::reloadRepo), new ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)));
-        bar.addView(kit.smallButton(S.t("+ Modas (.zip)").toUpperCase(Locale.ROOT), () -> pickFiles(REQ_PICK_MOD)), new ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)));
-        bar.addView(kit.smallButton(S.t("+ Botas (.so)").toUpperCase(Locale.ROOT), () -> pickFiles(REQ_PICK_BOT)), new ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)));
+        bar.addView(kit.smallButton(S.t("Atnaujinti sąrašą").toUpperCase(Locale.ROOT), this::reloadRepo), new ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(44)));
+        bar.addView(kit.smallButton(S.t("+ Modas (.zip)").toUpperCase(Locale.ROOT), () -> pickFiles(REQ_PICK_MOD)), new ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(44)));
+        bar.addView(kit.smallButton(S.t("+ Botas (.so)").toUpperCase(Locale.ROOT), () -> pickFiles(REQ_PICK_BOT)), new ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(44)));
         // The repository address is a one-time setup (it also lives in Settings).
-        bar.addView(kit.smallButton(S.t("Talpykla…").toUpperCase(Locale.ROOT), this::configureRepo), new ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)));
+        bar.addView(kit.smallButton(S.t("Talpykla…").toUpperCase(Locale.ROOT), this::configureRepo), new ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(44)));
         LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         blp.bottomMargin = dp(8);
         root.addView(bar, blp);
@@ -2316,6 +2532,22 @@ public class SetupActivity extends Activity {
      * folder is named anything else provides nothing, which is the single most
      * common way a mod "does not work".
      */
+    // A mod's type is a manifest token ("maps", "icons", ...); show it in the UI
+    // language. Unknown tokens pass through unchanged.
+    static String modTypeLabel(String type) {
+        if (type == null) return "";
+        switch (type) {
+            case "maps": return S.t("žemėlapiai");
+            case "icons": return S.t("ikonos");
+            case "anim": return S.t("animacijos");
+            case "ui": return S.t("sąsaja");
+            case "tileset": return S.t("plytelės");
+            case "data": return S.t("duomenys");
+            case "bots": return S.t("botai");
+            default: return type;
+        }
+    }
+
     private java.util.List<String> detectProvides(File dir) {
         java.util.List<String> out = new ArrayList<>();
         if (dir == null || !dir.isDirectory()) return out;
@@ -2476,8 +2708,8 @@ public class SetupActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(10), dp(8), dp(10), dp(8));
-        row.setMinimumHeight(dp(52));
+        row.setPadding(dp(10), dp(compact ? 4 : 8), dp(10), dp(compact ? 4 : 8));
+        row.setMinimumHeight(hdp(52));
         row.setBackground(sel ? kit.box(Kit.SEL_BG, Kit.LABEL) : kit.box(0xFF070B0E, e.active ? 0xFF2F5A3A : 0xFF2A3338));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         lp.bottomMargin = dp(6);
@@ -2499,7 +2731,7 @@ public class SetupActivity extends Activity {
         name.setEllipsize(android.text.TextUtils.TruncateAt.END);
         col.addView(name);
         String v = e.version != null && !e.version.isEmpty() ? " · v" + e.version : "";
-        col.addView(kit.text(e.type + v, Kit.TEXT2, 12));
+        col.addView(kit.text(modTypeLabel(e.type) + v, Kit.TEXT2, 12));
         row.addView(col, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         if (e.executable) {
             TextView g = kit.text(S.t("vykdomas kodas"), Kit.ACCENT, 11);
@@ -2522,7 +2754,7 @@ public class SetupActivity extends Activity {
         h.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
         modDetailBox.addView(h);
 
-        StringBuilder mb = new StringBuilder(e.type);
+        StringBuilder mb = new StringBuilder(modTypeLabel(e.type));
         if (e.version != null && !e.version.isEmpty()) mb.append(" · v").append(e.version);
         if (e.author != null && !e.author.isEmpty()) mb.append(" · ").append(e.author);
         TextView meta = kit.text(mb.toString(), Kit.TEXT2, 13);    // the state is on the list row and the action button
@@ -2686,11 +2918,11 @@ public class SetupActivity extends Activity {
     private void confirmUninstallMod(ModEntry e) {
         new AlertDialog.Builder(this)
                 .setTitle(S.t("Pašalinti modą?"))
-                .setMessage(e.name + "\nFailai bus ištrinti iš įrenginio.")
+                .setMessage(e.name + "\n" + S.t("Failai bus ištrinti iš įrenginio."))
                 .setPositiveButton(S.t("Pašalinti"), (d, w) -> {
                     deleteRecursive(new File(new File(getExternalFilesDir(null), "mods"), e.id));
                     prefs().edit().remove("mod_" + e.id).apply();
-                    Toast.makeText(this, "Pašalinta: " + e.name, Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, S.t("Pašalinta: ") + e.name, Toast.LENGTH_SHORT).show();
                     selectMod(null);
                 })
                 .setNegativeButton(S.t("Atšaukti"), null)
@@ -2763,10 +2995,10 @@ public class SetupActivity extends Activity {
 
     private void reloadRepo() {
         String base = modRepoUrl();
-        if (base.isEmpty()) { Toast.makeText(this, "Nustatyk talpyklos adresą (mygtukas žemiau).", Toast.LENGTH_SHORT).show(); return; }
+        if (base.isEmpty()) { Toast.makeText(this, S.t("Nustatyk talpyklos adresą (mygtukas žemiau)."), Toast.LENGTH_SHORT).show(); return; }
         final boolean quiet = repoQuiet;
         repoQuiet = false;
-        if (!quiet) Toast.makeText(this, "Gaunamas talpyklos sąrašas…", Toast.LENGTH_SHORT).show();
+        if (!quiet) Toast.makeText(this, S.t("Gaunamas talpyklos sąrašas…"), Toast.LENGTH_SHORT).show();
         final String b = base;
         new Thread(() -> {
             try {
@@ -2804,7 +3036,7 @@ public class SetupActivity extends Activity {
                     repoCache.clear();
                     repoCache.addAll(mods);
                     renderModList();
-                    if (!quiet) Toast.makeText(this, "Talpykla: " + mods.size() + " modų.", Toast.LENGTH_SHORT).show();
+                    if (!quiet) Toast.makeText(this, S.t("Talpykla: ") + mods.size() + S.t(" modų."), Toast.LENGTH_SHORT).show();
                 });
             } catch (Exception e) {
                 // v0.83.010: log it. A toast is gone in three seconds and says
@@ -2823,7 +3055,7 @@ public class SetupActivity extends Activity {
         final String id = m.optString("id", "").replaceAll("[^A-Za-z0-9._-]", "_");
         String u = m.optString("url", "");
         if (id.isEmpty() || u.isEmpty()) {
-            Toast.makeText(this, "Netinkamas talpyklos įrašas.", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, S.t("Netinkamas talpyklos įrašas."), Toast.LENGTH_LONG).show();
             return;
         }
         final String url = u.startsWith("http") ? u : base + "/" + u;
@@ -2914,7 +3146,7 @@ public class SetupActivity extends Activity {
                 boolean dAllowNative = dscan.nativeLibs.isEmpty()
                         ? false : askNativeConsent(id, dscan.nativeLibs);
                 files = unzipMod(Uri.fromFile(tmp), new File(new File(getExternalFilesDir(null), "mods"), id), dAllowNative);
-                if (files == 0) err = "tuščias zip";
+                if (files == 0) err = S.t("tuščias zip");
             } catch (Exception e) {
                 err = e.getMessage();
             } finally {
@@ -2925,7 +3157,7 @@ public class SetupActivity extends Activity {
             new Handler(Looper.getMainLooper()).post(() -> {
                 dialog.dismiss();
                 if (errF != null) {
-                    Toast.makeText(this, "Nepavyko įdiegti: " + errF, Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, S.t("Nepavyko įdiegti: ") + errF, Toast.LENGTH_LONG).show();
                 } else {
                     Toast.makeText(this, S.t("Įdiegta: ") + id, Toast.LENGTH_LONG).show();
                     if (modListBox != null) selectMod(id); else renderModList();
@@ -2949,7 +3181,7 @@ public class SetupActivity extends Activity {
         java.util.ArrayList<Episode> eps = new java.util.ArrayList<>();
         // --- StarCraft (original) ---
         eps.add(new Episode(S.t("Terran — Rebel Yell (I epizodas)"), new String[][]{
-            {"Mokymai — Boot Camp", "campaign/terran/tutorial"},
+            {S.t("Mokymai — Boot Camp"), "campaign/terran/tutorial"},
             {"1. Wasteland", "campaign/terran/terran01"},
             {"2. Backwater Station", "campaign/terran/terran02"},
             {"3. Desperate Alliance", "campaign/terran/terran03"},
@@ -2962,7 +3194,7 @@ public class SetupActivity extends Activity {
             {"10. The Hammer Falls", "campaign/terran/terran10"},
         }));
         eps.add(new Episode(S.t("Zerg — Overmind (II epizodas)"), new String[][]{
-            {"Mokymai", "campaign/zerg/tutorial"},
+            {S.t("Mokymai"), "campaign/zerg/tutorial"},
             {"1. Among the Ruins", "campaign/zerg/zerg01"},
             {"2. Egression", "campaign/zerg/zerg02"},
             {"3. The New Dominion", "campaign/zerg/zerg03"},
@@ -2975,7 +3207,7 @@ public class SetupActivity extends Activity {
             {"10. Full Circle", "campaign/zerg/zerg10"},
         }));
         eps.add(new Episode(S.t("Protoss — The Fall (III epizodas)"), new String[][]{
-            {"Mokymai", "campaign/protoss/tutorial"},
+            {S.t("Mokymai"), "campaign/protoss/tutorial"},
             {"1. First Strike", "campaign/protoss/protoss01"},
             {"2. Into the Flames", "campaign/protoss/protoss02"},
             {"3. Higher Ground", "campaign/protoss/protoss03"},
@@ -3070,7 +3302,7 @@ public class SetupActivity extends Activity {
             {"(4) Ramparts", "multimaps/broodwar/(4)Ramparts.scm"},
             {"(4) Sanctuary", "multimaps/broodwar/(4)Sanctuary.scx"},
         }));
-        g.add(new Episode("UMS scenarijai (mini-žaidimai)", new String[][]{
+        g.add(new Episode(S.t("UMS scenarijai (mini-žaidimai)"), new String[][]{
             {"(2) Pro Bowl", "multimaps/scenario/(2)Pro Bowl.scm"},
             {"(2) Wakka Wakka", "multimaps/scenario/(2)Wakka Wakka.scm"},
             {"(3) Defenders of the Galaxy", "multimaps/scenario/(3)Defenders of the Galaxy.scm"},
@@ -3396,11 +3628,11 @@ public class SetupActivity extends Activity {
                 row.setOrientation(LinearLayout.HORIZONTAL);
                 row.setBaselineAligned(false);
                 LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
-                if (i > 0) rlp.topMargin = dp(10);
+                if (i > 0) rlp.topMargin = dp(compact ? 6 : 10);
                 grid.addView(row, rlp);
             }
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
-            if (i % 3 != 0) lp.leftMargin = dp(10);
+            if (i % 3 != 0) lp.leftMargin = dp(compact ? 6 : 10);
             row.addView(card, lp);
         }
         if (wide) {
@@ -3422,12 +3654,12 @@ public class SetupActivity extends Activity {
         LinearLayout info = new LinearLayout(this);
         info.setOrientation(LinearLayout.VERTICAL);
         info.setPadding(dp(8), dp(2), dp(4), dp(2));
-        TextView lab = kit.label("Episode " + (index < EP_NUMERAL.length ? EP_NUMERAL[index] : String.valueOf(index + 1)) + " · " + RACE_LABEL[race]);
+        TextView lab = kit.label(S.t("Epizodas") + " " + (index < EP_NUMERAL.length ? EP_NUMERAL[index] : String.valueOf(index + 1)) + " · " + RACE_LABEL[race]);
         lab.setPadding(0, 0, 0, dp(4));
         info.addView(lab);
-        TextView title = kit.text(episodeName(ep), Color.WHITE, 18);
+        TextView title = kit.text(episodeName(ep), Color.WHITE, compact ? 15 : 18);
         title.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
-        title.setPadding(0, 0, 0, dp(8));
+        title.setPadding(0, 0, 0, dp(compact ? 4 : 8));
         info.addView(title);
         info.addView(kit.bar(total > 0 ? (float) beaten / total : 0f, Kit.LABEL),
                 new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(6)));
@@ -3436,7 +3668,7 @@ public class SetupActivity extends Activity {
         info.addView(pt);
         info.addView(new android.widget.Space(this), new LinearLayout.LayoutParams(1, 0, 1f));
         info.addView(kit.smallButton((beaten >= total && total > 0 ? S.t("Peržaisti") : beaten > 0 ? S.t("Tęsti") : S.t("Pradėti")).toUpperCase(Locale.ROOT),
-                () -> openEpisodeDetail(ep)), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)));
+                () -> openEpisodeDetail(ep)), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(40)));
         card.addView(info, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.58f));
         card.setOnClickListener(v -> openEpisodeDetail(ep));
         return card;
@@ -3464,10 +3696,10 @@ public class SetupActivity extends Activity {
         LinearLayout top = new LinearLayout(this);
         top.setOrientation(LinearLayout.HORIZONTAL);
         top.setGravity(Gravity.CENTER_VERTICAL);
-        top.setPadding(0, 0, 0, dp(8));
+        top.setPadding(0, 0, 0, dp(compact ? 4 : 8));
         top.addView(kit.smallButton(S.t("‹ Epizodai").toUpperCase(Locale.ROOT), this::campaignBackToEpisodes),
-                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)));
-        TextView t = kit.text(ep.title + "  ·  " + beaten + " / " + total, Kit.TEXT2, 13);
+                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(44)));
+        TextView t = kit.text(ep.title + "  ·  " + beaten + " / " + total, Kit.TEXT2, compact ? 12 : 13);
         t.setPadding(dp(14), 0, 0, 0);
         top.addView(t);
         campaignMissionBox.addView(top);
@@ -3506,28 +3738,29 @@ public class SetupActivity extends Activity {
 
         // RIGHT: the detail panel
         LinearLayout detail = spPanel();
-        detail.setPadding(dp(14), dp(12), dp(14), dp(12));
+        if (compact) detail.setPadding(dp(10), dp(8), dp(10), dp(8));
+        else detail.setPadding(dp(14), dp(12), dp(14), dp(12));
         LinearLayout dhead = new LinearLayout(this);
         dhead.setOrientation(LinearLayout.HORIZONTAL);
         dhead.setGravity(Gravity.CENTER_VERTICAL);
         PortraitView emblem = new PortraitView(this);
         loadEmblemInto(emblem, episodeEmblem(ep));
-        dhead.addView(emblem, new LinearLayout.LayoutParams(dp(120), dp(130)));
+        dhead.addView(emblem, compact ? new LinearLayout.LayoutParams(dp(72), dp(78)) : new LinearLayout.LayoutParams(dp(120), dp(130)));
         LinearLayout dt = new LinearLayout(this);
         dt.setOrientation(LinearLayout.VERTICAL);
         dt.setPadding(dp(12), 0, 0, 0);
-        detailTitle = kit.text("", Color.WHITE, 24);
+        detailTitle = kit.text("", Color.WHITE, compact ? 18 : 24);
         detailTitle.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
-        detailTitle.setPadding(0, 0, 0, dp(8));
+        detailTitle.setPadding(0, 0, 0, dp(compact ? 4 : 8));
         dt.addView(detailTitle);
         detailStatus = kit.text("", Kit.ACCENT, 11);
         detailStatus.setPadding(dp(8), dp(2), dp(8), dp(2));
         dt.addView(detailStatus, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         dhead.addView(dt, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         detail.addView(dhead);
-        detailDesc = kit.text("", Kit.TEXT, 15);
-        detailDesc.setLineSpacing(dp(3), 1f);
-        detailDesc.setPadding(0, dp(12), 0, 0);
+        detailDesc = kit.text("", Kit.TEXT, compact ? 13 : 15);
+        detailDesc.setLineSpacing(dp(compact ? 2 : 3), 1f);
+        detailDesc.setPadding(0, dp(compact ? 8 : 12), 0, 0);
         if (wide) {
             ScrollView dsv = new ScrollView(this);
             dsv.setNestedScrollingEnabled(true);
@@ -3540,11 +3773,11 @@ public class SetupActivity extends Activity {
 
         if (wide) {
             LinearLayout.LayoutParams l1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.42f);
-            l1.rightMargin = dp(10);
+            l1.rightMargin = dp(compact ? 6 : 10);
             cols.addView(listPanel, l1);
             cols.addView(detail, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.58f));
             campaignMissionBox.addView(cols, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(430)));
-            fitToPanel(cols, dp(52));
+            fitToPanel(cols, dp(compact ? 38 : 52));
         } else {
             LinearLayout.LayoutParams l1 = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             l1.bottomMargin = dp(10);
@@ -3569,17 +3802,17 @@ public class SetupActivity extends Activity {
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.bottomMargin = dp(6);
+        lp.bottomMargin = dp(compact ? 4 : 6);
         row.setLayoutParams(lp);
-        row.setPadding(dp(10), dp(8), dp(10), dp(8));
-        row.setMinimumHeight(dp(52));
+        row.setPadding(dp(10), dp(compact ? 4 : 8), dp(10), dp(compact ? 4 : 8));
+        row.setMinimumHeight(hdp(52));
 
         TextView mark = kit.text(isDone ? "\u2713" : current ? "\u25B6" : unlocked ? "\u2022" : "\uD83D\uDD12",
-                isDone ? Kit.LABEL : current ? Kit.ACCENT : Kit.TEXT2, 16);
-        mark.setMinWidth(dp(34));
+                isDone ? Kit.LABEL : current ? Kit.ACCENT : Kit.TEXT2, compact ? 14 : 16);
+        mark.setMinWidth(dp(compact ? 26 : 34));
         row.addView(mark);
         // the mark says the state; the detail panel's tag spells it out for the picked one
-        TextView tv = kit.text(name, unlocked ? Color.WHITE : Kit.TEXT2, 15);
+        TextView tv = kit.text(name, unlocked ? Color.WHITE : Kit.TEXT2, compact ? 13 : 15);
         tv.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
         row.addView(tv);
 
@@ -3714,13 +3947,13 @@ public class SetupActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(0, dp(7), 0, dp(7));
-        row.setMinimumHeight(dp(48));
+        row.setPadding(0, dp(compact ? 4 : 7), 0, dp(compact ? 4 : 7));
+        row.setMinimumHeight(hdp(48));
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         col.setPadding(0, 0, dp(12), 0);
-        col.addView(kit.text(label, Kit.TEXT, 14));
-        if (hint != null && !hint.isEmpty()) col.addView(kit.text(hint, Kit.TEXT2, 11));
+        col.addView(kit.text(label, Kit.TEXT, compact ? 13 : 14));
+        if (hint != null && !hint.isEmpty()) col.addView(kit.text(hint, Kit.TEXT2, compact ? 10.5f : 11));
         row.addView(col, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         return row;
     }
@@ -3793,7 +4026,7 @@ public class SetupActivity extends Activity {
     // A choice among a few labelled values.
     private void setSegments(LinearLayout root, String label, String hint, String[] labels, int sel, Kit.IntSink sink) {
         LinearLayout row = setRow(label, hint);
-        row.addView(kit.segmented(labels, sel, sink), new LinearLayout.LayoutParams(0, dp(44), labels.length > 4 ? 2.2f : 1.3f));
+        row.addView(kit.segmented(labels, sel, sink), new LinearLayout.LayoutParams(0, hdp(44), labels.length > 4 ? 2.2f : 1.3f));
         root.addView(row);
     }
 
@@ -3816,7 +4049,7 @@ public class SetupActivity extends Activity {
         indLp.rightMargin = dp(10);
         mpqRow.addView(mpqIndicator, 0, indLp);
         mpqRow.addView(kit.smallButton(S.t("Importuoti MPQ failus"), () -> pickFiles(REQ_PICK_MPQ)),
-                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)));
+                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(40)));
         files.addView(mpqRow);
         mpqStatus = kit.text("", Kit.TEXT2, 12);
         mpqStatus.setPadding(dp(22), 0, 0, dp(10));
@@ -3827,7 +4060,7 @@ public class SetupActivity extends Activity {
         sInd.rightMargin = dp(10);
         scrRow.addView(scrIndicator, 0, sInd);
         scrRow.addView(kit.smallButton(S.t("Pasirinkti SC:R aplanką"), this::pickScrFolder),
-                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)));
+                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(40)));
         files.addView(scrRow);
         scrStatus = kit.text("", Kit.TEXT2, 12);
         scrStatus.setPadding(dp(22), 0, 0, dp(10));
@@ -3861,7 +4094,7 @@ public class SetupActivity extends Activity {
                     recreate();
                 })
                 .setNegativeButton(S.t("Atšaukti"), null)
-                .show()), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)));
+                .show()), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(40)));
         files.addView(resetRow);
 
         // ---- Garsas: master + music, then per-category submixes on top of the master ----
@@ -3905,7 +4138,7 @@ public class SetupActivity extends Activity {
                 new String[]{"SD", "HD2", "FULL HD"}, tierSel, idx -> prefs().edit().putString("gfxTier", tierVals[idx]).apply());
         if (prefs().getString("scrCascDir", "").isEmpty())
             setNote(gfx, S.t("SC:R aplankas nepasirinktas — HD valdikliai veiks tik pasirinkus jį (Failai)."));
-        setSwitch(gfx, S.t("Emissive švytėjimas"), "emissiveGlow",
+        setSwitch(gfx, S.t("Švytintys efektai (emissive)"), "emissiveGlow",
                 S.t("SC:R vienetų savišvytėjimas — ginklų blyksniai, psi, skydai, warp."), true);
         setSlider(gfx, S.t("Minkšti šešėliai"),
                 S.t("Vienetų šešėlių švelnumas. 0 = klasikinis kietas juodas; didesnis — šviesesnis."), "shadowSoft", 0, 100);
@@ -3916,13 +4149,13 @@ public class SetupActivity extends Activity {
         setSwitch(gfx, S.t("Dinaminės šviesos"), "pointLights",
                 S.t("Burtai, ugnis ir sprogimai apšviečia aplinką. Tik HD."), false);
         setSlider(gfx, S.t("Šviesų stiprumas"), null, "lightStrength", 100, 200);
-        setSlider(gfx, S.t("Bloom (švytėjimo aureolė)"),
+        setSlider(gfx, S.t("Švytėjimo aureolė (bloom)"),
                 S.t("0 = išjungta."), "bloomLevel", 0, 100);
         // GPU sharpen: default ON with AUTO effect -> the engine enables it on Adreno GPUs
         // and stays on the classic present elsewhere.
         setSwitch(gfx, S.t("Ryškumo filtras (Sharpen)"), "sharpenFilter",
                 S.t("HD2 grafika atrodo aštriau."), true);
-        setSlider(gfx, S.t("Sharpen stiprumas"),
+        setSlider(gfx, S.t("Ryškumo filtro stiprumas"),
                 S.t("Per stipriai — triukšmas ir aureolės aplink kraštus."), "sharpenLevel", 35, 100);
         setSlider(gfx, S.t("Kinematinis atspalvis"),
                 S.t("Kontrastas, sodrumas, šiluma. 0 = išjungta."), "gradeLevel", 0, 100);
@@ -3935,7 +4168,7 @@ public class SetupActivity extends Activity {
                 S.t("Bakstelėjimas žemėje ar į priešą duoda komandą pažymėtiems."), true);
         setSwitch(ctl, S.t("LAN sklandumas"), "renderInterp", S.t("Sklandesnis vienetų judėjimas LAN žaidime."), true);
         setSlider(ctl, S.t("Kameros greitis"), S.t("Krašto ir klaviatūros slinkimo greitis (100 = įprastas)."), "cameraSpeed", 100, 250);
-        setSwitch(ctl, S.t("Rodyti zoom mygtukus"), "showZoomButtons", S.t("Ekrane rodomi - / + mygtukai. Pinch-zoom veikia ir be jų."), false);
+        setSwitch(ctl, S.t("Rodyti mastelio mygtukus"), "showZoomButtons", S.t("Ekrane rodomi - / + mygtukai. Mastelį dviem pirštais keisti galima ir be jų."), false);
 
         // ---- Žaidimo HUD: the classic bar (v2) or the touch HUD (v3) and its options ----
         LinearLayout hud = settingsSection(S.t("Žaidimo HUD"));
@@ -3983,7 +4216,7 @@ public class SetupActivity extends Activity {
         setSwitch(ifc, S.t("Rodyti APM"), "showApm", S.t("Veiksmai per minutę, po laikrodžiu."), false);
         setSwitch(ifc, S.t("Visada rodyti sveikatos juostas"), "healthBarsAlways",
                 S.t("Sveikatos juostos po VISAIS vienetais, ne tik pažeistais ar pažymėtais."), false);
-        setSwitch(ifc, S.t("Equipment ikonos pilkos"), "equipGrey",
+        setSwitch(ifc, S.t("Pilkos įrangos ikonos"), "equipGrey",
                 S.t("Išjunk, jei naudoji spalvotų ikonų modą."), true);
 
         // ---- Žaidimas: default game speed (in-game +/- keys still override) ----
@@ -4000,11 +4233,11 @@ public class SetupActivity extends Activity {
         // ---- Modų talpykla: repository address + token ----
         LinearLayout repo = settingsSection(S.t("Modų talpykla"));
         LinearLayout addrRow = setRow(S.t("Talpyklos adresas…"), S.t("Lieka tik šiame įrenginyje."));
-        addrRow.addView(kit.smallButton(S.t("Keisti"), this::configureRepo), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)));
+        addrRow.addView(kit.smallButton(S.t("Keisti"), this::configureRepo), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(40)));
         repo.addView(addrRow);
 
         // ---- Dev: switches that bypass or instrument normal play ----
-        LinearLayout dev = settingsSection(S.t("Dev"));
+        LinearLayout dev = settingsSection(S.t("Kūrėjams"));
         setSwitch(dev, S.t("Atrakinti visas kampanijos misijas"), "campaignUnlockAll",
                 S.t("Leidžia žaisti bet kurią misiją nebaigus ankstesnės."), false);
         setSwitch(dev, S.t("Išjungti karo rūką (Fog of War)"), "devNoFog",
@@ -4028,12 +4261,20 @@ public class SetupActivity extends Activity {
                 + "  (Android " + android.os.Build.VERSION.RELEASE + ")");
         setNote(abt, S.t("Įtaisyti botai:") + "\n"
                 + "• UnifiedAI — open1161HD");
+        // v1.0.24: updates from GitHub releases (Updater.REPO).
+        setSwitch(abt, S.t("Tikrinti atnaujinimus"), "updCheck",
+                S.t("Paleidus launcherį klausia GitHub, ar išleista nauja versija.")
+                        + (Updater.isReleaseSigned(this) ? "" : " " + S.t("Ši kūrimo versija automatiškai netikrina.")), true);
+        LinearLayout updRow = setRow(S.t("Atnaujinimai"), "github.com/" + Updater.REPO);
+        updRow.addView(kit.smallButton(S.t("Tikrinti dabar"), () -> Updater.check(this, true)),
+                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(40)));
+        abt.addView(updRow);
         // Third-party licence texts (assets/licenses/) -- the row shows only when some ship.
         try {
             String[] lic = getAssets().list("licenses");
             if (lic != null && lic.length > 0) {
                 LinearLayout licRow = setRow(S.t("Licencijos"), null);
-                licRow.addView(kit.smallButton(S.t("Rodyti"), this::showLicenses), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)));
+                licRow.addView(kit.smallButton(S.t("Rodyti"), this::showLicenses), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(40)));
                 abt.addView(licRow);
             }
         } catch (java.io.IOException ignored) {
@@ -4070,11 +4311,59 @@ public class SetupActivity extends Activity {
             holder.addView(v, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         }
         shown.get(settingsTab).setVisibility(View.VISIBLE);
+        if (compact) {
+            // phones: ten sub-tabs do not fit one 34 dp strip --
+            // a vertical list on the left, the section on the right, each scrolling alone
+            LinearLayout cols = new LinearLayout(this);
+            cols.setOrientation(LinearLayout.HORIZONTAL);
+            cols.setBaselineAligned(false);
+            LinearLayout tabs = new LinearLayout(this);
+            tabs.setOrientation(LinearLayout.VERTICAL);
+            final TextView[] items = new TextView[setTabNames.size()];
+            for (int i = 0; i != items.length; ++i) {
+                final int idx = i;
+                TextView t = kit.text(setTabNames.get(i), Kit.TEXT2, 12);
+                t.setGravity(Gravity.CENTER_VERTICAL);
+                t.setSingleLine(true);
+                t.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                t.setPadding(dp(10), 0, dp(6), 0);
+                t.setOnClickListener(v -> {
+                    MenuAudio.play(MenuAudio.CLICK);
+                    settingsTab = idx;
+                    for (int k = 0; k != shown.size(); ++k) shown.get(k).setVisibility(k == idx ? View.VISIBLE : View.GONE);
+                    for (int k = 0; k != items.length; ++k) kit.styleSeg(items[k], k == idx);
+                });
+                kit.styleSeg(t, i == settingsTab);
+                items[i] = t;
+                LinearLayout.LayoutParams tl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(30));
+                tl.bottomMargin = dp(2);
+                tabs.addView(t, tl);
+            }
+            ScrollView tsv = new ScrollView(this);
+            tsv.setVerticalScrollBarEnabled(false);
+            tsv.setNestedScrollingEnabled(true);
+            tsv.setOnTouchListener((v, e) -> { v.getParent().requestDisallowInterceptTouchEvent(true); return false; });
+            tsv.addView(tabs);
+            LinearLayout.LayoutParams l1 = new LinearLayout.LayoutParams(dp(150), ViewGroup.LayoutParams.MATCH_PARENT);
+            l1.rightMargin = dp(6);
+            cols.addView(tsv, l1);
+            LinearLayout panel = spPanel();
+            panel.setPadding(dp(12), dp(4), dp(12), dp(6));
+            ScrollView hsv = new ScrollView(this);
+            hsv.setNestedScrollingEnabled(true);
+            hsv.setOnTouchListener((v, e) -> { v.getParent().requestDisallowInterceptTouchEvent(true); return false; });
+            hsv.addView(holder);
+            panel.addView(hsv, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+            cols.addView(panel, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+            page.addView(cols, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(400)));
+            fitToPanel(cols);
+            return;
+        }
         LinearLayout strip = kit.segmented(setTabNames.toArray(new String[0]), settingsTab, idx -> {
             settingsTab = idx;
             for (int i = 0; i != shown.size(); ++i) shown.get(i).setVisibility(i == idx ? View.VISIBLE : View.GONE);
         });
-        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, hdp(44));
         slp.bottomMargin = dp(10);
         page.addView(strip, slp);
         LinearLayout panel = spPanel();
@@ -4600,7 +4889,7 @@ public class SetupActivity extends Activity {
                 String remaining = c.getHeaderField("X-RateLimit-Remaining");
                 c.disconnect();
                 if ("0".equals(remaining)) {
-                    throw new java.io.IOException(code + " -- GitHub užklausų limitas viršytas, pabandykite vėliau");
+                    throw new java.io.IOException(code + " -- " + S.t("GitHub užklausų limitas viršytas, pabandykite vėliau"));
                 }
                 throw new java.io.IOException(code + " -- " + (token.isEmpty()
                         ? "privatiems modams reikia prieigos kodo"
@@ -4808,7 +5097,7 @@ public class SetupActivity extends Activity {
         foot.addView(tile);
         // (no caption next to the tile -- it explains nothing the player needs)
         foot.addView(new android.widget.Space(this), new LinearLayout.LayoutParams(0, 1, 1f));
-        LinearLayout.LayoutParams exLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(52));
+        LinearLayout.LayoutParams exLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(52));
         exLp.rightMargin = dp(12);
         foot.addView(kit.button(S.t("Išeiti"), 0, this::finish), exLp);
         TextView go = kit.button(S.t("Tęsti"), 1, () -> {
@@ -4821,7 +5110,7 @@ public class SetupActivity extends Activity {
         go.setMinWidth(dp(140));
         go.setMinimumWidth(dp(140));
         if (!bwOk) { go.setAlpha(0.35f); go.setClickable(false); }
-        foot.addView(go, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(52)));
+        foot.addView(go, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(52)));
         panel.addView(foot);
 
         // a modal over a dark, empty launcher: nothing behind it is reachable
@@ -5138,8 +5427,8 @@ public class SetupActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.VERTICAL);
         row.setTag(MAP_ROW);
-        TextView t = kit.text(name, Kit.TEXT, 15);
-        t.setPadding(dp(10), dp(11), dp(10), dp(11));
+        TextView t = kit.text(name, Kit.TEXT, compact ? 13 : 15);
+        t.setPadding(dp(10), dp(compact ? 7 : 11), dp(10), dp(compact ? 7 : 11));
         t.setSingleLine(true);
         t.setEllipsize(android.text.TextUtils.TruncateAt.END);
         row.addView(t, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -5260,9 +5549,9 @@ public class SetupActivity extends Activity {
             img.setPadding(ip, ip, ip, ip);
             img.setVisibility(View.GONE);          // no empty frame before there is a map
             pin.addView(img, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-            name = kit.text(placeholder, Color.WHITE, 17);
+            name = kit.text(placeholder, Color.WHITE, compact ? 14 : 17);
             name.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
-            name.setPadding(0, dp(10), 0, dp(2));
+            name.setPadding(0, dp(compact ? 6 : 10), 0, dp(2));
             pin.addView(name);
             info = kit.text("", Kit.TEXT2, 12);
             pin.addView(info);
@@ -5398,8 +5687,8 @@ public class SetupActivity extends Activity {
         TextView t = new TextView(this);
         t.setText(s);
         t.setTextColor(Kit.ACCENT);
-        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        t.setPadding(dp(4), dp(10), dp(2), dp(4));
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, compact ? 11 : 12);
+        t.setPadding(dp(4), dp(compact ? 6 : 10), dp(2), dp(compact ? 2 : 4));
         return t;
     }
 
@@ -5446,7 +5735,8 @@ public class SetupActivity extends Activity {
         cols.setOrientation(wide ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
         cols.setBaselineAligned(false);
         LinearLayout listPanel = spPanel(), detailPanel = spPanel();
-        detailPanel.setPadding(dp(14), dp(12), dp(14), dp(12));
+        if (compact) detailPanel.setPadding(dp(10), dp(8), dp(10), dp(8));
+        else detailPanel.setPadding(dp(14), dp(12), dp(14), dp(12));
         LinearLayout list = new LinearLayout(this), detail = new LinearLayout(this);
         list.setOrientation(LinearLayout.VERTICAL);
         detail.setOrientation(LinearLayout.VERTICAL);
@@ -5459,7 +5749,7 @@ public class SetupActivity extends Activity {
                 (i == 0 ? listPanel : detailPanel).addView(sv, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
             }
             LinearLayout.LayoutParams l1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.55f);
-            l1.rightMargin = dp(10);
+            l1.rightMargin = dp(compact ? 6 : 10);
             cols.addView(listPanel, l1);
             cols.addView(detailPanel, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
             root.addView(cols, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(430)));
@@ -5481,10 +5771,10 @@ public class SetupActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(8), dp(8), dp(10), dp(8));
+        row.setPadding(dp(8), dp(compact ? 4 : 8), dp(10), dp(compact ? 4 : 8));
         row.setBackground(selected ? kit.box(Kit.SEL_BG, Kit.LABEL) : kit.box(0xFF070B0E, 0xFF2A3338));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.bottomMargin = dp(6);
+        lp.bottomMargin = dp(compact ? 4 : 6);
         row.setLayoutParams(lp);
         PortraitView pv = new PortraitView(this);
         pv.setScale(rowPortraitScale());
@@ -5494,8 +5784,8 @@ public class SetupActivity extends Activity {
         row.addView(pv);
         LinearLayout mid = new LinearLayout(this);
         mid.setOrientation(LinearLayout.VERTICAL);
-        mid.setPadding(dp(12), 0, dp(8), 0);
-        TextView t = kit.text(title, Color.WHITE, 15);
+        mid.setPadding(dp(compact ? 8 : 12), 0, dp(8), 0);
+        TextView t = kit.text(title, Color.WHITE, compact ? 13 : 15);
         t.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
         t.setSingleLine(true);
         t.setEllipsize(android.text.TextUtils.TruncateAt.END);
@@ -5567,12 +5857,12 @@ public class SetupActivity extends Activity {
             public void onTextChanged(CharSequence s, int a, int b, int c) {}
             public void afterTextChanged(android.text.Editable e) { renderReplayList(); }
         });
-        bar.addView(replaySearch, new LinearLayout.LayoutParams(0, dp(44), 1f));
-        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44));
+        bar.addView(replaySearch, new LinearLayout.LayoutParams(0, hdp(44), 1f));
+        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(44));
         ilp.leftMargin = dp(8);
         bar.addView(kit.smallButton(S.t("+ Importuoti (.rep)").toUpperCase(Locale.ROOT), () -> pickFiles(REQ_PICK_REPLAY)), ilp);
         root.addView(bar);
-        LinearLayout[] ld = listDetailPage(root, dp(52));
+        LinearLayout[] ld = listDetailPage(root, dp(compact ? 42 : 52));
         replayListBox = ld[0];
         replayDetailBox = ld[1];
         renderReplayList();
@@ -6084,5 +6374,10 @@ public class SetupActivity extends Activity {
 
     private int dp(int v) {
         return Math.round(getResources().getDisplayMetrics().density * v);
+    }
+
+    /** Control / row height: the tablet value, or its lower phone value (Kit.hdp). */
+    private int hdp(int v) {
+        return kit != null ? kit.hdp(v) : dp(v);
     }
 }

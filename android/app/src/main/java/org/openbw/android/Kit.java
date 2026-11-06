@@ -30,13 +30,72 @@ class Kit {
 
     final Activity a;
     final float density;
+    /** Short screen (phones in landscape, < 480 dp tall): lower controls, tighter padding.
+     *  Never true on a tablet, whose layout stays as designed. */
+    final boolean compact;
 
     Kit(Activity a) {
         this.a = a;
         density = a.getResources().getDisplayMetrics().density;
+        compact = isCompact(a);
+    }
+
+    @SuppressWarnings("deprecation")
+    static final int IMMERSIVE_FLAGS = View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+            | View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN;
+
+    static boolean isCompact(android.content.Context c) {
+        return c.getResources().getConfiguration().screenHeightDp < 480;
     }
 
     int dp(float v) { return Math.round(v * density); }
+
+    /** Control height: the tablet value, or its lower phone counterpart. */
+    int hdp(int tabletDp) {
+        if (!compact) return dp(tabletDp);
+        int v = tabletDp >= 56 ? 40 : tabletDp >= 52 ? 36 : tabletDp >= 48 ? 36 : tabletDp >= 46 ? 38
+                : tabletDp >= 44 ? 34 : tabletDp >= 40 ? 32 : tabletDp;
+        return dp(v);
+    }
+
+    /**
+     * Never break a word in the middle: if the longest word of the label does not fit the
+     * view's width, shrink the text (down to 9 sp); if it still does not fit, ellipsize.
+     * Acts only on overflow, so labels that already fit are left exactly as they were.
+     */
+    void fitWords(final TextView t) {
+        final float base = t.getTextSize();
+        t.addOnLayoutChangeListener((v, l, top, r, b, ol, ot, or, ob) -> {
+            int w = (r - l) - t.getPaddingLeft() - t.getPaddingRight();
+            if (w <= 0 || (r - l) == (or - ol) && t.getTag(R_FIT) != null) return;
+            t.setTag(R_FIT, Boolean.TRUE);
+            CharSequence cs = t.getText();
+            if (cs == null) return;
+            String[] words = cs.toString().split("[ \\t\\n]+");
+            android.text.TextPaint p = new android.text.TextPaint(t.getPaint());
+            float size = base, min = 9f * a.getResources().getDisplayMetrics().scaledDensity;
+            while (true) {
+                p.setTextSize(size);
+                float widest = 0;
+                for (String wd : words) widest = Math.max(widest, p.measureText(wd));
+                if (widest <= w || size <= min) break;
+                size = Math.max(min, size - density * 0.5f);
+            }
+            final float fs = size;
+            final boolean over = words.length > 0 && p.measureText(longest(words)) > w;
+            t.post(() -> {
+                if (Math.abs(t.getTextSize() - fs) > 0.1f) t.setTextSize(TypedValue.COMPLEX_UNIT_PX, fs);
+                if (over) t.setEllipsize(TextUtils.TruncateAt.END);
+            });
+        });
+    }
+    private static final int R_FIT = 0x7f0f1161;
+    private static String longest(String[] w) {
+        String best = "";
+        for (String s : w) if (s.length() > best.length()) best = s;
+        return best;
+    }
 
     // ---- small building blocks ---------------------------------------------------
     TextView text(String s, int color, float sp) {
@@ -50,7 +109,7 @@ class Kit {
     TextView label(String s) {
         TextView t = text(s.toUpperCase(java.util.Locale.ROOT), LABEL, 12);
         t.setLetterSpacing(0.12f);
-        t.setPadding(0, dp(10), 0, dp(6));
+        t.setPadding(0, dp(compact ? 6 : 10), 0, dp(compact ? 3 : 6));
         return t;
     }
 
@@ -63,13 +122,14 @@ class Kit {
 
     /** kind: 0 secondary (steel), 1 primary (green), 2 quiet (outline only). */
     TextView button(String s, int kind, Runnable run) {
-        TextView b = text(s.toUpperCase(java.util.Locale.ROOT), kind == 1 ? Color.WHITE : TEXT, kind == 1 ? 15 : 13);
-        b.setLetterSpacing(0.1f);
+        TextView b = text(s.toUpperCase(java.util.Locale.ROOT), kind == 1 ? Color.WHITE : TEXT,
+                kind == 1 ? (compact ? 14 : 15) : (compact ? 12 : 13));
+        b.setLetterSpacing(compact ? 0.06f : 0.1f);
         b.setGravity(Gravity.CENTER);
         b.setTypeface(Typeface.DEFAULT, kind == 1 ? Typeface.BOLD : Typeface.NORMAL);
-        b.setPadding(dp(16), 0, dp(16), 0);
-        b.setMinHeight(dp(48));
-        b.setMinimumHeight(dp(48));
+        b.setPadding(dp(compact ? 12 : 16), 0, dp(compact ? 12 : 16), 0);
+        b.setMinHeight(hdp(48));
+        b.setMinimumHeight(hdp(48));
         GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
                 kind == 1 ? new int[]{0xFF1F6B34, 0xFF114420} : kind == 0 ? new int[]{0xFF2A3338, 0xFF161C20} : new int[]{0, 0});
         g.setStroke(Math.max(1, dp(1)), kind == 1 ? LABEL : kind == 0 ? STEEL : LABEL);
@@ -90,8 +150,9 @@ class Kit {
             t.setGravity(Gravity.CENTER);
             t.setMaxLines(2);
             t.setPadding(dp(2), 0, dp(2), 0);
-            t.setMinHeight(dp(44));
-            t.setMinimumHeight(dp(44));
+            t.setMinHeight(hdp(44));
+            t.setMinimumHeight(hdp(44));
+            fitWords(t);
             t.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
             t.setOnClickListener(v -> {
                 MenuAudio.play(MenuAudio.CLICK);
@@ -116,8 +177,8 @@ class Kit {
         final TextView t = text(s, TEXT, 12);
         t.setGravity(Gravity.CENTER);
         t.setPadding(dp(10), 0, dp(10), 0);
-        t.setMinHeight(dp(40));
-        t.setMinimumHeight(dp(40));
+        t.setMinHeight(hdp(40));
+        t.setMinimumHeight(hdp(40));
         t.setTag(on);
         styleChip(t, on);
         t.setOnClickListener(v -> {
@@ -159,8 +220,8 @@ class Kit {
         TextView b = text(s, TEXT, 12);
         b.setGravity(Gravity.CENTER);
         b.setPadding(dp(10), 0, dp(10), 0);
-        b.setMinHeight(dp(40));
-        b.setMinimumHeight(dp(40));
+        b.setMinHeight(hdp(40));
+        b.setMinimumHeight(hdp(40));
         GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, new int[]{0xFF2A3338, 0xFF161C20});
         g.setStroke(Math.max(1, dp(1)), STEEL);
         b.setBackground(g);
@@ -253,6 +314,7 @@ class Kit {
             w.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
             w.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
             w.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            if (compact) w.getDecorView().setSystemUiVisibility(IMMERSIVE_FLAGS);   // keep the bars hidden on phones
         }
         return d;
     }

@@ -24260,6 +24260,10 @@ struct game_load_functions : state_functions {
 		tag_funcs["DIM "] = [&](data_reader_le r) {
 			game_st.map_tile_width = r.get<uint16_t>();
 			game_st.map_tile_height = r.get<uint16_t>();
+			// the tile tables (regions.tile_region_index, ...) hold 256 x 256 tiles
+			if (game_st.map_tile_width == 0 || game_st.map_tile_height == 0 || game_st.map_tile_width > 256 || game_st.map_tile_height > 256) {
+				error("invalid map dimensions %dx%d", game_st.map_tile_width, game_st.map_tile_height);
+			}
 			game_st.map_width = game_st.map_tile_width * 32;
 			game_st.map_height = game_st.map_tile_height * 32;
 			game_st.map_walk_width = game_st.map_tile_width * 4;

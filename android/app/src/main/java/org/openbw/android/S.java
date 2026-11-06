@@ -185,6 +185,7 @@ final class S {
         p("Žemėlapiai", "Maps");
         p("Pasirink žemėlapį kairėje.", "Pick a map on the left.");
         p("Žaidėjai", "Players");
+        p("AI ir režimas", "AI and mode");
         p("Žaidėjų", "Players");
         p("Dvi komandos", "Two teams");
         p("AI lygis", "AI level");
@@ -350,7 +351,7 @@ final class S {
         // --- mods ---
         p("Visi", "All");
         p("Aktyvūs", "Active");
-        p("Įdiegti", "Installed");
+        p("Įdiegtieji", "Installed");   // filter label; "Įdiegti" (verb) = Install, below
         p("Talpykloje", "In repository");
         p("Paieška...", "Search...");
         p("Paieška…", "Search...");
@@ -395,7 +396,7 @@ final class S {
         p("Žaidimas", "Game");
         p("Duomenys", "Data");
         p("Apie", "About");
-        p("Dev", "Dev");
+        p("Kūrėjams", "Dev");
         p("Garsumas: ", "Volume: ");
         p("Muzika: ", "Music: ");
         p("Raiška:", "Resolution:");
@@ -445,12 +446,6 @@ final class S {
         // the LAN host cards and the join list. Wrapping the call sites was not
         // enough -- the strings themselves had to be translatable, or the
         // English UI kept saying "speed: Normalus".
-        p("Lėtas", "Slowest");
-        p("Lėtesnis", "Slower");
-        p("Normalus", "Normal");
-        p("Greitas", "Fast");
-        p("Greitesnis", "Faster");
-        p("Greičiausias", "Fastest");
         p("Pasiruošęs", "Ready");
         // v0.83.008 (S1.1): the native-code consent dialog. Added WITH the
         // feature, not after it -- the v0.83.001 lesson was that call sites
@@ -475,7 +470,6 @@ final class S {
         p("Variklis kiekvienai kategorijai naudoja tik VIENĄ modą. Pakeisti?",
           "The engine uses only ONE mod per category. Replace?");
         p("Pakeisti", "Replace");
-        p("Atšaukti", "Cancel");
         p("Teikia: ", "Provides: ");
         // v0.83.010 (S1.5): repository address + token, integrity check.
         p("https://…/mods  (openbw-<versionCode>.json vieta)",
@@ -506,7 +500,7 @@ final class S {
         p("Rodyti saturaciją", "Show worker saturation");
         p("Kiek darbininkų dirba prie mineralų klasterio ir prie dujų.",
           "How many workers are on each mineral cluster and on gas.");
-        p("Equipment ikonos pilkos", "Grey equipment icons");
+        p("Pilkos įrangos ikonos", "Grey equipment icons");
         p("Nuspalvina Unit Display ekipuotės ikonas pilkai virš bet kokio ikonų pako. "
           + "Išjunk, jei naudoji spalvotų ikonų modą.",
           "Draws the Unit Display equipment icons grey on top of any icon pack. "
@@ -534,8 +528,8 @@ final class S {
         p("Išjungti karo rūką (Fog of War)", "Disable fog of war");
         p("Visas žemėlapis matomas. Determinizmui saugu - keičia tik vaizdą.",
           "The whole map is visible. Safe for determinism - presentation only.");
-        p("Rodyti zoom mygtukus", "Show zoom buttons");
-        p("Ekrane rodomi - / + mygtukai. Pinch-zoom veikia ir be jų.",
+        p("Rodyti mastelio mygtukus", "Show zoom buttons");
+        p("Ekrane rodomi - / + mygtukai. Mastelį dviem pirštais keisti galima ir be jų.",
           "On-screen - / + buttons. Pinch-zoom works without them.");
         p("Atsitiktinė", "Random");
         // v0.81.003: found by reading the launcher on a tablet, not by grep --
@@ -570,13 +564,13 @@ final class S {
         // open1161HD Faze 6 settings redesign.
         p("Pasirinkti SC:R aplanką", "Select SC:R folder");
         p("Grafika (HD):", "Graphics (HD):");
-        p("Emissive švytėjimas", "Emissive glow");
+        p("Švytintys efektai (emissive)", "Emissive glow");
         p("SC:R vienetų savišvytėjimas — ginklų blyksniai, psi, skydai, warp.",
           "SC:R unit self-glow — weapon flashes, psi, shields, warp.");
         p("Minkšti šešėliai", "Soft shadows");
         p("Švelnesni, permatomesni vienetų šešėliai (vietoj kietų juodų).",
           "Softer, more transparent unit shadows (instead of hard black).");
-        p("Bloom (švytėjimo aureolė)", "Bloom (glow halo)");
+        p("Švytėjimo aureolė (bloom)", "Bloom (glow halo)");
         p("Vienetų šešėlių švelnumas. 0 = klasikinis kietas juodas; didesnis — šviesesnis.",
           "Unit shadow softness. 0 = classic hard black; higher = lighter.");
         p("GPU švytėjimo aureolės stiprumas aplink ryškias vietas. 0 = išjungta.",
@@ -736,6 +730,26 @@ final class S {
         p("Vieno žaidėjo", "Single player");
         p("Spalva", "Colour");
         p("Kampanija", "Campaign");
+        // phone icon rail: short labels
+        p("Vienas", "Single");
+        // 2026-11-06 i18n audit: literals that bypassed the table
+        p("Tu neturi parsisiuntęs šio žemėlapio: ", "You do not have this map: ");
+        p(". Importuok jį arba pridėk MPQ.", ". Import it or add the MPQ.");
+        p("Failai bus ištrinti iš įrenginio.", "Its files will be deleted from the device.");
+        p("Pašalinta: ", "Removed: ");
+        p("Nustatyk talpyklos adresą (mygtukas žemiau).", "Set the repository address (button below).");
+        p("Gaunamas talpyklos sąrašas…", "Fetching the repository list…");
+        p("Talpykla: ", "Repository: ");
+        p(" modų.", " mods.");
+        p("Netinkamas talpyklos įrašas.", "Invalid repository entry.");
+        p("tuščias zip", "empty zip");
+        p("Nepavyko įdiegti: ", "Install failed: ");
+        p("UMS scenarijai (mini-žaidimai)", "UMS scenarios (mini-games)");
+        p("GitHub užklausų limitas viršytas, pabandykite vėliau", "GitHub request limit reached, try again later");
+        p("Mokymai — Boot Camp", "Tutorial — Boot Camp");
+        p("Mokymai", "Tutorial");
+        p("Epizodas", "Episode");
+        p("Išsaug.", "Saves");
         p("Dabartinė misija", "Current mission");
         p("Misijos aprašymas", "Mission description");
         p("PRADĖTI MISIJĄ", "START MISSION");
@@ -746,7 +760,46 @@ final class S {
         p("Auto-worker — automatiškai gamina darbininkus (tik SP)",
           "Auto-worker — automatically produces workers (SP only)");
         p("Ryškumo filtras (Sharpen)", "Sharpen filter");
-        p("Sharpen stiprumas", "Sharpen strength");
+        p("Ryškumo filtro stiprumas", "Sharpen strength");
+        // SCBW2 chip labels (LT display; EN keeps the SC2 terms)
+        p("Grupinis rally", "Group rally");
+        p(">12 pažymėjimas", ">12 selection");
+        p("Auto-darbininkai", "Auto-worker");
+        p("žemėlapiai", "maps");
+        p("ikonos", "icons");
+        p("animacijos", "animations");
+        p("sąsaja", "UI");
+        p("plytelės", "tileset");
+        p("duomenys", "data");
+        p("botai", "bots");
+        p("LAN lobby (hostas)", "LAN Lobby (Host)");
+        p("LAN lobby", "LAN Lobby");
+        p("LAN LOBBY", "LAN LOBBY");
+        // v1.0.24 updater
+        p("Tikrinami atnaujinimai…", "Checking for updates…");
+        p("Nepavyko patikrinti atnaujinimų: ", "Could not check for updates: ");
+        p("Naujausia versija jau įdiegta: ", "You have the latest version: ");
+        p("release'e nėra APK", "the release has no APK");
+        p("Nauja: ", "New: ");
+        p("Ši kopija pasirašyta kitu raktu (kūrimo versija) — Android jos neatnaujins; reikės ištrinti ir įdiegti iš naujo.", "This copy is signed with a different key (a development build) — Android will not update it; it has to be uninstalled and installed again.");
+        p("Yra atnaujinimas", "Update available");
+        p("Vėliau", "Later");
+        p("Praleisti šią versiją", "Skip this version");
+        p("Reikia leidimo", "Permission needed");
+        p("Kad galėtų įdiegti atnaujinimą, programai reikia leidimo diegti programas. Įjunk jį kitame lange ir grįžk — atsisiuntimas prasidės pats.", "To install the update the app needs permission to install apps. Turn it on in the next screen and come back — the download starts by itself.");
+        p("Atsisiunčiamas atnaujinimas", "Downloading the update");
+        p("atšaukta", "cancelled");
+        p("failas nepilnas", "the file is incomplete");
+        p("Atsisiųsti nepavyko: ", "Download failed: ");
+        p("Įdiegti nepavyko: ", "Install failed: ");
+        p("Įdiegta kopija pasirašyta kitu raktu. Ištrink programą ir įdiek atsisiųstą APK iš naujo (MPQ/CASC reikės importuoti dar kartą).", "The installed copy is signed with a different key. Uninstall the app and install the downloaded APK again (MPQ/CASC must be imported again).");
+        p("Diegimas atšauktas.", "Installation cancelled.");
+        p("Tikrinti atnaujinimus", "Check for updates");
+        p("Paleidus launcherį klausia GitHub, ar išleista nauja versija.", "When the launcher starts, asks GitHub whether a new version is out.");
+        p("Ši kūrimo versija automatiškai netikrina.", "This development build does not check automatically.");
+        p("Atnaujinimai", "Updates");
+        p("Tikrinti dabar", "Check now");
+        p("Nepavyko prisijungti prie hosto (", "Could not connect to the host (");
         p("Kiek stipriai ryškinti. Per stipriai — atsiranda triukšmas ir aureolės aplink kraštus.",
           "Sharpen strength. Too high adds noise and halos around edges.");
         p("GPU ryškinimas — HD2 grafika atrodo aštriau be FULL HD kainos. Auto: įjungta ",

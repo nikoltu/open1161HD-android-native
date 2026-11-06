@@ -182,7 +182,7 @@ public class LanLobby {
             server.setReuseAddress(true);
             server.bind(new java.net.InetSocketAddress((InetAddress) null, PORT));
         } catch (Exception e) {
-            fail("Nepavyko sukurti lobby. Ar kitas žaidimas jau hostina?");
+            fail(S.t("Nepavyko sukurti lobby. Ar kitas žaidimas jau hostina?"));
             return;
         }
         while (running) {
@@ -424,9 +424,9 @@ public class LanLobby {
                         return;
                     }
                 }
-                if (running) fail("Ryšys su hostu nutrūko.");
+                if (running) fail(S.t("Ryšys su hostu nutrūko."));
             } catch (Exception e) {
-                fail("Nepavyko prisijungti prie hosto (" + hostIp + ").");
+                fail(S.t("Nepavyko prisijungti prie hosto (") + hostIp + ").");
             }
         }, "lobby-join").start();
     }

@@ -654,13 +654,18 @@ void decompress(uint8_t* input, size_t input_size, uint8_t* output, size_t outpu
 				}
 				size_t src_pos = out_pos - 1 - distance;
 				if (src_pos > output_size) {
+					// A reference before the start of the output (corrupt data; never
+					// in a valid stream). Copy nothing: falling through to the clamps
+					// below turned len back into "the rest of the output" and read
+					// up to 4 KB before the buffer -- a crash on a damaged map.
 					len = 0;
-				}
-				if (src_pos + len > output_size) {
-					len = output_size - src_pos;
-				}
-				if (out_pos + len > output_size) {
-					len = output_size - out_pos;
+				} else {
+					if (src_pos + len > output_size) {
+						len = output_size - src_pos;
+					}
+					if (out_pos + len > output_size) {
+						len = output_size - out_pos;
+					}
 				}
 				for (size_t i = 0; i != len; ++i) {
 					output[out_pos + i] = output[src_pos + i];
@@ -1154,6 +1159,7 @@ struct mpq_archive_file_reader {
 	}
 
 	void get_bytes(uint8_t* dst, size_t n) {
+		if (n == 0) return;   // an empty file (maps carry 0-byte .cnd / (listfile)): nothing to read
 		if (file_position + n > be.size) error("mpq: %s: attempt to read past end", filename);
 		if (file_position / sector_size != current_sector) read_sector();
 		size_t sector_offset = file_position % sector_size;
@@ -1257,22 +1263,22 @@ struct mpq_archive_reader {
 		auto hash1 = string_hash(filename.c_str(), 1, crypt_table);
 		auto hash2 = string_hash(filename.c_str(), 2, crypt_table);
 
-		bool found = false;
-		size_t initial_index = hash0 % hash_table.size();
+		// Storm's lookup: index = hash & (size - 1), probing (index + 1) & (size - 1).
+		// The same as `% size` for every power-of-two table; a protected map with a
+		// 1000-entry table ("(2)Jacobs Ladder.scm") is only readable this way. An
+		// entry naming a block past the block table is skipped, as Storm does.
+		if (hash_table.empty()) return nullptr;
+		const size_t mask = hash_table.size() - 1;
+		const size_t initial_index = hash0 & mask;
 		size_t index = initial_index;
-		if (!hash_table.empty()) {
-			do {
-				auto& he = hash_table[index];
-				if (he.block_index == 0xffffffff) break;
-				if (he.hash1 == hash1 && he.hash2 == hash2) {
-					found = true;
-					break;
-				}
-				++index;
-				if (index == hash_table.size()) index = 0;
-			} while (index != initial_index);
+		for (size_t steps = 0; steps != hash_table.size(); ++steps) {
+			auto& he = hash_table[index];
+			if (he.block_index == 0xffffffff) break;
+			if (he.hash1 == hash1 && he.hash2 == hash2 && he.block_index < block_table.size()) return &he;
+			index = (index + 1) & mask;
+			if (index == initial_index) break;
 		}
-		return found ? &hash_table[index] : nullptr;
+		return nullptr;
 	}
 
 	bool file_exists(const a_string& filename) {
