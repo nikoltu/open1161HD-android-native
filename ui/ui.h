@@ -2048,7 +2048,7 @@ struct ui_functions: ui_util_functions {
 				wnd.update_surface();
 				native_window::event_t e;
 				while (wnd.peek_message(e)) {
-					if (e.type == native_window::event_t::type_mouse_button_down) skipped = true;
+					if (e.type == native_window::event_t::type_mouse_button_down || e.type == native_window::event_t::type_command_click) skipped = true;
 					if (e.type == native_window::event_t::type_quit) { skipped = true; window_closed = true; }
 				}
 			}
@@ -2161,7 +2161,7 @@ struct ui_functions: ui_util_functions {
 				wnd.update_surface();
 				native_window::event_t e;
 				while (wnd.peek_message(e)) {
-					if (e.type == native_window::event_t::type_mouse_button_down) skipped = true;
+					if (e.type == native_window::event_t::type_mouse_button_down || e.type == native_window::event_t::type_command_click) skipped = true;
 					if (e.type == native_window::event_t::type_quit) { skipped = true; window_closed = true; }
 				}
 			}
@@ -2245,7 +2245,7 @@ struct ui_functions: ui_util_functions {
 			native_window::event_t e;
 			while (wnd.peek_message(e)) {
 				// Ignore the first ~0.5s of input so a late in-game tap doesn't skip it.
-				if (shown_frames > 12 && (e.type == native_window::event_t::type_mouse_button_down ||
+				if (shown_frames > 12 && (e.type == native_window::event_t::type_mouse_button_down || e.type == native_window::event_t::type_command_click ||
 				    e.type == native_window::event_t::type_key_down)) done = true;
 				if (e.type == native_window::event_t::type_quit) { done = true; window_closed = true; }
 			}
@@ -17689,6 +17689,29 @@ struct ui_functions: ui_util_functions {
 	bool is_moving_replay_slider = false;
 	bool is_paused = false;
 	bool is_drag_selecting = false;
+	// The drag-select was started by a real mouse's SELECT button (classic / swapped
+	// mouse modes): its click selects only -- the order is the other button's.
+	bool drag_select_mouse = false;
+	// A mouse command click that turned out to be a plain click (menus, HUD, replay):
+	// its button-up, delivered right after the synthesized button-down.
+	native_window::event_t mouse_click_up;
+	bool mouse_click_up_pending = false;
+
+	// The COMMAND button of a real mouse (right, or left when swapped) was clicked:
+	// the original's right click. Returns false when it is not an order here (a
+	// menu, a HUD control, a replay) -- the caller then treats it as a plain click.
+	bool mouse_command_click(int x, int y) {
+		if (!game_input || pause_screen != 0 || briefing_active || lobby_mode || chat_active || save_name_active) return false;
+		if (hud_v3 && hud3_hint_pending) return false;   // the first-game hint: its button takes a click
+		if (hud_v3 && wheel_open) { hud3_close_wheel(false); return true; }
+		// right click drops a pending target / placement, like the original
+		if (placing_type || attack_armed || ability_armed_order >= 0) { hud3_cancel_targeting(); card_menu = 0; return true; }
+		if (group_menu_n >= 0) { group_menu_close(); return true; }
+		if (hud_control_at(x, y)) return false;   // the minimap is not one: an order to that spot
+		if (!first_own_selected_unit()) return true;
+		issue_default_order_at(x, y);
+		return true;
+	}
 	bool is_dragging_screen = false;
 	int drag_select_from_x = 0;
 	int drag_select_from_y = 0;
@@ -17830,7 +17853,7 @@ struct ui_functions: ui_util_functions {
 				// modify the selection (so the S-Pen barrel = shift still selects); a
 				// double-tap still select-all-of-type. Off => classic (tap = select).
 				// Determinism-safe: the order goes through the recorded action stream.
-				if (game_input && (tap_command || hud_v3) && !shift && !ctrl && !double_clicked
+				if (game_input && (tap_command || hud_v3) && !shift && !ctrl && !double_clicked && !drag_select_mouse
 				    && (!u || u->owner != game_local_player)) {
 					bool own_sel = false;
 					for (auto uid : current_selection) { unit_t* s = get_unit(uid); if (s && s->owner == game_local_player) { own_sel = true; break; } }
@@ -17914,7 +17937,16 @@ struct ui_functions: ui_util_functions {
 
 		if (wnd) {
 			native_window::event_t e;
-			while (wnd.peek_message(e)) {
+			while ((mouse_click_up_pending && (e = mouse_click_up, mouse_click_up_pending = false, true)) || wnd.peek_message(e)) {
+				if (e.type == native_window::event_t::type_command_click) {
+					if (mouse_command_click(e.mouse_x, e.mouse_y)) continue;
+					mouse_click_up = e;
+					mouse_click_up.type = native_window::event_t::type_mouse_button_up;
+					mouse_click_up.button = 1; mouse_click_up.button_state = 0; mouse_click_up.clicks = 1;
+					mouse_click_up_pending = true;
+					e.type = native_window::event_t::type_mouse_button_down;
+					e.button = 1; e.button_state = 1; e.clicks = 1;
+				}
 				// While the chat bar is open, swallow game gestures so typing
 				// (soft keyboard) can't move units or the camera.
 				if (chat_active) {
@@ -18015,6 +18047,7 @@ struct ui_functions: ui_util_functions {
 						// inert, not leak an order to the field hidden behind the HUD.
 						if (!is_moving_minimap && !is_moving_replay_slider && (hud_v3 ? !hud3_rect_at(e.mouse_x, e.mouse_y) : e.mouse_y < playfield_bottom_y())) {
 							is_drag_selecting = true;
+							drag_select_mouse = e.device == 1;
 							drag_select_from_x = e.mouse_x;
 							drag_select_from_y = e.mouse_y;
 							drag_select_to_x = e.mouse_x;

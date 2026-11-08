@@ -43,7 +43,11 @@ namespace native_window {
 			// while the other hand works on the field. button = the rectangle's index.
 			type_hold_down,
 			type_hold_motion,
-			type_hold_up
+			type_hold_up,
+			// Mouse (Android, "classic" / "swapped" button modes): a click of the
+			// COMMAND button (right, or left when swapped) that neither moved nor was
+			// held -- the original's right click: the contextual order at the point.
+			type_command_click
 		};
 		int type = type_none;
 		int sym = -1;
@@ -59,6 +63,9 @@ namespace native_window {
 		int mouse_xrel = -1;
 		int mouse_yrel = -1;
 		int clicks = -1;
+		// 1 = a real mouse's SELECT button in the classic / swapped modes (a click
+		// selects only, never orders); 0 = a finger, the pen, or a mouse acting as one.
+		int device = 0;
 	};
 
 	// Divisor between the window pixel size and the render/present size
@@ -66,6 +73,11 @@ namespace native_window {
 	void set_render_scale(int scale);
 	// Touch: how long a still finger is held before type_long_press (ms).
 	void set_long_press_ms(int ms);
+	// Mouse buttons (Settings > Valdymas): 0 = the left button acts as a finger
+	// (tap / hold / drag), right or middle drag pans; 1 = classic RTS: left selects,
+	// right commands (click = order, hold = the command wheel, drag = pan); 2 = the
+	// same with the buttons swapped. Middle drag pans and the wheel zooms in every mode.
+	void set_mouse_mode(int mode);
 
 	// Returns (and clears) whether the OS signalled low memory since the
 	// last call; the caller should free what it can.

@@ -17,8 +17,8 @@ android {
         applicationId 'org.openbw.android.hd'
         minSdk 24
         targetSdk 34
-        versionCode 206
-        versionName '1.0.24'
+        versionCode 207
+        versionName '1.0.24-hotfix1'
 
         ndk {
             // arm64-v8a: Tab S7+/S8 Ultra; x86_64: Android Studio emulator

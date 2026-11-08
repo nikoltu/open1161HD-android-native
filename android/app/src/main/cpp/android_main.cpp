@@ -896,6 +896,7 @@ extern "C" int main(int argc, char* argv[]) {
 	bool hd_anim_diag = false;    // DIAG: log each image's HD-anim load result
 	int show_fps = 1;             // Faze 7+: HUD fps readout (Settings > Sąsaja)
 	int tap_command = 1;          // modern touch: plain tap = contextual order (Settings > Valdymas)
+	int mouse_buttons = 1;        // a real mouse: 0 as a finger, 1 classic (right = order), 2 swapped
 	int render_interp = 1;        // LAN: blend sprite positions between lockstep ticks (net-only, pure render)
 	int bot_level = 2;            // unified AI difficulty 0..3 (launcher "Sunkumas"), read by the bot via difficulty()
 	int show_apm = 0;             // Faze 7+: HUD APM readout (default off)
@@ -994,6 +995,7 @@ extern "C" int main(int argc, char* argv[]) {
 		else if (arg == "--health-always" && i + 1 < argc) health_always = atoi(argv[++i]);
 		else if (arg == "--camera-speed" && i + 1 < argc) camera_speed = atoi(argv[++i]);
 		else if (arg == "--tap-command" && i + 1 < argc) tap_command = atoi(argv[++i]);
+		else if (arg == "--mouse-buttons" && i + 1 < argc) mouse_buttons = atoi(argv[++i]);
 		else if (arg == "--render-interp" && i + 1 < argc) render_interp = atoi(argv[++i]);
 		else if (arg == "--bot-level" && i + 1 < argc) { bot_level = atoi(argv[++i]); if (bot_level < 0) bot_level = 0; if (bot_level > 3) bot_level = 3; }
 		else if (arg == "--lang" && i + 1 < argc) lang = argv[++i];
@@ -1465,6 +1467,7 @@ extern "C" int main(int argc, char* argv[]) {
 		ui.hud_health_always = health_always != 0;
 		ui.camera_speed = camera_speed < 25 ? 25 : (camera_speed > 250 ? 250 : camera_speed);
 		ui.tap_command = tap_command != 0;
+		native_window::set_mouse_mode(mouse_buttons);
 	ui.render_interp = render_interp != 0;
 
 		// Networking objects live for the whole game (referenced by the

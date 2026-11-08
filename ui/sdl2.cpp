@@ -50,6 +50,12 @@ void set_long_press_ms(int ms) {
 	g_long_press_ms = (unsigned)ms;
 }
 
+// A real mouse's buttons (Settings > Valdymas > "Pelės mygtukai"); see native_window.h.
+static int g_mouse_mode = 1;
+void set_mouse_mode(int mode) {
+	g_mouse_mode = mode < 0 || mode > 2 ? 1 : mode;
+}
+
 // Set from the SDL thread when SDL_APP_LOWMEMORY arrives; the main loop
 // consumes it to shrink its memory (dropping cached seek states).
 bool low_memory_flag = false;
@@ -399,6 +405,133 @@ struct window_impl {
 		return true;
 	}
 
+	// ---- a real mouse (Samsung DeX, a USB / Bluetooth mouse) ----------------------
+	// Touch is turned into mouse events by the state machine above; a real mouse
+	// arrives as SDL mouse events and is translated here, by g_mouse_mode:
+	//   0 "as a finger": the left button is fed to the touch state machine (tap,
+	//     hold = the command wheel / the order, drag = a box); right drag pans.
+	//   1 "classic": left = select only (click, double click, box); right = the
+	//     COMMAND button: a click is the contextual order (type_command_click), a
+	//     still hold is a long press (HUD v3: the wheel), a drag pans the camera.
+	//   2 "swapped": 1 with the buttons exchanged (left-handed mouse).
+	// The middle button drags the camera and the wheel zooms in every mode.
+	enum class mcmd_t { idle, pressed, held, panning };
+	mcmd_t mcmd = mcmd_t::idle;
+	int mcmd_x = 0, mcmd_y = 0;
+	Uint32 mcmd_ticks = 0;
+	bool mpan = false;          // the middle (or, as a finger, the right) button pans
+	bool msel_down = false;     // the select button is down (classic / swapped)
+	bool mfinger_down = false;  // "as a finger": the left button is down
+	int mouse_last_x = 0, mouse_last_y = 0;
+	static constexpr SDL_FingerID mouse_finger_id = (SDL_FingerID)0x6d6f757365LL;   // "mouse"
+	static constexpr int mouse_drag_px = 6;   // render px: a mouse is precise
+
+	void mouse_finger(Uint32 type, int x, int y) {
+		SDL_Event f;
+		std::memset(&f, 0, sizeof f);
+		f.type = type;
+		f.tfinger.fingerId = mouse_finger_id;
+		f.tfinger.x = render_w > 0 ? (float)x / (float)render_w : 0.0f;
+		f.tfinger.y = render_h > 0 ? (float)y / (float)render_h : 0.0f;
+		handle_finger_event(f);
+	}
+	int mouse_state_bits() const {
+		return (msel_down ? 1 : 0) | (mpan || mcmd == mcmd_t::panning ? 4 : 0);
+	}
+	void push_mouse_select(int type, int x, int y, int clicks) {
+		push_mouse_event(type, 1, x, y, mouse_state_bits(), clicks);
+		pending_events.back().device = 1;
+	}
+	void mouse_pan_begin(int x, int y) {
+		if (mpan || mcmd == mcmd_t::panning) return;
+		push_mouse_event(event_t::type_mouse_button_down, 3, x, y, 4);
+	}
+	// Returns true when the SDL event was a real mouse's (it is then consumed).
+	bool mouse_event(const SDL_Event& s) {
+		if (s.type == SDL_MOUSEWHEEL) {
+			if (s.wheel.which == SDL_TOUCH_MOUSEID) return false;
+			if (s.wheel.y != 0) {
+				event_t e;
+				e.type = event_t::type_zoom;
+				e.button = s.wheel.y > 0 ? 1 : -1;
+				e.mouse_x = mouse_last_x;
+				e.mouse_y = mouse_last_y;
+				pending_events.push_back(e);
+			}
+			return true;
+		}
+		if (s.type != SDL_MOUSEMOTION && s.type != SDL_MOUSEBUTTONDOWN && s.type != SDL_MOUSEBUTTONUP) return false;
+		if ((s.type == SDL_MOUSEMOTION ? s.motion.which : s.button.which) == SDL_TOUCH_MOUSEID) return false;
+		const int x = s.type == SDL_MOUSEMOTION ? s.motion.x : s.button.x;
+		const int y = s.type == SDL_MOUSEMOTION ? s.motion.y : s.button.y;
+		mouse_last_x = x;
+		mouse_last_y = y;
+		const int mode = g_mouse_mode;
+		const int sel_btn = mode == 2 ? SDL_BUTTON_RIGHT : SDL_BUTTON_LEFT;
+		const int cmd_btn = mode == 1 ? SDL_BUTTON_RIGHT : mode == 2 ? SDL_BUTTON_LEFT : -1;
+		const int pan_btn = mode == 0 ? SDL_BUTTON_RIGHT : -1;   // as a finger: right drags the camera too
+		if (s.type == SDL_MOUSEBUTTONDOWN) {
+			const int b = s.button.button;
+			if (mode == 0 && b == SDL_BUTTON_LEFT) {
+				if (!mfinger_down) { mfinger_down = true; mouse_finger(SDL_FINGERDOWN, x, y); }
+			} else if (mode != 0 && b == sel_btn) {
+				if (!msel_down) { msel_down = true; push_mouse_select(event_t::type_mouse_button_down, x, y, s.button.clicks); }
+			} else if (b == cmd_btn) {
+				if (mcmd == mcmd_t::idle) { mcmd = mcmd_t::pressed; mcmd_x = x; mcmd_y = y; mcmd_ticks = SDL_GetTicks(); }
+			} else if (b == SDL_BUTTON_MIDDLE || b == pan_btn) {
+				mouse_pan_begin(x, y);
+				mpan = true;
+			}
+			return true;
+		}
+		if (s.type == SDL_MOUSEBUTTONUP) {
+			const int b = s.button.button;
+			if (mode == 0 && b == SDL_BUTTON_LEFT) {
+				if (mfinger_down) { mfinger_down = false; mouse_finger(SDL_FINGERUP, x, y); }
+			} else if (mode != 0 && b == sel_btn) {
+				if (msel_down) { msel_down = false; push_mouse_select(event_t::type_mouse_button_up, x, y, s.button.clicks); }
+			} else if (b == cmd_btn) {
+				const mcmd_t was = mcmd;
+				mcmd = mcmd_t::idle;
+				if (was == mcmd_t::pressed) push_mouse_event(event_t::type_command_click, -1, mcmd_x, mcmd_y, 0);
+				else if (was == mcmd_t::held) push_mouse_event(event_t::type_long_release, -1, x, y, 0);
+				else if (was == mcmd_t::panning && !mpan) push_mouse_event(event_t::type_mouse_button_up, 3, x, y, 0);
+			} else if (b == SDL_BUTTON_MIDDLE || b == pan_btn) {
+				if (mpan) {
+					mpan = false;
+					if (mcmd != mcmd_t::panning) push_mouse_event(event_t::type_mouse_button_up, 3, x, y, 0);
+				}
+			}
+			return true;
+		}
+		// motion
+		if (mode == 0 && mfinger_down) {
+			mouse_finger(SDL_FINGERMOTION, x, y);   // the state machine reports it
+			return true;
+		}
+		if (mcmd == mcmd_t::pressed && (std::abs(x - mcmd_x) > mouse_drag_px || std::abs(y - mcmd_y) > mouse_drag_px)) {
+			mouse_pan_begin(mcmd_x, mcmd_y);
+			mcmd = mcmd_t::panning;
+		}
+		if (mcmd == mcmd_t::held) {
+			push_mouse_event(event_t::type_long_motion, -1, x, y, 0);
+			return true;
+		}
+		push_mouse_event(event_t::type_mouse_motion, -1, x, y, mouse_state_bits());
+		if (msel_down) pending_events.back().device = 1;
+		return true;
+	}
+	// A still hold of the command button: a long press, like a held finger.
+	bool poll_mouse_hold(event_t& e) {
+		if (mcmd != mcmd_t::pressed || SDL_GetTicks() - mcmd_ticks < touch_long_press_ms()) return false;
+		mcmd = mcmd_t::held;
+		e = event_t();
+		e.type = event_t::type_long_press;
+		e.mouse_x = mcmd_x;
+		e.mouse_y = mcmd_y;
+		return true;
+	}
+
 	void handle_finger_event(const SDL_Event& sdl_e) {
 		int rw = render_w;
 		int rh = render_h;
@@ -595,8 +728,19 @@ struct window_impl {
 			return true;
 		}
 		if (poll_long_press(e)) return true;
+		if (poll_mouse_hold(e)) return true;
 #endif
 		while (SDL_PollEvent(&sdl_e)) {
+#ifdef __ANDROID__
+			if (mouse_event(sdl_e)) {
+				if (!pending_events.empty()) {
+					e = pending_events.front();
+					pending_events.pop_front();
+					return true;
+				}
+				continue;
+			}
+#endif
 			switch (sdl_e.type) {
 #ifdef __ANDROID__
 			case SDL_FINGERDOWN:

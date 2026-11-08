@@ -428,6 +428,7 @@ public class OpenBWActivity extends SDLActivity {
         args.add("--health-always"); args.add(dev.getBoolean("healthBarsAlways", false) ? "1" : "0");
         args.add("--camera-speed");  args.add(String.valueOf(dev.getInt("cameraSpeed", 100)));
         args.add("--tap-command");   args.add(dev.getBoolean("tapCommand", true) ? "1" : "0");
+        args.add("--mouse-buttons"); args.add(String.valueOf(dev.getInt("mouseButtons", 1)));
         args.add("--render-interp"); args.add(dev.getBoolean("renderInterp", true) ? "1" : "0");
         args.add("--zoom-buttons");  args.add(dev.getBoolean("showZoomButtons", false) ? "1" : "0");
         // HUD style (Settings > Interface): v2 "Klasikinis" (default) or v3 "Lietimo".
@@ -545,6 +546,7 @@ public class OpenBWActivity extends SDLActivity {
             installPenHover();
         } catch (Throwable ignored) {
         }
+        installTestMouse();
         try {
             addOverlayControls();
         } catch (Throwable ignored) {
@@ -655,6 +657,34 @@ public class OpenBWActivity extends SDLActivity {
         super.onDestroy();
         // Kills only the ":game" process; the launcher process survives.
         System.exit(0);
+    }
+
+    // DEBUG builds only: a test hook that drives SDL's own mouse entry point, so the
+    // mouse-button modes (sdl2.cpp) can be checked on an emulator, which has no mouse
+    // and whose `input mouse` cannot press a button. Usage:
+    //   adb shell am broadcast -a org.openbw.TEST_MOUSE --ei buttons 2 --ei action 0 --ei x 900 --ei y 800
+    // buttons = MotionEvent button state (1 left, 2 right, 4 middle; 0 on release),
+    // action = MotionEvent action (0 down, 1 up, 2 move, 7 hover move; 100 = a whole click), x / y = surface px.
+    private void installTestMouse() {
+        if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) return;
+        try {
+            android.content.BroadcastReceiver r = new android.content.BroadcastReceiver() {
+                @Override
+                public void onReceive(android.content.Context c, Intent i) {
+                    final int action = i.getIntExtra("action", 2), x = i.getIntExtra("x", 0), y = i.getIntExtra("y", 0);
+                    if (action == 100) {   // a whole click: down + up (a broadcast takes longer than the hold delay)
+                        SDLActivity.onNativeMouse(i.getIntExtra("buttons", 0), MotionEvent.ACTION_DOWN, x, y, false);
+                        SDLActivity.onNativeMouse(0, MotionEvent.ACTION_UP, x, y, false);
+                    } else {
+                        SDLActivity.onNativeMouse(i.getIntExtra("buttons", 0), action, x, y, false);
+                    }
+                }
+            };
+            android.content.IntentFilter f = new android.content.IntentFilter("org.openbw.TEST_MOUSE");
+            if (android.os.Build.VERSION.SDK_INT >= 33) registerReceiver(r, f, android.content.Context.RECEIVER_EXPORTED);
+            else registerReceiver(r, f);
+        } catch (Throwable ignored) {
+        }
     }
 
     // While the S-Pen is in contact, finger touches are almost always the

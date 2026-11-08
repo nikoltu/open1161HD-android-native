@@ -1002,7 +1002,22 @@
 	const char* wheel_hub_label = "";
 	// What the selection would do to `t` by default, or nullptr if nothing special.
 	const char* hud3_default_target_label(unit_t* t) {
-		if (!t || t->owner != game_local_player) return nullptr;
+		if (!t) return nullptr;
+		// Workers held on a mineral field or a gas building they can mine (owner
+		// 2026-11-07: "the hub should say GATHER when it really gathers"): the same
+		// test the engine's default order uses (get_default_gather_order).
+		if (t->owner != game_local_player || ut_resource(t)) {
+			if (!unit_is_mineral_field(t) && !(unit_is_refinery(t) && u_completed(t))) return nullptr;   // not a bare geyser
+			bool any = false, all_gather = true;
+			for (auto uid : current_selection) {
+				unit_t* u = get_unit(uid);
+				if (!u || u->owner != game_local_player || ut_building(u)) continue;
+				any = true;
+				const order_type_t* o = get_default_order(default_action(u), u, t->sprite->position, t, nullptr);
+				if (!o || (o->id != Orders::MoveToMinerals && o->id != Orders::MoveToGas)) all_gather = false;
+			}
+			return any && all_gather ? "GATHER" : nullptr;
+		}
 		bool mobile = false, worker = false, scv = false;
 		for (auto uid : current_selection) {
 			unit_t* u = get_unit(uid);
@@ -1027,6 +1042,15 @@
 	// What is at a point: -2 outside, -1 hub, 0..n-1 slot; *band = in the queue band.
 	int wheel_at(int x, int y, bool* band = nullptr) {
 		if (band) *band = false;
+		// While the finger is still down, the spot where it went down is the hub too.
+		// Near an edge the wheel is pushed onto the screen, away from the finger, and
+		// letting go without moving used to pick the slot that ended up under the
+		// finger (owner 2026-11-07: a worker held on its refinery near the top edge
+		// ATTACKED it -- the top slot -- instead of the GATHER hub).
+		if (wheel_held) {
+			const double fx = x - wheel_pt.x, fy = y - wheel_pt.y;
+			if (std::sqrt(fx * fx + fy * fy) * 1000.0 / hud3_ppd_milli() < wr_hub) return -1;
+		}
 		const double dx = x - wheel_c.x, dy = y - wheel_c.y;
 		const double r = std::sqrt(dx * dx + dy * dy) * 1000.0 / hud3_ppd_milli();
 		if (r < wr_hub) return -1;
@@ -1489,7 +1513,10 @@
 		}
 		// the real point, when the wheel had to move in from an edge
 		if (std::abs(wheel_c.x - wheel_pt.x) + std::abs(wheel_c.y - wheel_pt.y) > d3(6)) {
-			draw_line2(data, pitch, wheel_c.x, wheel_c.y, wheel_pt.x, wheel_pt.y, 0xf2c53du, true);
+			// from the hub's rim, so the line does not cross the hub's label
+			const double lx = wheel_pt.x - wheel_c.x, ly = wheel_pt.y - wheel_c.y, ll = std::sqrt(lx * lx + ly * ly);
+			const int hr = d3(wr_hub);
+			if (ll > hr) draw_line2(data, pitch, wheel_c.x + (int)(lx * hr / ll), wheel_c.y + (int)(ly * hr / ll), wheel_pt.x, wheel_pt.y, 0xf2c53du, true);
 			mark_rect(data, pitch, {{wheel_pt.x - d3(7), wheel_pt.y - d3(7)}, {wheel_pt.x + d3(7), wheel_pt.y + d3(7)}}, 0xf2c53du);
 		}
 	}

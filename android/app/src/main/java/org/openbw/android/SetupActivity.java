@@ -4086,7 +4086,7 @@ public class SetupActivity extends Activity {
                             // interface controls
                             .remove("showFps").remove("showApm").remove("healthBarsAlways").remove("cameraSpeed")
                             .remove("resourceCounts").remove("showSaturation").remove("showZoomButtons").remove("equipGrey")
-                            .remove("tapCommand").remove("renderInterp")
+                            .remove("tapCommand").remove("mouseButtons").remove("renderInterp")
                             .remove("hudStyle").remove("hud3Template").remove("hud3Dock").remove("hud3WheelMs").remove("hud3Pen")
                             .remove("hud3Latch").remove("hud3Labels").remove("hud3Left").remove("hud3Scale").remove("hud3Vibrate").remove("hud3AllGroups")
                             .apply();
@@ -4166,6 +4166,10 @@ public class SetupActivity extends Activity {
                 S.t("Klasikiniame HUD: komandų eilės ir pažymėjimo papildymo mygtukas."), true);
         setSwitch(ctl, S.t("Bakstelėjimas = komanda"), "tapCommand",
                 S.t("Bakstelėjimas žemėje ar į priešą duoda komandą pažymėtiems."), true);
+        setSegments(ctl, S.t("Pelės mygtukai"),
+                S.t("Klasikinis: kairysis žymi, dešinysis duoda komandą (laikant — komandų ratas, tempiant — kamera). Kaip pirštas: kairysis veikia kaip pirštas, dešiniuoju tempiama kamera. Vidurinis mygtukas tempia kamerą, ratukas keičia mastelį."),
+                new String[]{S.t("Kaip pirštas"), S.t("Klasikinis"), S.t("Sukeisti")}, Math.max(0, Math.min(2, prefs().getInt("mouseButtons", 1))),
+                idx -> prefs().edit().putInt("mouseButtons", idx).apply());
         setSwitch(ctl, S.t("LAN sklandumas"), "renderInterp", S.t("Sklandesnis vienetų judėjimas LAN žaidime."), true);
         setSlider(ctl, S.t("Kameros greitis"), S.t("Krašto ir klaviatūros slinkimo greitis (100 = įprastas)."), "cameraSpeed", 100, 250);
         setSwitch(ctl, S.t("Rodyti mastelio mygtukus"), "showZoomButtons", S.t("Ekrane rodomi - / + mygtukai. Mastelį dviem pirštais keisti galima ir be jų."), false);

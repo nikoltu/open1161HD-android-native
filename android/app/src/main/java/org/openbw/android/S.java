@@ -722,6 +722,11 @@ final class S {
         // English users because they had no EN_MAP entry. Keys match the S.t() calls
         // exactly, including trailing spaces / \n. ---
         p("Bakstelėjimas = komanda", "Tap to command");
+        p("Pelės mygtukai", "Mouse buttons");
+        p("Klasikinis: kairysis žymi, dešinysis duoda komandą (laikant — komandų ratas, tempiant — kamera). Kaip pirštas: kairysis veikia kaip pirštas, dešiniuoju tempiama kamera. Vidurinis mygtukas tempia kamerą, ratukas keičia mastelį.",
+          "Classic: left selects, right commands (hold for the command wheel, drag to move the camera). As a finger: left works like a finger, right drags the camera. The middle button drags the camera, the wheel zooms.");
+        p("Kaip pirštas", "As a finger");
+        p("Sukeisti", "Swapped");
         p("Pažymėjus vienetus, bakstelėjimas žemėje/priešą duoda komandą (be ilgo paspaudimo). Savo vieneto bakstelėjimas vis tiek pažymi.",
           "With units selected, a tap on the ground/an enemy issues an order (no long-press). Tapping your own unit still selects it.");
         p("LAN sklandumas (interpoliacija)", "LAN smoothing (interpolation)");
