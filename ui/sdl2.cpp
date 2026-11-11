@@ -55,6 +55,18 @@ static int g_mouse_mode = 1;
 void set_mouse_mode(int mode) {
 	g_mouse_mode = mode < 0 || mode > 2 ? 1 : mode;
 }
+static bool g_mouse_bound = false;
+static int g_btn_sel = 1, g_btn_cmd = 3, g_btn_pan = 2;
+void set_mouse_buttons(int select, int command, int pan) {
+	auto ok = [](int b) { return b >= 1 && b <= 5 ? b : -1; };
+	g_mouse_bound = true;
+	g_mouse_mode = 1;
+	g_btn_sel = ok(select);
+	g_btn_cmd = ok(command);
+	g_btn_pan = ok(pan);
+	if (g_btn_cmd == g_btn_sel) g_btn_cmd = -1;
+	if (g_btn_pan == g_btn_sel || g_btn_pan == g_btn_cmd) g_btn_pan = -1;
+}
 
 // Set from the SDL thread when SDL_APP_LOWMEMORY arrives; the main loop
 // consumes it to shrink its memory (dropping cached seek states).
@@ -423,6 +435,7 @@ struct window_impl {
 	bool msel_down = false;     // the select button is down (classic / swapped)
 	bool mfinger_down = false;  // "as a finger": the left button is down
 	int mouse_last_x = 0, mouse_last_y = 0;
+	bool mouse_present = false; // a real mouse moved last (not a touch), the window has focus
 	static constexpr SDL_FingerID mouse_finger_id = (SDL_FingerID)0x6d6f757365LL;   // "mouse"
 	static constexpr int mouse_drag_px = 6;   // render px: a mouse is precise
 
@@ -446,8 +459,17 @@ struct window_impl {
 		if (mpan || mcmd == mcmd_t::panning) return;
 		push_mouse_event(event_t::type_mouse_button_down, 3, x, y, 4);
 	}
+	void push_mouse_key(bool down, int button) {
+		event_t e;
+		e.type = down ? event_t::type_key_down : event_t::type_key_up;
+		e.scancode = event_t::mouse_key_base + button;
+		e.mouse_x = mouse_last_x;
+		e.mouse_y = mouse_last_y;
+		pending_events.push_back(e);
+	}
 	// Returns true when the SDL event was a real mouse's (it is then consumed).
 	bool mouse_event(const SDL_Event& s) {
+		if (s.type == SDL_FINGERDOWN) mouse_present = false;
 		if (s.type == SDL_MOUSEWHEEL) {
 			if (s.wheel.which == SDL_TOUCH_MOUSEID) return false;
 			if (s.wheel.y != 0) {
@@ -466,19 +488,23 @@ struct window_impl {
 		const int y = s.type == SDL_MOUSEMOTION ? s.motion.y : s.button.y;
 		mouse_last_x = x;
 		mouse_last_y = y;
+		mouse_present = true;
 		const int mode = g_mouse_mode;
-		const int sel_btn = mode == 2 ? SDL_BUTTON_RIGHT : SDL_BUTTON_LEFT;
-		const int cmd_btn = mode == 1 ? SDL_BUTTON_RIGHT : mode == 2 ? SDL_BUTTON_LEFT : -1;
-		const int pan_btn = mode == 0 ? SDL_BUTTON_RIGHT : -1;   // as a finger: right drags the camera too
+		const int sel_btn = g_mouse_bound ? g_btn_sel : mode == 2 ? SDL_BUTTON_RIGHT : SDL_BUTTON_LEFT;
+		const int cmd_btn = g_mouse_bound ? g_btn_cmd : mode == 1 ? SDL_BUTTON_RIGHT : mode == 2 ? SDL_BUTTON_LEFT : -1;
+		const int pan_btn = g_mouse_bound ? g_btn_pan : mode == 0 ? SDL_BUTTON_RIGHT : -1;   // as a finger: right drags the camera too
+		const int mid_btn = g_mouse_bound ? -1 : SDL_BUTTON_MIDDLE;
 		if (s.type == SDL_MOUSEBUTTONDOWN) {
 			const int b = s.button.button;
-			if (mode == 0 && b == SDL_BUTTON_LEFT) {
+			if (g_mouse_bound && b != sel_btn && b != cmd_btn && b != pan_btn) {
+				push_mouse_key(true, b);
+			} else if (mode == 0 && b == SDL_BUTTON_LEFT) {
 				if (!mfinger_down) { mfinger_down = true; mouse_finger(SDL_FINGERDOWN, x, y); }
 			} else if (mode != 0 && b == sel_btn) {
 				if (!msel_down) { msel_down = true; push_mouse_select(event_t::type_mouse_button_down, x, y, s.button.clicks); }
 			} else if (b == cmd_btn) {
 				if (mcmd == mcmd_t::idle) { mcmd = mcmd_t::pressed; mcmd_x = x; mcmd_y = y; mcmd_ticks = SDL_GetTicks(); }
-			} else if (b == SDL_BUTTON_MIDDLE || b == pan_btn) {
+			} else if (b == mid_btn || b == pan_btn) {
 				mouse_pan_begin(x, y);
 				mpan = true;
 			}
@@ -486,7 +512,9 @@ struct window_impl {
 		}
 		if (s.type == SDL_MOUSEBUTTONUP) {
 			const int b = s.button.button;
-			if (mode == 0 && b == SDL_BUTTON_LEFT) {
+			if (g_mouse_bound && b != sel_btn && b != cmd_btn && b != pan_btn) {
+				push_mouse_key(false, b);
+			} else if (mode == 0 && b == SDL_BUTTON_LEFT) {
 				if (mfinger_down) { mfinger_down = false; mouse_finger(SDL_FINGERUP, x, y); }
 			} else if (mode != 0 && b == sel_btn) {
 				if (msel_down) { msel_down = false; push_mouse_select(event_t::type_mouse_button_up, x, y, s.button.clicks); }
@@ -496,7 +524,7 @@ struct window_impl {
 				if (was == mcmd_t::pressed) push_mouse_event(event_t::type_command_click, -1, mcmd_x, mcmd_y, 0);
 				else if (was == mcmd_t::held) push_mouse_event(event_t::type_long_release, -1, x, y, 0);
 				else if (was == mcmd_t::panning && !mpan) push_mouse_event(event_t::type_mouse_button_up, 3, x, y, 0);
-			} else if (b == SDL_BUTTON_MIDDLE || b == pan_btn) {
+			} else if (b == mid_btn || b == pan_btn) {
 				if (mpan) {
 					mpan = false;
 					if (mcmd != mcmd_t::panning) push_mouse_event(event_t::type_mouse_button_up, 3, x, y, 0);
@@ -782,6 +810,7 @@ struct window_impl {
 				e.type = event_t::type_key_down;
 				e.sym = sdl_e.key.keysym.sym;
 				e.scancode = sdl_e.key.keysym.scancode;
+				e.repeat = sdl_e.key.repeat;
 				if ((size_t)e.scancode < key_state.size()) key_state[e.scancode] = true;
 				return true;
 			case SDL_KEYUP:
@@ -830,6 +859,12 @@ struct window_impl {
 				break;
 			case SDL_WINDOWEVENT:
 				if (sdl_e.window.windowID == SDL_GetWindowID(window)) {
+					if (sdl_e.window.event == SDL_WINDOWEVENT_FOCUS_LOST || sdl_e.window.event == SDL_WINDOWEVENT_LEAVE) {
+#ifdef __ANDROID__
+						mouse_present = false;
+#endif
+						key_state.fill(false);
+					}
 					if (sdl_e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || sdl_e.window.event == SDL_WINDOWEVENT_RESIZED) {
 						update_render_size();
 						e.type = event_t::type_resize;
@@ -860,6 +895,18 @@ struct window_impl {
 	
 	bool get_key_state(int scancode) {
 		return key_state.at(scancode) ? true : false;
+	}
+
+	bool get_mouse_pointer(int* x, int* y) {
+#ifdef __ANDROID__
+		if (!mouse_present) return false;
+		*x = mouse_last_x;
+		*y = mouse_last_y;
+		return true;
+#else
+		(void)x; (void)y;
+		return false;
+#endif
 	}
 	
 	bool get_mouse_button_state(int button) {
@@ -1399,6 +1446,10 @@ bool window::show_cursor(bool show) {
 
 bool window::get_key_state(int scancode) {
 	return impl->get_key_state(scancode);
+}
+
+bool window::get_mouse_pointer(int* x, int* y) {
+	return impl->get_mouse_pointer(x, y);
 }
 
 bool window::get_mouse_button_state(int button) {

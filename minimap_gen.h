@@ -56,9 +56,15 @@ inline bool render_chk_to_png(data_loading::data_files_loader<>& load_data_file,
 	// Load the tileset graphics for the colour lookup.
 	static const char* tileset_names[8] = {"badlands", "platform", "install", "AshWorld", "Jungle", "Desert", "Ice", "Twilight"};
 	a_vector<uint8_t> cv5, vx4, vr4, wpe;
+	bool vx4ex = false;   // SC:R: 32-bit megatile -> image table (see ui.h load_tileset_image_data)
 	try {
 		load_data_file(cv5, format("Tileset/%s.cv5", tileset_names[tileset]));
-		load_data_file(vx4, format("Tileset/%s.vx4", tileset_names[tileset]));
+		try {
+			load_data_file(vx4, format("Tileset/%s.vx4ex", tileset_names[tileset]));
+			vx4ex = true;
+		} catch (std::exception&) {
+			load_data_file(vx4, format("Tileset/%s.vx4", tileset_names[tileset]));
+		}
 		load_data_file(vr4, format("Tileset/%s.vr4", tileset_names[tileset]));
 		load_data_file(wpe, format("Tileset/%s.wpe", tileset_names[tileset]));
 	} catch (std::exception& e) {
@@ -67,7 +73,7 @@ inline bool render_chk_to_png(data_loading::data_files_loader<>& load_data_file,
 	}
 	if (wpe.size() < 256 * 4) { err = "bad wpe"; return false; }
 	size_t cv5_n = cv5.size() / 52;
-	size_t vx4_n = vx4.size() / 32;
+	size_t vx4_n = vx4.size() / (vx4ex ? 64 : 32);
 	size_t vr4_n = vr4.size() / 64;
 
 	// Build the RGB pixel grid (top-down).
@@ -81,7 +87,8 @@ inline bool render_chk_to_png(data_loading::data_files_loader<>& load_data_file,
 			if (g < cv5_n) mti = rd16(cv5.data() + g * 52 + 20 + s * 2);
 			uint8_t val = 0;
 			if (mti < vx4_n) {
-				size_t vr4i = rd16(vx4.data() + mti * 32) >> 1;
+				const uint8_t* e = vx4.data() + mti * (vx4ex ? 64 : 32);
+				size_t vr4i = ((size_t)rd16(e) | (vx4ex ? (size_t)rd16(e + 2) << 16 : 0)) >> 1;
 				if (vr4i < vr4_n) val = vr4[vr4i * 64 + 55];
 			}
 			uint8_t* px = rgb.data() + ((size_t)y * mw + x) * 3;

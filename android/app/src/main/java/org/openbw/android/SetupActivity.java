@@ -189,9 +189,40 @@ public class SetupActivity extends Activity {
 
     @Override
     public void startActivity(Intent intent) {
-        if (intent != null && intent.getComponent() != null && OpenBWActivity.class.getName().equals(intent.getComponent().getClassName()))
-            prefs().edit().putBoolean("inGame", true).commit();
+        boolean game = intent != null && intent.getComponent() != null && OpenBWActivity.class.getName().equals(intent.getComponent().getClassName());
+        if (game && mpLobby != null) { showLobbyBusy(intent); return; }
+        if (game) prefs().edit().putBoolean("inGame", true).commit();
         super.startActivity(intent);
+    }
+
+    // A game is about to start while this device hosts or has joined a LAN lobby: say so instead.
+    private void showLobbyBusy(final Intent pending) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(22), dp(14), dp(22), dp(18));
+        box.setBackground(kit.box(Kit.PANEL, Kit.LINE));
+        TextView title = kit.label(mpIsHost ? S.t("Jūs kuriate LAN lobby") : S.t("Jūs esate LAN lobby"));
+        title.setTextColor(Kit.DANGER);
+        box.addView(title);
+        TextView msg = kit.text(S.t("Kol esate LAN lobby, kito žaidimo pradėti negalima. Grįžkite į lobby arba jį palikite."), Kit.TEXT, 14);
+        msg.setPadding(0, dp(4), 0, dp(16));
+        box.addView(msg, new LinearLayout.LayoutParams(Math.min(dp(520), getResources().getDisplayMetrics().widthPixels - dp(80)), ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout acts = new LinearLayout(this);
+        acts.setOrientation(LinearLayout.HORIZONTAL);
+        acts.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        final android.app.Dialog[] d = new android.app.Dialog[1];
+        LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        gap.leftMargin = dp(8);
+        acts.addView(kit.button(S.t("Atšaukti"), 2, () -> d[0].dismiss()), gap);
+        acts.addView(kit.button(S.t("Palikti lobby ir pradėti"), 0, () -> {
+            d[0].dismiss();
+            mpLeaveLobby();
+            startActivity(pending);
+        }), gap);
+        acts.addView(kit.button(S.t("Grįžti į lobby"), 1, () -> { d[0].dismiss(); selectTab(TAB_MULTI); }), gap);
+        box.addView(acts, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        d[0] = kit.modal(box, false);
+        d[0].show();
     }
 
     @Override
@@ -1358,6 +1389,7 @@ public class SetupActivity extends Activity {
         mpLocalReady = false;
         mpLobby = new LanLobby(mpLobbyListener, versionName(), enabledModsCsv());
         mpLobby.setLocalPortrait(PortraitStore.activeId(prefs(), activeProfile(), getExternalFilesDir(null)));
+        mpLobby.setLocalKbm(Keybinds.kbm(prefs()));
         mpLobby.startHost(activeProfile(), race, mapId, players, speed);
         showLobbyView();
     }
@@ -1459,6 +1491,7 @@ public class SetupActivity extends Activity {
         mpLocalReady = false;
         mpLobby = new LanLobby(mpLobbyListener, versionName(), enabledModsCsv());
         mpLobby.setLocalPortrait(PortraitStore.activeId(prefs(), activeProfile(), getExternalFilesDir(null)));
+        mpLobby.setLocalKbm(Keybinds.kbm(prefs()));
         mpLobby.startJoin(activeProfile(), race, h.ip);
         showLobbyView();
     }
@@ -1504,13 +1537,21 @@ public class SetupActivity extends Activity {
     private void mpLeaveLobby() {
         if (mpLobby != null) { mpLobby.close(); mpLobby = null; }
         mpState = null;
+        setLanAttention(false);
         mpLobbyBox.setVisibility(View.GONE);
         mpSetup.setVisibility(View.VISIBLE);
         if (screenTitle != null && activeTab == TAB_MULTI) screenTitle.setText(S.t(SCREEN_TITLE[TAB_MULTI]).toUpperCase(Locale.ROOT));
         updateStartButtonVisibility();
     }
 
+    private static String lobbyPeople(LanLobby.State s) {
+        StringBuilder b = new StringBuilder();
+        if (s != null) for (LanLobby.Slot sl : s.slots) b.append(sl.userId).append('|');
+        return b.toString();
+    }
+
     private void renderLobby(LanLobby.State s) {
+        if (mpState != null && activeTab != TAB_MULTI && !lobbyPeople(mpState).equals(lobbyPeople(s))) setLanAttention(true);
         mpState = s;
         mpLobbyTitle.setText((S.t("Žaidėjai") + "  ·  " + s.slots.size() + " / " + s.target).toUpperCase(Locale.ROOT));
         mpLobbyStatus.setText(mapBasename(s.map) + "  ·  " + S.t("greitis: ") + gameSpeedName(String.valueOf(s.speed)));
@@ -1546,7 +1587,16 @@ public class SetupActivity extends Activity {
                 sp.setSpan(new android.text.style.RelativeSizeSpan(0.7f), at, sp.length(), 0);
                 name.setText(sp);
             }
-            who.addView(name);
+            if (sl.kbm) {
+                LinearLayout nameRow = new LinearLayout(this);
+                nameRow.setOrientation(LinearLayout.HORIZONTAL);
+                nameRow.setGravity(Gravity.CENTER_VERTICAL);
+                nameRow.addView(name);
+                LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                flp.leftMargin = dp(8);
+                nameRow.addView(new Keybinds.FlagView(this), flp);
+                who.addView(nameRow);
+            } else who.addView(name);
             boolean isMe = (mpIsHost && i == 0) || (!mpIsHost && sl.userId.equals(activeProfile()) && !sl.host);
             // the race of the others; my own is on the race button of my row
             if (!isMe) who.addView(kit.text(sl.race >= 0 && sl.race <= 2 ? raceNames()[indexOfRace(sl.race)] : S.t("Atsitiktinė"), Kit.TEXT2, 11));
@@ -1635,6 +1685,13 @@ public class SetupActivity extends Activity {
                 np.append(sl.portrait).append('=').append(sl.userId.replace('|', '_'));
             }
             if (np.length() > 0) i.putExtra(OpenBWActivity.EXTRA_NAME_PORTRAITS, np.toString());
+            StringBuilder kb = new StringBuilder();
+            for (LanLobby.Slot sl : mpState.slots) {
+                if (!sl.kbm || sl.userId == null || sl.userId.isEmpty()) continue;
+                if (kb.length() > 0) kb.append('|');
+                kb.append(sl.userId.replace('|', '_'));
+            }
+            if (kb.length() > 0) i.putExtra(OpenBWActivity.EXTRA_KBM_PLAYERS, kb.toString());
         }
         prefs().edit().putInt("lastLocalRace", race).apply();
         addCommonExtras(i);
@@ -1665,6 +1722,7 @@ public class SetupActivity extends Activity {
         @Override public void onError(String msg) {
             Toast.makeText(SetupActivity.this, S.t(msg), Toast.LENGTH_LONG).show();
             mpLeaveLobby();
+            if (activeTab != TAB_MULTI) setLanAttention(true);
         }
         @Override public void onClosed() { }
     };
@@ -2192,9 +2250,46 @@ public class SetupActivity extends Activity {
         rail.addView(e, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
     }
 
+    // Something changed in the LAN lobby while the player is on another screen: the LAN
+    // entry turns orange and pulses (tablet rail: the whole entry; phone rail: the icon).
+    private boolean lanAttention;
+    private android.animation.ObjectAnimator lanPulse;
+    private static final int ATTN = 0xFFFF8A1E;
+
+    private void setLanAttention(boolean on) {
+        if (lanAttention == on) return;
+        lanAttention = on;
+        if (lanPulse != null) { lanPulse.cancel(); lanPulse = null; }
+        if (railEntries == null || railEntries[TAB_MULTI] == null) return;
+        LinearLayout e = railEntries[TAB_MULTI];
+        View target = e.getChildAt(1) instanceof TextView ? e : ((LinearLayout) e.getChildAt(1)).getChildAt(0);
+        target.setAlpha(1f);
+        styleRailEntry(TAB_MULTI, activeTab == TAB_MULTI);
+        if (!on) return;
+        lanPulse = android.animation.ObjectAnimator.ofFloat(target, "alpha", 1f, 0.35f);
+        lanPulse.setDuration(650);
+        lanPulse.setRepeatMode(android.animation.ValueAnimator.REVERSE);
+        lanPulse.setRepeatCount(android.animation.ValueAnimator.INFINITE);
+        lanPulse.start();
+    }
+
     private void styleRailEntry(int tab, boolean on) {
         if (railEntries == null || railEntries[tab] == null) return;
         LinearLayout e = railEntries[tab];
+        if (tab == TAB_MULTI && lanAttention && !on) {
+            if (e.getChildAt(1) instanceof TextView) {
+                e.getChildAt(0).setBackgroundColor(ATTN);
+                e.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, new int[]{0xFF5A3010, 0x405A3010}));
+                ((TextView) e.getChildAt(1)).setTextColor(0xFFFFB46A);
+            } else {
+                LinearLayout col = (LinearLayout) e.getChildAt(1);
+                e.getChildAt(0).setBackgroundColor(0x00000000);
+                e.setBackground(null);
+                ((RailIcon) ((FrameLayout) col.getChildAt(0)).getChildAt(0)).setColor(ATTN);
+                ((TextView) col.getChildAt(1)).setTextColor(0xFF9FB3A4);
+            }
+            return;
+        }
         e.getChildAt(0).setBackgroundColor(on ? Kit.LABEL : 0x00000000);
         if (on) {
             GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, new int[]{0xFF14401F, 0x40143C1E});
@@ -3473,6 +3568,7 @@ public class SetupActivity extends Activity {
     private void selectTab(int idx) {
         if (pages == null || idx < 0 || idx >= pages.length) return;
         activeTab = idx;
+        if (idx == TAB_MULTI) setLanAttention(false);
         for (int k = 0; k < pages.length; k++) {
             pages[k].setVisibility(k == idx ? View.VISIBLE : View.GONE);
             styleRailEntry(k, k == idx);
@@ -3934,6 +4030,7 @@ public class SetupActivity extends Activity {
     // used -- only the widgets changed (switches, segments, tinted sliders).
     private final List<String> setTabNames = new ArrayList<>();
     private final List<LinearLayout> setTabBoxes = new ArrayList<>();
+    private static final String FULL_WIDTH = "fullWidth";   // a section row the two-column split keeps whole, below the columns
 
     private LinearLayout settingsSection(String title) {
         LinearLayout box = new LinearLayout(this);
@@ -4087,9 +4184,11 @@ public class SetupActivity extends Activity {
                             .remove("showFps").remove("showApm").remove("healthBarsAlways").remove("cameraSpeed")
                             .remove("resourceCounts").remove("showSaturation").remove("showZoomButtons").remove("equipGrey")
                             .remove("tapCommand").remove("mouseButtons").remove("renderInterp")
+                            .remove("inputMode").remove("edgeScroll").remove(Keybinds.PREF)
                             .remove("hudStyle").remove("hud3Template").remove("hud3Dock").remove("hud3WheelMs").remove("hud3Pen")
                             .remove("hud3Latch").remove("hud3Labels").remove("hud3Left").remove("hud3Scale").remove("hud3Vibrate").remove("hud3AllGroups")
                             .apply();
+                    if (mpLobby != null) mpLobby.updateLocalKbm(false);
                     restoreTab = TAB_NUSTATYMAI;
                     recreate();
                 })
@@ -4166,13 +4265,35 @@ public class SetupActivity extends Activity {
                 S.t("Klasikiniame HUD: komandų eilės ir pažymėjimo papildymo mygtukas."), true);
         setSwitch(ctl, S.t("Bakstelėjimas = komanda"), "tapCommand",
                 S.t("Bakstelėjimas žemėje ar į priešą duoda komandą pažymėtiems."), true);
-        setSegments(ctl, S.t("Pelės mygtukai"),
-                S.t("Klasikinis: kairysis žymi, dešinysis duoda komandą (laikant — komandų ratas, tempiant — kamera). Kaip pirštas: kairysis veikia kaip pirštas, dešiniuoju tempiama kamera. Vidurinis mygtukas tempia kamerą, ratukas keičia mastelį."),
+        final LinearLayout touchBox = new LinearLayout(this), kbmBox = new LinearLayout(this);
+        touchBox.setOrientation(LinearLayout.VERTICAL);
+        kbmBox.setOrientation(LinearLayout.VERTICAL);
+        final boolean kbmOn = Keybinds.kbm(prefs());
+        touchBox.setVisibility(kbmOn ? View.GONE : View.VISIBLE);
+        kbmBox.setVisibility(kbmOn ? View.VISIBLE : View.GONE);
+        setSegments(ctl, S.t("Įvesties režimas"),
+                S.t("Klaviatūra + pelė: kairysis žymi (ir rėmeliu), dešinysis duoda komandą, kamera — ekrano kraštu ir klavišais, klavišai komandoms ir grupėms. LAN žaidėjams prie vardo rodoma klaviatūros žymė."),
+                new String[]{S.t("Lietimas"), S.t("Klaviatūra + pelė")}, kbmOn ? 1 : 0,
+                idx -> {
+                    prefs().edit().putString("inputMode", idx == 1 ? "kbm" : "touch").apply();
+                    if (mpLobby != null) mpLobby.updateLocalKbm(idx == 1);
+                    touchBox.setVisibility(idx == 1 ? View.GONE : View.VISIBLE);
+                    kbmBox.setVisibility(idx == 1 ? View.VISIBLE : View.GONE);
+                });
+        ctl.addView(touchBox);
+        setSegments(touchBox, S.t("Pelės mygtukai"),
+                S.t("Kaip pelė veikia lietimo režime. Kaip pirštas — kairysis mygtukas yra pirštas (bakstelėti, laikyti, tempti), dešiniuoju tempiama kamera. Klasikinis — kairysis tik žymi (spustelėjimas, dvigubas spustelėjimas, rėmelis); dešinysis: spustelėjimas — komanda į tą vietą, laikymas — komandų ratas, tempimas — kamera. Sukeisti — kaip Klasikinis, tik kairysis ir dešinysis sukeisti vietomis (kairiarankiams). Visada: vidurinis mygtukas tempia kamerą, ratukas keičia mastelį."),
                 new String[]{S.t("Kaip pirštas"), S.t("Klasikinis"), S.t("Sukeisti")}, Math.max(0, Math.min(2, prefs().getInt("mouseButtons", 1))),
                 idx -> prefs().edit().putInt("mouseButtons", idx).apply());
         setSwitch(ctl, S.t("LAN sklandumas"), "renderInterp", S.t("Sklandesnis vienetų judėjimas LAN žaidime."), true);
         setSlider(ctl, S.t("Kameros greitis"), S.t("Krašto ir klaviatūros slinkimo greitis (100 = įprastas)."), "cameraSpeed", 100, 250);
         setSwitch(ctl, S.t("Rodyti mastelio mygtukus"), "showZoomButtons", S.t("Ekrane rodomi - / + mygtukai. Mastelį dviem pirštais keisti galima ir be jų."), false);
+        kbmBox.setTag(FULL_WIDTH);
+        ctl.addView(kbmBox);
+        setSwitch(kbmBox, S.t("Kamera ekrano kraštu"), "edgeScroll",
+                S.t("Klaviatūra + pelė: pelė prie ekrano krašto slenka kamerą."), true);
+        kbmBox.addView(kit.label(S.t("Klavišai ir pelės mygtukai")));
+        kbmBox.addView(Keybinds.table(this, kit, prefs()));
 
         // ---- Žaidimo HUD: the classic bar (v2) or the touch HUD (v3) and its options ----
         LinearLayout hud = settingsSection(S.t("Žaidimo HUD"));
@@ -4299,16 +4420,23 @@ public class SetupActivity extends Activity {
                 LinearLayout left = new LinearLayout(this), right = new LinearLayout(this);
                 left.setOrientation(LinearLayout.VERTICAL);
                 right.setOrientation(LinearLayout.VERTICAL);
-                int half = (n + 1) / 2;
-                List<View> kids = new ArrayList<>();
-                for (int i = 0; i != n; ++i) kids.add(box.getChildAt(i));
+                List<View> kids = new ArrayList<>(), full = new ArrayList<>();
+                for (int i = 0; i != n; ++i) (FULL_WIDTH.equals(box.getChildAt(i).getTag()) ? full : kids).add(box.getChildAt(i));
                 box.removeAllViews();
-                for (int i = 0; i != n; ++i) (i < half ? left : right).addView(kids.get(i));
+                int half = (kids.size() + 1) / 2;
+                for (int i = 0; i != kids.size(); ++i) (i < half ? left : right).addView(kids.get(i));
                 LinearLayout.LayoutParams l1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
                 l1.rightMargin = dp(28);
                 two.addView(left, l1);
                 two.addView(right, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
                 v = two;
+                if (!full.isEmpty()) {
+                    LinearLayout stack = new LinearLayout(this);
+                    stack.setOrientation(LinearLayout.VERTICAL);
+                    stack.addView(two);
+                    for (View f : full) stack.addView(f);
+                    v = stack;
+                }
             }
             v.setVisibility(View.GONE);
             shown.add(v);

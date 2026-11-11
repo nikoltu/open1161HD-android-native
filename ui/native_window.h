@@ -66,6 +66,11 @@ namespace native_window {
 		// 1 = a real mouse's SELECT button in the classic / swapped modes (a click
 		// selects only, never orders); 0 = a finger, the pen, or a mouse acting as one.
 		int device = 0;
+		// type_key_down: an auto-repeat of a held key.
+		int repeat = 0;
+		// A mouse button outside the select / command / pan roles (set_mouse_buttons)
+		// arrives as type_key_down / type_key_up with scancode = mouse_key_base + button.
+		static constexpr int mouse_key_base = 1000;
 	};
 
 	// Divisor between the window pixel size and the render/present size
@@ -78,6 +83,9 @@ namespace native_window {
 	// right commands (click = order, hold = the command wheel, drag = pan); 2 = the
 	// same with the buttons swapped. Middle drag pans and the wheel zooms in every mode.
 	void set_mouse_mode(int mode);
+	// Keyboard + mouse mode: the classic mode with these SDL buttons (1 left, 2 middle,
+	// 3 right, 4 / 5 side) as select / command / pan; -1 = none. Other buttons become keys.
+	void set_mouse_buttons(int select, int command, int pan);
 
 	// Returns (and clears) whether the OS signalled low memory since the
 	// last call; the caller should free what it can.
@@ -108,6 +116,9 @@ namespace native_window {
 		void stop_text_input();
 		bool show_cursor(bool show);
 		bool get_key_state(int scancode);
+		// The last position of a real mouse pointer (render px); false while there is
+		// none (no mouse yet, a touch came after it, or the window lost focus).
+		bool get_mouse_pointer(int* x, int* y);
 		bool get_mouse_button_state(int button);
 		void update_surface();
 		void set_bloom(int strength); // open1161HD Faze 7: GPU bloom (0 = off)

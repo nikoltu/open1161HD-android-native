@@ -26,11 +26,12 @@ import java.util.List;
  * (net melee), where the native lockstep layer takes over.
  *
  * Wire protocol: newline-delimited JSON.
- *   join -> host  : {"hello":"<userId>","race":<int>,"portrait":<int>}
- *                   ("portrait" = the profile's portdata id; unknown keys are ignored
- *                   by older builds on either side, a missing one reads as -1)
+ *   join -> host  : {"hello":"<userId>","race":<int>,"portrait":<int>,"kbm":<bool>}
+ *                   ("portrait" = the profile's portdata id; "kbm" = keyboard + mouse
+ *                   mode; unknown keys are ignored by older builds on either side, a
+ *                   missing portrait reads as -1, a missing kbm as false)
  *   host -> all   : {"state":{...}}   (authoritative snapshot, see State.toJson)
- *   join -> host  : {"race":<int>} | {"ready":<bool>} | {"leave":true}
+ *   join -> host  : {"race":<int>} | {"ready":<bool>} | {"kbm":<bool>} | {"leave":true}
  *   host -> all   : {"start":true}
  * UDP discovery (port {@link #PORT}): a probe "OPENBW_DISCOVER" is answered with
  *   "OPENBW\t<port>\t<map>\t<used>/<total>\t<ver>\t<mods>\t<speed>\t<host name>\t<host portrait>" so joiners can
@@ -44,6 +45,7 @@ public class LanLobby {
         public int race = -1;      // -1 = random, 0/1/2 concrete
         public int color = -1;     // -1 = auto (slot index); 0..7 = chosen BW colour
         public int portrait = -1;  // portdata id of the player's profile portrait; -1 = an older build
+        public boolean kbm;        // plays with keyboard + mouse (presentation only)
         public boolean ready;
         public boolean host;
     }
@@ -69,6 +71,7 @@ public class LanLobby {
                     j.put("race", s.race);
                     j.put("color", s.color);
                     j.put("portrait", s.portrait);
+                    j.put("kbm", s.kbm);
                     j.put("ready", s.ready);
                     j.put("host", s.host);
                     arr.put(j);
@@ -96,6 +99,7 @@ public class LanLobby {
                     sl.race = j.optInt("race", -1);
                     sl.color = j.optInt("color", -1);
                     sl.portrait = j.optInt("portrait", -1);
+                    sl.kbm = j.optBoolean("kbm", false);
                     sl.ready = j.optBoolean("ready", false);
                     sl.host = j.optBoolean("host", false);
                     s.slots.add(sl);
@@ -133,9 +137,12 @@ public class LanLobby {
     private boolean isHost;
     private String myUserId = "Player";
     private int myPortrait = -1;
+    private boolean myKbm;
 
     /** The local profile's portrait id; call before startHost / startJoin. */
     public void setLocalPortrait(int id) { myPortrait = id; }
+    /** Keyboard + mouse mode of this device; call before startHost / startJoin. */
+    public void setLocalKbm(boolean on) { myKbm = on; }
     private String hostIp;
 
     private final String appVersion, modsCsv;
@@ -169,6 +176,7 @@ public class LanLobby {
         h.userId = userId;
         h.race = race;
         h.portrait = myPortrait;
+        h.kbm = myKbm;
         h.host = true;
         state.slots.add(h);
         new Thread(this::hostAcceptLoop, "lobby-accept").start();
@@ -211,6 +219,7 @@ public class LanLobby {
             sl.userId = hello.optString("hello", "Guest");
             sl.race = hello.optInt("race", -1);
             sl.portrait = hello.optInt("portrait", -1);
+            sl.kbm = hello.optBoolean("kbm", false);
             ClientConn c = new ClientConn();
             c.sock = s;
             c.out = o;
@@ -234,6 +243,7 @@ public class LanLobby {
                     if (m.has("race")) c.slot.race = m.optInt("race", -1);
                     if (m.has("color") && colorFree(m.optInt("color", -1), c.slot)) c.slot.color = m.optInt("color", -1);
                     if (m.has("ready")) c.slot.ready = m.optBoolean("ready", false);
+                    if (m.has("kbm") && !m.has("hello")) c.slot.kbm = m.optBoolean("kbm", false);
                     if (m.optBoolean("leave", false)) break;
                 }
                 emitState();
@@ -409,7 +419,7 @@ public class LanLobby {
                 joinSock.connect(new java.net.InetSocketAddress(hostIp, PORT), 8000);
                 joinOut = joinSock.getOutputStream();
                 BufferedReader r = new BufferedReader(new InputStreamReader(joinSock.getInputStream(), "UTF-8"));
-                JSONObject hello = new JSONObject().put("hello", userId).put("race", myRace).put("portrait", myPortrait);
+                JSONObject hello = new JSONObject().put("hello", userId).put("race", myRace).put("portrait", myPortrait).put("kbm", myKbm);
                 sendJoin(hello.toString());
                 String line;
                 while (running && (line = r.readLine()) != null) {
@@ -444,6 +454,21 @@ public class LanLobby {
             });
         } catch (Exception ignored) {
             // io shut down (leaving) - nothing to send.
+        }
+    }
+
+    /** The input mode changed in Settings while in the lobby: every peer sees the new flag. */
+    public void updateLocalKbm(boolean on) {
+        myKbm = on;
+        if (isHost) {
+            synchronized (this) {
+                if (state.slots.isEmpty()) return;
+                state.slots.get(0).kbm = on;
+                emitState();
+                broadcastState();
+            }
+        } else {
+            try { sendJoin(new JSONObject().put("kbm", on).toString()); } catch (Exception ignored) {}
         }
     }
 

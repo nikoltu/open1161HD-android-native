@@ -42,6 +42,7 @@ struct player_t {
 	int team = 0;              // players sharing a team id are allies
 	bool is_local = false;     // highlighted
 	std::string role;          // optional second-line note: "Computer", "Medium", "Bot"...
+	bool kbm = false;          // LAN: plays with keyboard + mouse (the orange keyboard flag)
 	// Portrait tile (launcher redesign F4): the player's unit portrait replaces the
 	// colour badge -- the colour becomes the tile's frame, the race letter a corner
 	// tag. `portrait_tile` asks for the tile; with no pixels (race hidden, clip
@@ -819,6 +820,24 @@ inline void draw_portrait_tile(canvas& c, const player_t& p, const portrait_tile
 	draw_text(c, gx0 + (ts - lw) / 2, gy0 + (ts - lh) / 2, letter, lc, lh, 0, 240, luma(p.color) <= 150);
 }
 
+// The keyboard + mouse flag: a small orange keyboard, h px tall (width h * 8 / 5).
+inline void draw_kbm_flag(canvas& c, int x, int y, int h) {
+	const int w = h * 8 / 5;
+	const uint32_t body = 0xff8a1e, key = 0x3a1c04;
+	c.fill(x + 1, y, x + w - 1, y + h, body);
+	c.fill(x, y + 1, x + w, y + h - 1, body);
+	const int u = std::max(1, h / 7), oy = (h - 7 * u) / 2;
+	const int kx0 = x + 2 * u, kw = w - 4 * u;
+	for (int row = 0; row != 2; ++row) {
+		const int ky = y + oy + u * (1 + 2 * row);
+		for (int k = 0; k != 5; ++k) {
+			const int px = kx0 + k * kw / 5;
+			c.fill(px, ky, px + std::max(1, kw / 5 - u), ky + u, key);
+		}
+	}
+	c.fill(x + w / 4, y + oy + 5 * u, x + w - w / 4, y + oy + 6 * u, key);
+}
+
 // One player row. `mirror` = right-hand column (badge on the right, text
 // right-aligned), so the two sides face each other across the minimap.
 inline void draw_player_card(canvas& c, const player_t& p, int x0, int y0, int w, int h, bool mirror, const style_t& st) {
@@ -863,10 +882,16 @@ inline void draw_player_card(canvas& c, const player_t& p, int x0, int y0, int w
 	float block = nh + gap + sh2;
 	float ny = y0 + (h - block) / 2;
 	std::string name = p.name;
-	float fh = fit_height(name, nh, nh * 0.72f, tw);
-	name = ellipsize(name, fh, tw);
+	const int kh = std::max(7, (int)(nh * 0.62f)), kw = kh * 8 / 5, kgap = (int)(nh * 0.3f);
+	const float ntw = p.kbm && tw > kw * 3 ? tw - kw - kgap : tw;
+	float fh = fit_height(name, nh, nh * 0.72f, ntw);
+	name = ellipsize(name, fh, ntw);
 	float nw = text_width(name, fh);
 	draw_text(c, mirror ? tx1 - nw : tx0, ny + (nh - fh) / 2, name, pal::title, fh);
+	if (p.kbm && tw > kw * 3) {
+		const int kx = mirror ? (int)(tx1 - nw) - kgap - kw : (int)(tx0 + nw) + kgap;
+		draw_kbm_flag(c, kx, (int)(ny + (nh - kh) / 2), kh);
+	}
 	// Second line: race, then the role in a dimmer tone.
 	std::string race = race_text(p, st);
 	std::string role = p.role;
@@ -1082,7 +1107,7 @@ inline uint64_t signature(const info_t& info, const style_t& st, int w, int h) {
 	mixi(info.minimap_w); mixi(info.minimap_h); mixi((int64_t)info.minimap.size()); mixi(info.minimap_rev);
 	for (auto& m : info.markers) { mixb(&m.x, sizeof(m.x)); mixb(&m.y, sizeof(m.y)); mixi(m.color); mixi(m.active); }
 	for (auto& p : info.players) {
-		mixs(p.name); mixs(p.role); mixi(p.race); mixi(p.race_random); mixi(p.color); mixi(p.team); mixi(p.is_local);
+		mixs(p.name); mixs(p.role); mixi(p.race); mixi(p.race_random); mixi(p.color); mixi(p.team); mixi(p.is_local); mixi(p.kbm);
 		mixi(p.portrait_tile); mixi(p.portrait_id); mixi(p.portrait ? (int64_t)p.portrait->size() : -1);
 	}
 	// Backdrop: its size plus a sparse sample of the pixels (the whole image is

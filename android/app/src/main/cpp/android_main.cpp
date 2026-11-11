@@ -870,6 +870,10 @@ extern "C" int main(int argc, char* argv[]) {
 	a_string player_name;         // v0.26: UserID profile, shown as the local player's "Name"
 	int player_portrait = -1;     // launcher redesign F4: the profile's portdata id (render-only)
 	a_string name_portraits_arg;  // LAN: "id=name|id=name" from the launcher lobby (render-only)
+	a_string kbm_players_arg;     // LAN: "name|name" -- players in keyboard + mouse mode (render-only)
+	a_string key_binds_arg;       // keyboard + mouse: "id=code,id=code"
+	bool input_kbm = false;       // --input-mode kbm
+	int edge_scroll = 1;
 	a_string slot_races_csv;      // v0.43: per active slot race (0 Z,1 T,2 P, else random); index 0 = local
 	a_string slot_colors_csv;     // per active slot player colour (0..7); index 0 = local (render-only)
 	bool trigger_trace = false;   // v0.62: --trigger-trace, campaign trigger diagnosis
@@ -963,6 +967,10 @@ extern "C" int main(int argc, char* argv[]) {
 		else if (arg == "--player-name" && i + 1 < argc) player_name = argv[++i];
 		else if (arg == "--player-portrait" && i + 1 < argc) player_portrait = atoi(argv[++i]);
 		else if (arg == "--name-portraits" && i + 1 < argc) name_portraits_arg = argv[++i];
+		else if (arg == "--kbm-players" && i + 1 < argc) kbm_players_arg = argv[++i];
+		else if (arg == "--key-binds" && i + 1 < argc) key_binds_arg = argv[++i];
+		else if (arg == "--input-mode" && i + 1 < argc) input_kbm = std::string(argv[++i]) == "kbm";
+		else if (arg == "--edge-scroll" && i + 1 < argc) edge_scroll = atoi(argv[++i]);
 		else if (arg == "--races" && i + 1 < argc) slot_races_csv = argv[++i];
 		else if (arg == "--colors" && i + 1 < argc) slot_colors_csv = argv[++i]; // per-slot player colours (render-only)
 		else if (arg == "--trigger-trace") trigger_trace = true;
@@ -1468,6 +1476,19 @@ extern "C" int main(int argc, char* argv[]) {
 		ui.camera_speed = camera_speed < 25 ? 25 : (camera_speed > 250 ? 250 : camera_speed);
 		ui.tap_command = tap_command != 0;
 		native_window::set_mouse_mode(mouse_buttons);
+		ui.kbm_mode = input_kbm;
+		ui.kbm_edge_scroll = edge_scroll != 0;
+		if (input_kbm) {
+			ui.kbm_parse_binds(key_binds_arg);
+			auto btn = [&](int a) { int c = ui.kbm_bind[(size_t)a] - native_window::event_t::mouse_key_base; return c >= 1 && c <= 5 ? c : -1; };
+			native_window::set_mouse_buttons(btn(ui.kb_mouse_select), btn(ui.kb_mouse_command), btn(ui.kb_mouse_pan));
+		}
+		for (size_t sp = 0; sp < kbm_players_arg.size();) {
+			size_t e = kbm_players_arg.find('|', sp);
+			if (e == a_string::npos) e = kbm_players_arg.size();
+			if (e > sp) ui.kbm_players.push_back(kbm_players_arg.substr(sp, e - sp));
+			sp = e + 1;
+		}
 	ui.render_interp = render_interp != 0;
 
 		// Networking objects live for the whole game (referenced by the

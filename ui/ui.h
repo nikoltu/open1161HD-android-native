@@ -33,7 +33,8 @@ struct vr4_entry {
 	std::array<bitmap_t, 64 / sizeof(bitmap_t)> inverted_bitmap;
 };
 struct vx4_entry {
-	std::array<uint16_t, 16> images;
+	// (vr4 index << 1) | horizontal flip. 32 bits: SC:R's vx4ex has more than 32768 images.
+	std::array<uint32_t, 16> images;
 };
 
 struct pcx_image {
@@ -214,7 +215,18 @@ void load_tileset_image_data(tileset_image_data& img, size_t tileset_index, load
 	const char* tileset_name = tileset_names.at(tileset_index);
 
 	load_data_file(vr4_data, format("Tileset/%s.vr4", tileset_name));
-	load_data_file(vx4_data, format("Tileset/%s.vx4", tileset_name));
+	// SC:R data (CASC) has no .vx4, only .vx4ex: the same table with 32-bit entries,
+	// whose first entries are 1.16.1's .vx4 widened (all 8 tilesets, measured). SC:R's
+	// .cv5 points at megatiles past the 1.16.1 table (badlands up to 6171 vs 4844), so
+	// with SC:R tile tables only vx4ex can draw them; with the 1.16.1 .vx4 draw_tile
+	// threw out_of_range on 26 of 575 maps.
+	bool vx4ex = false;
+	try {
+		load_data_file(vx4_data, format("Tileset/%s.vx4ex", tileset_name));
+		vx4ex = true;
+	} catch (std::exception&) {
+		load_data_file(vx4_data, format("Tileset/%s.vx4", tileset_name));
+	}
 	load_data_file(img.wpe, format("Tileset/%s.wpe", tileset_name));
 
 	a_vector<uint8_t> grp_data;
@@ -238,10 +250,10 @@ void load_tileset_image_data(tileset_image_data& img, size_t tileset_index, load
 		}
 	}
 	data_reader<true, false> vx4_r(vx4_data.data(), vx4_data.data() + vx4_data.size());
-	img.vx4.resize(vx4_data.size() / 32);
+	img.vx4.resize(vx4_data.size() / (vx4ex ? 64 : 32));
 	for (size_t i = 0; i != img.vx4.size(); ++i) {
 		for (size_t i2 = 0; i2 != 16; ++i2) {
-			img.vx4[i].images[i2] = vx4_r.get<uint16_t>();
+			img.vx4[i].images[i2] = vx4ex ? vx4_r.get<uint32_t>() : vx4_r.get<uint16_t>();
 		}
 	}
 
@@ -3136,7 +3148,10 @@ struct ui_functions: ui_util_functions {
 			draw_frame(frame, i_flag(image, image_t::flag_horizontally_flipped), dst, data_pitch, offset_x, offset_y, width, height, glow);
 		};
 
-		if (image->modifier == 0 || image->modifier == 1) {
+		if (image->modifier == 0 || image->modifier == 1 || image->modifier == 14) {
+			// 14 = player colour override: the colours of player modifier_data1 (set to
+			// the sprite's owner at creation; the capture-the-flag flag, image 392).
+			if (image->modifier == 14 && image->modifier_data1 >= 0 && image->modifier_data1 < 12) color_index = st.players[image->modifier_data1].color;
 			uint8_t* ptr = img.player_unit_colors.at(color_index).data();
 			auto player_color = [ptr](uint8_t new_value, uint8_t) {
 				if (new_value >= 8 && new_value < 16) return ptr[new_value - 8];
@@ -4349,8 +4364,11 @@ struct ui_functions: ui_util_functions {
 	}
 
 	void draw_image_rgba(const image_t* image, uint32_t* data, size_t data_pitch, size_t color_index) {
+		// 14 = player colour override (the capture-the-flag flag): drawn like 0 / 1 in the
+		// colours of player modifier_data1, as the indexed pass (draw_image) does
+		if (image->modifier == 14 && image->modifier_data1 >= 0 && image->modifier_data1 < 12) color_index = st.players[image->modifier_data1].color;
 		// HD path: normal/player-color images with a matching HD sprite.
-		if ((!hd_anim_dir.empty() || hd_casc) && (image->modifier == 0 || image->modifier == 1)) {
+		if ((!hd_anim_dir.empty() || hd_casc) && (image->modifier == 0 || image->modifier == 1 || image->modifier == 14)) {
 			auto* ha = get_hd_anim((int)image->image_type->id, (int)image->image_type->grp_filename_index);
 			if (ha && image->frame_index < ha->frames.size()) {
 				draw_image_hd(image, *ha, data, data_pitch, color_index);
@@ -4821,7 +4839,9 @@ struct ui_functions: ui_util_functions {
 
 	void process_rgba_sprite_queue(uint32_t* data, size_t data_pitch) {
 		for (auto& e : rgba_sprite_queue) {
-			if (e.image) draw_image_rgba(e.image, data, data_pitch, st.players[e.sprite->owner].color);
+			// map-placed (THG2) sprites keep the map's owner byte (0..255): colour 0, as the
+			// indexed pass (draw_sprite) does
+			if (e.image) draw_image_rgba(e.image, data, data_pitch, e.sprite->owner >= 0 && e.sprite->owner < 12 ? st.players[e.sprite->owner].color : 0);
 			else if (e.circle_u) draw_selection_circle_rgba(e.sprite, e.circle_u, data, data_pitch);
 			else if (e.bars_u) draw_health_bars_rgba(e.sprite, e.bars_u, data, data_pitch);
 		}
@@ -4854,7 +4874,9 @@ struct ui_functions: ui_util_functions {
 				draw_selection_circle(sprite, draw_selection_u, data, data_pitch);
 				draw_selection_u = nullptr;
 			}
-			draw_image(image, data, data_pitch, st.players[sprite->owner].color);
+			// Map-placed (THG2) sprites keep the map's owner byte (0..255); only 0..11 are
+			// players. None of those images has player-colour pixels, so colour 0 is safe.
+			draw_image(image, data, data_pitch, sprite->owner >= 0 && sprite->owner < 12 ? st.players[sprite->owner].color : 0);
 		}
 		if (draw_health_bars_u && !u_invincible(draw_health_bars_u)) {
 			draw_health_bars(sprite, draw_health_bars_u, data, data_pitch);
@@ -4953,7 +4975,9 @@ struct ui_functions: ui_util_functions {
 		if (from_y < 4) from_y = 0;
 		else from_y -= 4;
 		size_t to_y = screen_tile.to.y;
-		if (to_y >= game_st.map_tile_height - 4) to_y = game_st.map_tile_height - 1;
+		// The loop below is exclusive: map_tile_height (not -1), or the sprites on the
+		// map's bottom tile line are never drawn.
+		if (to_y >= game_st.map_tile_height - 4) to_y = game_st.map_tile_height;
 		else to_y += 4;
 		// v0.76 item 3: sprites the local player cannot see are not drawn.
 		// Until now nothing here consulted vision at all: an enemy standing on
@@ -4970,7 +4994,12 @@ struct ui_functions: ui_util_functions {
 			}
 		}
 
-		std::sort(sorted_sprites.begin(), sorted_sprites.end());
+		// Equal depth: the lower sprite index first. Comparing the pointers (the pair's
+		// default order) depended on where the sprite pool's chunks were allocated.
+		std::sort(sorted_sprites.begin(), sorted_sprites.end(), [](auto& a, auto& b) {
+			if (a.first != b.first) return a.first < b.first;
+			return a.second->index < b.second->index;
+		});
 
 		hd_prefetch_drain();   // perf #2: install any HD anims the worker finished
 		update_render_interp();
@@ -9088,6 +9117,7 @@ struct ui_functions: ui_util_functions {
 			r.is_local = is_local;
 			// r.race is already -1 for an enemy that picked Random, so its portrait hides too.
 			loading_attach_portrait(r, player_portrait_id(is_local, player_is_ai(p, local_player), nm, r.race));
+			r.kbm = is_net_game && kbm_player(nm);
 			info.players.push_back(std::move(r));
 		};
 		if (local_player >= 0 && local_player < 8 && listed((size_t)local_player)) add((size_t)local_player);
@@ -9120,6 +9150,7 @@ struct ui_functions: ui_util_functions {
 			r.team = s.slot; // LAN games are free-for-all (teams are not synced yet)
 			r.is_local = s.is_local;
 			loading_attach_portrait(r, player_portrait_id(s.is_local, false, s.name, r.race));
+			r.kbm = kbm_player(s.name);
 			info.players.push_back(std::move(r));
 		};
 		for (auto& s : lobby_slots) if (s.is_local) add(s);
@@ -12166,7 +12197,7 @@ struct ui_functions: ui_util_functions {
 			bool ally = game_local_player >= 0 && st.alliances[game_local_player][p] != 0;
 			bool vis = game_local_player >= 0
 				&& (st.shared_vision[game_local_player] & (1u << p)) != 0;
-			alliance_rows.push_back({p, chat_display_name(p), ally ? (vis ? 2 : 1) : 0});
+			alliance_rows.push_back({p, chat_display_name(p), ally ? (vis ? 2 : 1) : 0, kbm_player(slot_player_names[(size_t)p])});
 		}
 		const int n = (int)alliance_rows.size();
 		menu_lay_t l = menu_layout([&](const menu_lay_t& m) { return (n + 1) * m.bh + n * m.gap; });
@@ -12188,9 +12219,13 @@ struct ui_functions: ui_util_functions {
 			const int in = hud_h_px(12);
 			int scale = 3;
 			if (menu_text_h(scale) > l.bh
-				|| menu_text_w(row.name.c_str(), scale) + menu_text_w(stx, scale) > (r.to.x - r.from.x) - 3 * in) scale = 2;
+				|| menu_text_w(row.name.c_str(), scale) + menu_text_w(stx, scale) + (row.kbm ? menu_text_h(scale) * 2 : 0) > (r.to.x - r.from.x) - 3 * in) scale = 2;
 			const int ty = (r.from.y + r.to.y) / 2 - menu_text_h(scale) / 2;
 			draw_text_rgba(data, pitch, r.from.x + in, ty, row.name.c_str(), text, scale);
+			if (row.kbm) {
+				const int fh = menu_text_h(scale) * 3 / 4;
+				draw_kbm_flag(data, pitch, r.from.x + in + menu_text_w(row.name.c_str(), scale) + in / 2, ty + (menu_text_h(scale) - fh) / 2, fh);
+			}
 			draw_text_rgba(data, pitch, r.to.x - in - menu_text_w(stx, scale), ty, stx, state_color[row.state], scale);
 		}
 		if (hx >= 0) return menu_in(back, hx, hy) ? n : -1;
@@ -12325,7 +12360,7 @@ struct ui_functions: ui_util_functions {
 
 	// Rows shown by pause screen 7; rebuilt on every render/hit-test so the
 	// state always matches the game. state: 0 Enemy, 1 Allied, 2 Allied + Vision.
-	struct alliance_row_t { int player; a_string name; int state; };
+	struct alliance_row_t { int player; a_string name; int state; bool kbm; };
 	a_vector<alliance_row_t> alliance_rows;
 
 	// Cycles one player through Enemy -> Allied -> Allied + Vision and sends the
@@ -15099,6 +15134,7 @@ struct ui_functions: ui_util_functions {
 					draw_text_rgba(data, pitch, r.from.x + 3 * hud_us(), r.from.y + 3 * hud_us(), lv, cth.amber);
 				}
 			}
+			kbm_draw_card_key(data, pitch, r, (int)i, 85);
 		}
 	}
 
@@ -15137,7 +15173,7 @@ struct ui_functions: ui_util_functions {
 		if (card_hover_index >= (int)buttons.size()) return;
 		auto& b = buttons[card_hover_index];
 		if (b.action == cardact_none) return; // empty fixed slot has no tooltip
-		char l0[40] = {0}, l1[40] = {0}, l2[40] = {0}, l3[48] = {0}, l0buf[40] = {0};
+		char l0[56] = {0}, l1[40] = {0}, l2[40] = {0}, l3[48] = {0}, l0buf[40] = {0};
 		int mineral = 0, gas = 0, supply = 0, btime = 0;
 		const char* name = b.label;
 		const char* effect = nullptr; // what a research/upgrade does (SC wiki wording)
@@ -15195,7 +15231,8 @@ struct ui_functions: ui_util_functions {
 		}
 		default: break;
 		}
-		snprintf(l0, sizeof l0, "%s", name);
+		if (kbm_mode) { char k[8]; kbm_key_name(kbm_bind[kb_card0 + card_hover_index], k, sizeof k); snprintf(l0, sizeof l0, "%s  [%s]", name, k); }
+		else snprintf(l0, sizeof l0, "%s", name);
 		if (mineral || gas) snprintf(l1, sizeof l1, "Min %d  Gas %d", mineral, gas);
 		if (supply && btime) snprintf(l2, sizeof l2, "Sup %d   %ds", supply, btime / 24);
 		else if (supply) snprintf(l2, sizeof l2, "Sup %d", supply);
@@ -17683,6 +17720,7 @@ struct ui_functions: ui_util_functions {
 	}
 
 #include "hud3.h"   // HUD v3, the touch HUD (members of this class; after the card types it uses)
+#include "kbm.h"    // keyboard + mouse play (members of this class)
 
 	bool is_moving_minimap = false;
 	xy minimap_drag_pos = xy(-1, -1);
@@ -17974,6 +18012,7 @@ struct ui_functions: ui_util_functions {
 					break;
 				case native_window::event_t::type_resize:
 					resize(e.width, e.height);
+					kbm_release_all();   // back from the background: a key-up may have been lost
 					break;
 				case native_window::event_t::type_mouse_button_down:
 					if (e.button == 1) hud_press_pos = xy(e.mouse_x, e.mouse_y);   // HUD v2 pressed state
@@ -18199,6 +18238,12 @@ struct ui_functions: ui_util_functions {
 								play_unit_what(gu);
 								break;
 							}
+							// keyboard + mouse: a click of the select button places the building, as in the original
+							if (kbm_mode && placing_type && e.device == 1 && !hud_control_at(e.mouse_x, e.mouse_y) && !(hud_v3 && hud3_rect_at(e.mouse_x, e.mouse_y))
+							    && !(e.mouse_x >= minimap_area.from.x && e.mouse_x < minimap_area.to.x && e.mouse_y >= minimap_area.from.y && e.mouse_y < minimap_area.to.y)) {
+								place_building_at(e.mouse_x, e.mouse_y);
+								break;
+							}
 							if (game_click(e.mouse_x, e.mouse_y)) break;
 						}
 						if (is_moving_minimap) is_moving_minimap = false;
@@ -18276,6 +18321,9 @@ struct ui_functions: ui_util_functions {
 						for (const char* p = e.text; *p && cur < (save_name_active ? 40u : 120u); ++p, ++cur) chat_input += *p;
 					}
 					break;
+				case native_window::event_t::type_key_up:
+					kbm_key(e, false);
+					break;
 				case native_window::event_t::type_key_down:
 					// Chat bar owns the keyboard while open: Enter sends, Esc/Back
 					// cancels, Backspace deletes. Everything else is text (handled
@@ -18296,6 +18344,14 @@ struct ui_functions: ui_util_functions {
 					//if (e.sym == 'q') {
 					//	use_new_images = !use_new_images;
 					//}
+					if (kbm_mode && game_input) {
+						if (kbm_key(e, true)) break;
+						if (e.scancode == 270 && !e.repeat) {
+							if (pause_screen == 0 && (placing_type || attack_armed || ability_armed_order >= 0 || (hud_v3 && wheel_open))) kbm_action(kb_cancel);
+							else kbm_action(kb_menu);
+						}
+						break;
+					}
 #ifndef EMSCRIPTEN
 					// The corner button injects 'm'; Android hardware Back is consumed
 					// by SDL and arrives as SDL_SCANCODE_AC_BACK (270), not via Java
@@ -18362,10 +18418,15 @@ struct ui_functions: ui_util_functions {
 					int scroll_speed = scroll_speeds[scroll_speed_n] * camera_speed / 100;
 					if (scroll_speed < 1) scroll_speed = 1;
 					auto prev_screen_pos = screen_pos;
-					if (wnd.get_key_state(81)) screen_pos.y += scroll_speed;
-					else if (wnd.get_key_state(82)) screen_pos.y -= scroll_speed;
-					if (wnd.get_key_state(79)) screen_pos.x += scroll_speed;
-					else if (wnd.get_key_state(80)) screen_pos.x -= scroll_speed;
+					if (kbm_mode && game_input) {
+						const xy d = kbm_scroll_dir();
+						screen_pos += d * scroll_speed;
+					} else {
+						if (wnd.get_key_state(81)) screen_pos.y += scroll_speed;
+						else if (wnd.get_key_state(82)) screen_pos.y -= scroll_speed;
+						if (wnd.get_key_state(79)) screen_pos.x += scroll_speed;
+						else if (wnd.get_key_state(80)) screen_pos.x -= scroll_speed;
+					}
 					if (screen_pos != prev_screen_pos) {
 						if (scroll_speed_n != scroll_speeds.size() - 1) ++scroll_speed_n;
 					} else scroll_speed_n = 0;
@@ -18566,6 +18627,11 @@ struct ui_functions: ui_util_functions {
 
 	void set_image_data() {
 		tileset_img = all_tileset_img.at(game_st.tileset_index);
+		// blit_grp_frame_ws keys its decoded frames by frame ADDRESS; the copy above puts
+		// this tileset's GRPs (creep edges) at new addresses, where an old entry may sit
+		// (a previous map's frame) -- FULL HD then drew stale creep edge pixels.
+		grp_ws_cache.clear();
+		grp_ws_cache_bytes = 0;
 
 		if (!palette) palette = native_window_drawing::new_palette();
 

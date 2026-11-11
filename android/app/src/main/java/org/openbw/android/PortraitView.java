@@ -17,7 +17,7 @@ import java.util.Random;
  * idle variant like the game does, and can play the talking clip once.
  *
  * SD clips are 60x56 and are drawn at an INTEGER multiple without filtering, with
- * a light scanline pass -- upscaled smoothly they turn to mush. Before any game
+ * the game's portrait CRT pass -- upscaled smoothly they turn to mush. Before any game
  * files are imported there is no portrait at all (the app ships no art): the view
  * then draws a procedural "no signal" tile.
  */
@@ -35,18 +35,20 @@ final class PortraitView extends View {
     private int borderPx;
 
     private final Paint paint = new Paint();
-    private final Paint line = new Paint();
     private final Paint border = new Paint();
     private final Rect src = new Rect(), dst = new Rect();
     private final Random rnd = new Random();
     private Bitmap noise;
     private int[] noisePx;
+    private final Paint scan = new Paint(), glow = new Paint();
+    private long snowUntil;          // a portrait change shows static until then, as in the game
 
     PortraitView(Context c) {
         super(c);
         paint.setFilterBitmap(false);
         paint.setAntiAlias(false);
-        line.setColor(0x38000000);
+        scan.setColor(0x33000000);
+        glow.setXfermode(new android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.ADD));
         border.setStyle(Paint.Style.STROKE);
         borderPx = Math.max(2, Math.round(getResources().getDisplayMetrics().density * 1.5f));
         border.setStrokeWidth(borderPx);
@@ -63,6 +65,7 @@ final class PortraitView extends View {
 
     /** Shows the idle clip of a portdata id (decodes on the calling thread, ~1 ms). */
     void setPortrait(File gameDir, int id) {
+        if (this.id >= 0 && id != this.id && animate) snowUntil = SystemClock.uptimeMillis() + 400;
         this.gameDir = gameDir;
         this.id = id;
         entry = PortraitStore.catalog(gameDir).get(id);
@@ -250,25 +253,49 @@ final class PortraitView extends View {
             dst.set(x0, y0, x0 + dw, y0 + dh);
             paint.setFilterBitmap(c.hd);
             canvas.drawBitmap(c.strip, src, dst, paint);
-            if (!c.hd && scale >= 2) for (int y = y0 + scale - 1; y < y0 + dh; y += scale) canvas.drawRect(x0, y, x0 + dw, y + 1, line);
+            boolean snow = SystemClock.uptimeMillis() < snowUntil;
+            if (snow) drawNoise(canvas, x0, y0, dw, dh);
+            crt(canvas, x0, y0, dw, dh);
             border.setColor(borderColor);
             canvas.drawRect(x0 - pad / 2f, y0 - pad / 2f, x0 + dw + pad / 2f, y0 + dh + pad / 2f, border);
-            if (animate && isShown()) postInvalidateDelayed(c.msPerFrame);
+            if (animate && isShown()) postInvalidateDelayed(snow ? 60 : Math.min(c.msPerFrame, 48));
         } else {
             // "no signal": our own pixels, regenerated ~10x a second
-            if (noise == null) { noise = Bitmap.createBitmap(30, 28, Bitmap.Config.ARGB_8888); noisePx = new int[30 * 28]; }
-            for (int i = 0; i != noisePx.length; ++i) { int g = 24 + rnd.nextInt(72); noisePx[i] = 0xFF000000 | (g << 16) | (g << 8) | g; }
-            noise.setPixels(noisePx, 0, 30, 0, 0, 30, 28);
             // the same box a 60x56 clip would take, so the tile does not jump when a clip arrives
             int scale = 2 * Math.max(1, Math.min(aw / 60, ah / 56));
             int dw = 30 * scale, dh = 28 * scale;
             int x0 = pad + (aw - dw) / 2, y0 = pad + (ah - dh) / 2;
-            src.set(0, 0, 30, 28);
-            dst.set(x0, y0, x0 + dw, y0 + dh);
-            canvas.drawBitmap(noise, src, dst, paint);
+            drawNoise(canvas, x0, y0, dw, dh);
+            crt(canvas, x0, y0, dw, dh);
             border.setColor(0xFF606870);
             canvas.drawRect(x0 - pad / 2f, y0 - pad / 2f, x0 + dw + pad / 2f, y0 + dh + pad / 2f, border);
             if (animate && isShown()) postInvalidateDelayed(100);
+        }
+    }
+
+    private void drawNoise(Canvas canvas, int x0, int y0, int dw, int dh) {
+        if (noise == null) { noise = Bitmap.createBitmap(30, 28, Bitmap.Config.ARGB_8888); noisePx = new int[30 * 28]; }
+        for (int i = 0; i != noisePx.length; ++i) { int g = 24 + rnd.nextInt(72); noisePx[i] = 0xFF000000 | (g << 16) | (g << 8) | g; }
+        noise.setPixels(noisePx, 0, 30, 0, 0, 30, 28);
+        src.set(0, 0, 30, 28);
+        dst.set(x0, y0, x0 + dw, y0 + dh);
+        canvas.drawBitmap(noise, src, dst, paint);
+    }
+
+    // The in-game portrait CRT (ui.h draw_portrait_crt): every third line at 80 %, plus a slow rolling highlight band.
+    private void crt(Canvas canvas, int x0, int y0, int dw, int dh) {
+        int sl = Math.max(1, dh / 112);
+        for (int y = 0; y < dh; y += 3 * sl) canvas.drawRect(x0, y0 + y, x0 + dw, y0 + y + sl, scan);
+        if (!animate) return;
+        int bandH = Math.max(4, dh / 8), half = Math.max(1, bandH / 2);
+        int bandY = (int) ((SystemClock.uptimeMillis() / 24) % (dh + bandH)) - bandH;
+        for (int rel = 0; rel < bandH; ++rel) {
+            int y = bandY + rel;
+            if (y < 0 || y >= dh) continue;
+            int g = (half - Math.abs(rel - half)) * 22 / half;
+            if (g <= 0) continue;
+            glow.setColor(0xFF000000 | (g << 16) | (g << 8) | g);
+            canvas.drawRect(x0, y0 + y, x0 + dw, y0 + y + 1, glow);
         }
     }
 

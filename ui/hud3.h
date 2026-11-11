@@ -389,7 +389,7 @@
 	void hud3_corner_mark(uint32_t* data, size_t pitch, rect r, bool instant, bool submenu) {
 		const hud_theme_t th = hud_theme();
 		if (instant) {
-			const int x = r.to.x - d3(9), y = r.from.y + d3(3), t = d3(2) > 0 ? d3(2) : 1;
+			const int x = kbm_mode ? r.from.x + d3(4) : r.to.x - d3(9), y = r.from.y + d3(3), t = d3(2) > 0 ? d3(2) : 1;
 			hud3_stroke(data, pitch, x + d3(3), y, x, y + d3(5), th.amber, t);
 			hud3_stroke(data, pitch, x, y + d3(5), x + d3(4), y + d3(5), th.amber, t);
 			hud3_stroke(data, pitch, x + d3(4), y + d3(5), x + d3(1), y + d3(10), th.amber, t);
@@ -428,6 +428,7 @@
 			} else draw_card_label(data, pitch, r, b.label);
 			if (hud3_labels_everywhere && !hud3_arc_dock()) hud3_text_c(data, pitch, r, r.to.y - d3(7), b.label, 0xffb8c0c8u, 100);
 			hud3_corner_mark(data, pitch, r, hud3_instant(b), hud3_submenu(b));
+			kbm_draw_card_key(data, pitch, r, i, 85);
 			if (!b.available) {
 				blend_rect_rgba(data, pitch, r, th.dim_rgb, 150);
 				if (!hud3_arc_dock()) line_rectangle_rgba(data, pitch, r, th.dim_line);

@@ -132,6 +132,21 @@ public class OpenBWActivity extends SDLActivity {
      * frame against the window height. Attached once, on the first keyboard
      * request, and left in place: it is a cheap comparison per layout pass.
      */
+    // With a hardware keyboard Android draws its translucent "focused" highlight over the
+    // focused view; after the chat SDL refocuses the game surface, so the whole screen
+    // stayed tinted. Keep the highlight off for every view that takes focus.
+    private void noFocusHighlight() {
+        if (android.os.Build.VERSION.SDK_INT < 26) return;
+        try {
+            if (mSurface != null) mSurface.setDefaultFocusHighlightEnabled(false);
+            getWindow().getDecorView().setDefaultFocusHighlightEnabled(false);
+            getWindow().getDecorView().getViewTreeObserver().addOnGlobalFocusChangeListener((oldF, newF) -> {
+                if (newF != null) newF.setDefaultFocusHighlightEnabled(false);
+            });
+        } catch (Throwable ignored) {
+        }
+    }
+
     private boolean imeWatchAttached = false;
     private int lastImeHeight = -1;
 
@@ -200,6 +215,7 @@ public class OpenBWActivity extends SDLActivity {
     public static final String EXTRA_VS_AI = "vsAi"; // melee: opponents run the aiscript AI
     public static final String EXTRA_PLAYER_NAME = "playerName"; // UserID: shown as the player's "Name"
     public static final String EXTRA_NAME_PORTRAITS = "namePortraits"; // LAN: "id=name|id=name" (render-only)
+    public static final String EXTRA_KBM_PLAYERS = "kbmPlayers"; // LAN: "name|name" in keyboard + mouse mode (render-only)
     public static final String EXTRA_GAME_SPEED = "gameSpeed"; // int percent, 100 = normal
     public static final String EXTRA_RENDER_SCALE = "renderScale";
     public static final String EXTRA_SHOW_QUEUE = "showQueue"; // HUD QUEUE toggle visibility
@@ -304,6 +320,8 @@ public class OpenBWActivity extends SDLActivity {
         // LAN: the launcher lobby's "id=name|id=name" portrait list (render-only).
         String namePortraits = getIntent().getStringExtra(EXTRA_NAME_PORTRAITS);
         if (namePortraits != null && !namePortraits.isEmpty()) { args.add("--name-portraits"); args.add(namePortraits); }
+        String kbmPlayers = getIntent().getStringExtra(EXTRA_KBM_PLAYERS);
+        if (kbmPlayers != null && !kbmPlayers.isEmpty()) { args.add("--kbm-players"); args.add(kbmPlayers); }
         args.add("--scale");
         args.add(String.valueOf(getIntent().getIntExtra(EXTRA_RENDER_SCALE, 2)));
         args.add("--show-queue");
@@ -429,6 +447,9 @@ public class OpenBWActivity extends SDLActivity {
         args.add("--camera-speed");  args.add(String.valueOf(dev.getInt("cameraSpeed", 100)));
         args.add("--tap-command");   args.add(dev.getBoolean("tapCommand", true) ? "1" : "0");
         args.add("--mouse-buttons"); args.add(String.valueOf(dev.getInt("mouseButtons", 1)));
+        args.add("--input-mode");    args.add(Keybinds.kbm(dev) ? "kbm" : "touch");
+        args.add("--edge-scroll");   args.add(dev.getBoolean("edgeScroll", true) ? "1" : "0");
+        args.add("--key-binds");     args.add(Keybinds.arg(dev));
         args.add("--render-interp"); args.add(dev.getBoolean("renderInterp", true) ? "1" : "0");
         args.add("--zoom-buttons");  args.add(dev.getBoolean("showZoomButtons", false) ? "1" : "0");
         // HUD style (Settings > Interface): v2 "Klasikinis" (default) or v3 "Lietimo".
@@ -546,6 +567,7 @@ public class OpenBWActivity extends SDLActivity {
             installPenHover();
         } catch (Throwable ignored) {
         }
+        noFocusHighlight();
         installTestMouse();
         try {
             addOverlayControls();

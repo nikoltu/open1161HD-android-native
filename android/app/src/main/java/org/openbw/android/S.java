@@ -726,6 +726,65 @@ final class S {
         p("Klasikinis: kairysis žymi, dešinysis duoda komandą (laikant — komandų ratas, tempiant — kamera). Kaip pirštas: kairysis veikia kaip pirštas, dešiniuoju tempiama kamera. Vidurinis mygtukas tempia kamerą, ratukas keičia mastelį.",
           "Classic: left selects, right commands (hold for the command wheel, drag to move the camera). As a finger: left works like a finger, right drags the camera. The middle button drags the camera, the wheel zooms.");
         p("Kaip pirštas", "As a finger");
+        p("Kaip pelė veikia lietimo režime. Kaip pirštas — kairysis mygtukas yra pirštas (bakstelėti, laikyti, tempti), dešiniuoju tempiama kamera. Klasikinis — kairysis tik žymi (spustelėjimas, dvigubas spustelėjimas, rėmelis); dešinysis: spustelėjimas — komanda į tą vietą, laikymas — komandų ratas, tempimas — kamera. Sukeisti — kaip Klasikinis, tik kairysis ir dešinysis sukeisti vietomis (kairiarankiams). Visada: vidurinis mygtukas tempia kamerą, ratukas keičia mastelį.",
+          "How the mouse works in touch mode. As a finger: the left button is a finger (tap, hold, drag), the right button drags the camera. Classic: left only selects (click, double click, box); right: a click orders to that spot, a hold opens the command wheel, a drag moves the camera. Swapped: like Classic with left and right exchanged (left-handed). Always: the middle button drags the camera, the wheel zooms.");
+        // --- keyboard + mouse mode ---
+        p("Įvesties režimas", "Input mode");
+        p("Klaviatūra + pelė: kairysis žymi (ir rėmeliu), dešinysis duoda komandą, kamera — ekrano kraštu ir klavišais, klavišai komandoms ir grupėms. LAN žaidėjams prie vardo rodoma klaviatūros žymė.",
+          "Keyboard + mouse: left selects (and box-selects), right commands, the camera follows the screen edge and the keys, hotkeys for commands and groups. LAN players see a keyboard flag next to your name.");
+        p("Lietimas", "Touch");
+        p("Klaviatūra + pelė", "Keyboard + mouse");
+        p("Kamera ekrano kraštu", "Screen-edge scrolling");
+        p("Klaviatūra + pelė: pelė prie ekrano krašto slenka kamerą.", "Keyboard + mouse: the pointer at a screen edge moves the camera.");
+        p("Klavišai ir pelės mygtukai", "Keys and mouse buttons");
+        p("Komandų langeliai 1–9 — 3×3 kortelė (1–3 viršuje). Shift + komanda — į eilę; Ctrl + grupė — priskirti, Shift + grupė — pridėti, du kartus — kamera į grupę; Ctrl + kameros vieta — įsiminti.",
+          "Command slots 1–9 are the 3×3 card (1–3 on top). Shift + an order queues it; Ctrl + a group assigns, Shift + a group adds, twice moves the camera to it; Ctrl + a camera location stores it.");
+        p("Atstatyti numatytus", "Reset to defaults");
+        p("Klavišai atstatyti.", "Keys reset.");
+        p("Jau naudojama: ", "Already used by: ");
+        p("Spustelėkite pelės mygtuku žemiau esančiame lauke.", "Click a mouse button in the field below.");
+        p("Paspauskite klavišą arba spustelėkite pelės mygtuku žemiau esančiame lauke.", "Press a key, or click a mouse button in the field below.");
+        p("Čia tinka tik pelės mygtukas.", "Only a mouse button fits here.");
+        p("Šio klavišo priskirti negalima.", "This key cannot be bound.");
+        p("Žaidžia klaviatūra ir pele", "Keyboard and mouse player");
+        p("Jūs kuriate LAN lobby", "You are hosting a LAN lobby");
+        p("Jūs esate LAN lobby", "You are in a LAN lobby");
+        p("Kol esate LAN lobby, kito žaidimo pradėti negalima. Grįžkite į lobby arba jį palikite.",
+          "Another game cannot start while you are in a LAN lobby. Go back to the lobby or leave it.");
+        p("Palikti lobby ir pradėti", "Leave the lobby and start");
+        p("Grįžti į lobby", "Back to the lobby");
+        p("Atstatyti visus", "Reset all");
+        p("Atstatyti numatytą", "Reset to default");
+        p("Pelė", "Mouse");
+        p("Kamera", "Camera");
+        p("Komandų kortelė", "Command card");
+        p("Grupės", "Groups");
+        p("Kameros vietos", "Camera locations");
+        p("Žymėjimas", "Select");
+        p("Komanda", "Command");
+        p("Kameros tempimas", "Camera drag");
+        p("Kamera aukštyn", "Camera up");
+        p("Kamera žemyn", "Camera down");
+        p("Kamera kairėn", "Camera left");
+        p("Kamera dešinėn", "Camera right");
+        p("Komandos langelis", "Command slot");
+        p("Meniu", "Menu");
+        p("Pokalbis", "Chat");
+        p("Į paskutinį pavojų", "Last alert");
+        p("Laisvas darbininkas", "Idle worker");
+        p("Kariuomenė", "Army");
+        p("Centruoti į pažymėtus", "Center on selection");
+        p("Priartinti", "Zoom in");
+        p("Atitolinti", "Zoom out");
+        p("Grupė", "Group");
+        p("Kameros vieta", "Camera location");
+        p("Kairysis pelės", "Left mouse");
+        p("Vidurinis pelės", "Middle mouse");
+        p("Dešinysis pelės", "Right mouse");
+        p("Pelės atgal", "Mouse back");
+        p("Pelės pirmyn", "Mouse forward");
+        p("Pelės ", "Mouse ");
+        p("Tarpas", "Space");
         p("Sukeisti", "Swapped");
         p("Pažymėjus vienetus, bakstelėjimas žemėje/priešą duoda komandą (be ilgo paspaudimo). Savo vieneto bakstelėjimas vis tiek pažymi.",
           "With units selected, a tap on the ground/an enemy issues an order (no long-press). Tapping your own unit still selects it.");
