@@ -65,6 +65,12 @@
 		const int u = hud3_ppd_unfit_milli();
 		return u > 0 && hud3_ppd_milli() < u ? (int)((long long)hud3_ppd_milli() * 1000 / u) : 1000;
 	}
+	// A phone: game surface under 480 dp high (the launcher's rule), by aspect when the
+	// density is unknown. The shrunk text gets up to 35 % back there (hud_text_pct).
+	bool hud3_phone() const {
+		if (hud3_surface_dp_h > 0) return hud3_surface_dp_h < 480;
+		return screen_height > 0 && (long long)screen_width * 100 >= (long long)screen_height * 195;
+	}
 	int d3(int dp) const { long long v = (long long)dp * hud3_ppd_milli(); return (int)(v >= 0 ? (v + 500) / 1000 : (v - 500) / 1000); }
 	int W3() const { return (int)((long long)screen_width * 1000 / hud3_ppd_milli()); }
 	int H3() const { return (int)((long long)screen_height * 1000 / hud3_ppd_milli()); }

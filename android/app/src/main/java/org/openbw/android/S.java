@@ -613,6 +613,17 @@ final class S {
           "SD — classic 8-bit graphics (no SC:R). HD2 — HD at half resolution "
                 + "(recommended). FULL HD — full HD resolution (needs SC:R + a strong tablet).");
         p("Pasirinkti MPQ failus", "Choose MPQ files");
+        p("Pasirinkti žaidimo aplanką", "Choose the game folder");
+        p("arba failus", "or files");
+        p("Importuojami MPQ failai", "Importing MPQ files");
+        p("Importuojami žemėlapiai", "Importing maps");
+        p("Importuojami botai", "Importing bots");
+        p("Importuojami modai", "Importing mods");
+        p("Importuojami replay failai", "Importing replays");
+        p("Pasirinkti aplanką", "Choose folder");
+        p("MPQ failų nerasta", "No MPQ files found");
+        p("Šiame aplanke nėra StarCraft 1.16.1 MPQ failų. Pasirink aplanką, kuriame yra StarDat.mpq, BrooDat.mpq ir Patch_rt.mpq (nebūtina: StarCraft.mpq, BroodWar.mpq).",
+          "This folder has no StarCraft 1.16.1 MPQ files. Choose the folder that holds StarDat.mpq, BrooDat.mpq and Patch_rt.mpq (optional: StarCraft.mpq, BroodWar.mpq).");
         p("Trūksta MPQ: ", "Missing MPQ: ");
         p("MPQ failai rasti", "MPQ files found");
         p("Būtini failai", "Required files");
@@ -664,6 +675,10 @@ final class S {
         p("Dujos", "Gas");
         p("Taškai", "Score");
         p("Tu", "You");
+        p("Kompiuteris", "Computer");
+        p("Misijų sąrašas", "Mission list");
+        p("Iš naujo", "Restart");
+        p("Epizodas įveiktas", "Episode complete");
         p("Išsaugoti replay", "Save replay");
         p("Išsaugota: ", "Saved: ");
         p("Nepavyko išsaugoti replay.", "Could not save the replay.");
@@ -858,6 +873,24 @@ final class S {
         p("Įdiegti nepavyko: ", "Install failed: ");
         p("Įdiegta kopija pasirašyta kitu raktu. Ištrink programą ir įdiek atsisiųstą APK iš naujo (MPQ/CASC reikės importuoti dar kartą).", "The installed copy is signed with a different key. Uninstall the app and install the downloaded APK again (MPQ/CASC must be imported again).");
         p("Diegimas atšauktas.", "Installation cancelled.");
+        // v1.0.26 updater: resumable download, signer check, release page
+        p("Atnaujinimas jau atsisiunčiamas.", "The update is already downloading.");
+        p("jau atsisiųsta", "already downloaded");
+        p("Šiame leidime nėra APK — atsisiųsk jį iš leidimo puslapio.", "This release has no APK — download it from the release page.");
+        p("Atidaryti leidimo puslapį", "Open the release page");
+        p("Nepavyko atidaryti puslapio: ", "Could not open the page: ");
+        p("nepavyko sukurti aplanko", "could not create the folder");
+        p("nepavyko pakeisti seno failo", "could not replace the old file");
+        p("nepavyko išsaugoti failo", "could not keep the file");
+        p("Atsisiųsti nepavyko", "Download failed");
+        p("Bandyti dar kartą", "Try again");
+        p("Atnaujinti vietoje negalima", "Cannot update in place");
+        p("Įdiegta kopija pasirašyta kitu raktu nei leidimas (pvz., kūrimo versija). Android jos neatnaujins: ištrink programą ir įdiek APK iš leidimo puslapio (MPQ/CASC reikės importuoti dar kartą).",
+          "The installed copy is signed with a different key than the release (for example a development build). Android will not update it: uninstall the app and install the APK from the release page (MPQ/CASC must be imported again).");
+        p("Atnaujinimas atsisiųstas. Kad galėtų jį įdiegti, programai reikia leidimo diegti programas. Įjunk jį kitame lange ir grįžk — diegimas prasidės pats.",
+          "The update is downloaded. To install it the app needs permission to install apps. Turn it on in the next screen and come back — the installation starts by itself.");
+        p("Diegimas atšauktas. Atsisiųstas failas liko — „Tikrinti dabar“ įdiegs jį be naujo atsisiuntimo.",
+          "Installation cancelled. The downloaded file is kept — \"Check now\" installs it without downloading again.");
         p("Tikrinti atnaujinimus", "Check for updates");
         p("Paleidus launcherį klausia GitHub, ar išleista nauja versija.", "When the launcher starts, asks GitHub whether a new version is out.");
         p("Ši kūrimo versija automatiškai netikrina.", "This development build does not check automatically.");

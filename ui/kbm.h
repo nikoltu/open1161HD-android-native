@@ -99,7 +99,7 @@
 			return;
 		}
 		if (pause_screen != 0) {
-			if (a == kb_cancel) { if (pause_screen > 1) pause_screen = 1; else close_pause_menu(); }
+			if (a == kb_cancel) { if (pause_screen > 1 && pause_screen != 10) pause_screen = 1; else close_pause_menu(); }
 			return;
 		}
 		if (briefing_active || lobby_mode) return;

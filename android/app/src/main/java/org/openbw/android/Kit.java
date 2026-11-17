@@ -292,7 +292,9 @@ class Kit {
         return row;
     }
 
-    Dialog modal(View content, boolean fullScreen) {
+    Dialog modal(View content, boolean fullScreen) { return modal(content, fullScreen, true); }
+
+    Dialog modal(View content, boolean fullScreen, final boolean cancelable) {
         // panels swish in and out, like the original menu's
         final Dialog d = new Dialog(a, android.R.style.Theme_Translucent_NoTitleBar) {
             @Override public void show() { MenuAudio.play(MenuAudio.OPEN); super.show(); }
@@ -300,7 +302,7 @@ class Kit {
         };
         FrameLayout scrim = new FrameLayout(a);
         scrim.setBackgroundColor(fullScreen ? 0xF205080A : 0xB8000000);
-        scrim.setOnClickListener(v -> { if (!fullScreen) d.dismiss(); });
+        scrim.setOnClickListener(v -> { if (!fullScreen && cancelable) d.dismiss(); });
         content.setClickable(true);   // taps on the panel must not fall through to the scrim
         int m = fullScreen ? dp(12) : 0;
         FrameLayout.LayoutParams lp = fullScreen
@@ -317,5 +319,35 @@ class Kit {
             if (compact) w.getDecorView().setSystemUiVisibility(IMMERSIVE_FLAGS);   // keep the bars hidden on phones
         }
         return d;
+    }
+
+    /**
+     * v1.0.26: the launcher's toast -- a Kit pill over the bottom of the activity
+     * instead of the system's grey one. Returns a canceller. Without a live activity
+     * (e.g. an application context) it falls back to the system toast.
+     */
+    static Runnable toast(android.content.Context c, CharSequence msg, int duration) {
+        if (!(c instanceof Activity) || ((Activity) c).isFinishing()) {
+            final android.widget.Toast t = android.widget.Toast.makeText(c, msg, duration);
+            t.show();
+            return t::cancel;
+        }
+        final Activity act = (Activity) c;
+        final Kit k = new Kit(act);
+        final ViewGroup root = (ViewGroup) act.getWindow().getDecorView();
+        final TextView t = k.text(String.valueOf(msg), TEXT, k.compact ? 13 : 15);
+        t.setBackground(k.box(0xF20B1114, LABEL));
+        t.setPadding(k.dp(18), k.dp(10), k.dp(18), k.dp(10));
+        t.setGravity(Gravity.CENTER);
+        t.setMaxWidth(act.getResources().getDisplayMetrics().widthPixels - k.dp(48));
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        lp.bottomMargin = k.dp(k.compact ? 24 : 48);
+        t.setAlpha(0f);
+        root.addView(t, lp);
+        t.animate().alpha(1f).setDuration(150).start();
+        final Runnable remove = () -> t.animate().alpha(0f).setDuration(200).withEndAction(() -> root.removeView(t)).start();
+        t.postDelayed(remove, duration == android.widget.Toast.LENGTH_LONG ? 3500 : 2000);
+        return () -> { t.removeCallbacks(remove); remove.run(); };
     }
 }

@@ -1,7 +1,7 @@
 package org.openbw.android;
 
 import android.app.Activity;
-import android.app.AlertDialog;
+import android.app.Dialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
@@ -54,6 +54,7 @@ public class SetupActivity extends Activity {
     private static final int REQ_PICK_BOT = 4;
     private static final int REQ_PICK_MOD = 5; // v0.26: mod .zip packages
     private static final int REQ_PICK_SCR = 6; // open1161hd: SC:R install folder (CASC source)
+    private static final int REQ_PICK_MPQ_DIR = 7; // v1.0.26: folder that holds the 1.16.1 MPQs
     private TextView scrStatus;                 // Faze 6: green "SC:R OK" / red "no folder"
     private View scrIndicator;                  // green when an SC:R folder is set
 
@@ -274,7 +275,7 @@ public class SetupActivity extends Activity {
                 dg.delete();
                 if ("full".equals(prefs().getString("gfxTier", "hd2"))) {
                     prefs().edit().putString("gfxTier", "hd2").apply();
-                    Toast.makeText(this, S.t("FULL HD buvo per lėtas šiam įrenginiui — grafika perjungta į HD2."), Toast.LENGTH_LONG).show();
+                    Kit.toast(this, S.t("FULL HD buvo per lėtas šiam įrenginiui — grafika perjungta į HD2."), Toast.LENGTH_LONG);
                 }
             }
         } catch (Exception e) {}
@@ -482,50 +483,18 @@ public class SetupActivity extends Activity {
         // v0.69 item 14: after-action score screen. Shown before anything else
         // so it is the first thing the player sees coming out of a match; it
         // owns the whole window (not a tab) and is dismissed with Return.
-        if (!gateMode && showScoreScreenIfPending()) return;
-        // v0.26 campaign progression: the native side leaves the next mission
-        // dir in campaign-next.txt after a campaign victory.
-        try {
-            java.io.File f = new java.io.File(getExternalFilesDir(null), "campaign-next.txt");
-            if (f.isFile()) {
-                byte[] b = new byte[(int) f.length()];
-                java.io.FileInputStream in = new java.io.FileInputStream(f);
-                int n = in.read(b);
-                in.close();
-                f.delete();
-                String next = n > 0 ? new String(b, 0, n).trim() : "";
-                // Record the just-beaten mission for the picker's checkmarks.
-                String prev = getCampaignDir();
-                if (!prev.isEmpty()) {
-                    java.util.Set<String> done = new java.util.HashSet<>(getCampaignDone());
-                    done.add(prev);
-                    setCampaignDone(done);
-                }
-                if (next.isEmpty()) {
-                    setCampaignDir("");
-                    new AlertDialog.Builder(this)
-                            .setTitle(S.t("Kampanija baigta!"))
-                            .setMessage(S.t("Sveikiname — įveikei visą epizodą!"))
-                            .setPositiveButton(S.t("Gerai"), (d, w) -> recreate())
-                            .setCancelable(false)
-                            .show();
-                } else {
-                    // v0.33 seamless progression: offer to continue straight to the
-                    // next mission instead of making the player re-navigate + START.
-                    setCampaignDir(next);
-                    String nextName = campaignDisplayName(next);
-                    new AlertDialog.Builder(this)
-                            .setTitle(S.t("Misija įveikta!"))
-                            .setMessage(S.t("Kita misija:\n") + nextName)
-                            .setPositiveButton(S.t("Tęsti"), (d, w) -> launchCampaignMission(next))
-                            .setNegativeButton(S.t("Į meniu"), (d, w) -> recreate())
-                            .setCancelable(false)
-                            .show();
-                }
-                return;
-            }
-        } catch (Exception ignored) {
+        // v0.26 campaign progression: the native side leaves the next mission dir in
+        // campaign-next.txt after a campaign victory. v1.0.26: recorded silently --
+        // the campaign score screen offers Mission list / Restart / Continue instead
+        // of the old "Mission complete" dialog.
+        String[] outcome = consumeCampaignNext();
+        if (!gateMode && showScoreScreenIfPending(outcome)) return;
+        if (outcome != null) {
+            // no score (Skip Tutorial): straight to the episode's list, next mission selected
+            String ep = episodeTitleFor(outcome[1].isEmpty() ? outcome[0] : outcome[1]);
+            if (!ep.isEmpty()) prefs().edit().putString("returnToEpisode", ep).apply();
         }
+        if (launchIfPending()) return;   // Restart / Continue from the campaign score screen
         // v0.83.015: if we came back from a campaign mission and the activity
         // was NOT recreated (onCreate did not run -- the S8U case), land on the
         // episode's mission list instead of whatever tab was last shown.
@@ -811,7 +780,7 @@ public class SetupActivity extends Activity {
 
     private void addQolChip(ViewGroup parent, String shortLabel, final String full, final String key, boolean def) {
         TextView c = kit.chip(shortLabel, prefs().getBoolean(key, def), on -> prefs().edit().putBoolean(key, on).apply());
-        c.setOnLongClickListener(v -> { Toast.makeText(this, full, Toast.LENGTH_LONG).show(); return true; });
+        c.setOnLongClickListener(v -> { Kit.toast(this, full, Toast.LENGTH_LONG); return true; });
         parent.addView(c);
     }
 
@@ -877,7 +846,7 @@ public class SetupActivity extends Activity {
             if (useBot && selBot != null) for (int k = 0; k != moreBot.size(); ++k)
                 if (selBot.equals(moreBot.get(k))) moreLabel = more.get(k);
         }
-        TextView moreBtn = kit.smallButton(moreLabel + "  \u25BE", () -> new AlertDialog.Builder(this)
+        TextView moreBtn = kit.smallButton(moreLabel + "  \u25BE", () -> new KitDialog(this)
                 .setItems(more.toArray(new String[0]), (d, which) -> {
                     String f = moreBot.get(which);
                     if (f == null) { pickFiles(REQ_PICK_BOT); return; }
@@ -912,7 +881,7 @@ public class SetupActivity extends Activity {
         b.setAllCaps(false);
         int cur = selected >= 0 && selected < labels.length ? selected : 0;
         b.setText(labels[cur] + "  ▾");
-        b.setOnClickListener(v -> new AlertDialog.Builder(this)
+        b.setOnClickListener(v -> new KitDialog(this)
                 .setItems(labels, (d, which) -> {
                     b.setText(labels[which] + "  ▾");
                     onPick.accept(which);
@@ -949,7 +918,7 @@ public class SetupActivity extends Activity {
             grid.setOrientation(LinearLayout.VERTICAL);
             grid.setPadding(dp(18), dp(16), dp(18), dp(8));
             grid.setGravity(Gravity.CENTER_HORIZONTAL);
-            final AlertDialog[] dlg = new AlertDialog[1];
+            final Dialog[] dlg = new Dialog[1];
             final int perRow = 5;
             LinearLayout[] rowRef = { null };
             int shown = 0;
@@ -975,7 +944,7 @@ public class SetupActivity extends Activity {
                 });
                 rowRef[0].addView(sw);
             }
-            dlg[0] = new AlertDialog.Builder(this).setTitle(S.t("Spalva")).setView(grid)
+            dlg[0] = new KitDialog(this).setTitle(S.t("Spalva")).setView(grid)
                     .setNegativeButton(S.t("Atšaukti"), null).create();
             dlg[0].show();
         });
@@ -1041,7 +1010,7 @@ public class SetupActivity extends Activity {
             pv.setBorderColor(PLAYER_COLORS[idx % PLAYER_COLORS.length]);
         }));
         final String[] races = raceNames();
-        TextView raceBtn = kit.smallButton(races[raceIdx] + "  \u25BE", () -> new AlertDialog.Builder(this)
+        TextView raceBtn = kit.smallButton(races[raceIdx] + "  \u25BE", () -> new KitDialog(this)
                 .setItems(races, (d, which) -> {
                     prefs().edit().putInt("spRace." + slot, RACE_VALUES[which]).apply();
                     rebuildPlayerRaces();   // the row's caption and the AI portrait follow the race
@@ -1311,14 +1280,14 @@ public class SetupActivity extends Activity {
     // Join by address: ask that one device what it hosts, then join it like a scanned host.
     private void mpJoinByIp() {
         final String ip = joinIpField.getText().toString().trim();
-        if (ip.isEmpty()) { Toast.makeText(this, S.t("Įveskite host IP."), Toast.LENGTH_LONG).show(); return; }
-        Toast.makeText(this, S.t("Ieškoma…"), Toast.LENGTH_SHORT).show();
+        if (ip.isEmpty()) { Kit.toast(this, S.t("Įveskite host IP."), Toast.LENGTH_LONG); return; }
+        Kit.toast(this, S.t("Ieškoma…"), Toast.LENGTH_SHORT);
         new Thread(() -> {
             final List<java.net.InetAddress> one = new ArrayList<>();
             try { one.add(java.net.InetAddress.getByName(ip)); } catch (Exception ignored) {}
             final List<LanLobby.HostInfo> hosts = one.isEmpty() ? new ArrayList<LanLobby.HostInfo>() : LanLobby.scan(one, 1500);
             ui.post(() -> {
-                if (hosts.isEmpty()) Toast.makeText(this, S.t("Hostas neatsako: ") + ip, Toast.LENGTH_LONG).show();
+                if (hosts.isEmpty()) Kit.toast(this, S.t("Hostas neatsako: ") + ip, Toast.LENGTH_LONG);
                 else mpJoinHost(hosts.get(0));
             });
         }, "mp-ip").start();
@@ -1376,9 +1345,9 @@ public class SetupActivity extends Activity {
     }
 
     private void mpStartHosting() {
-        if (!mpqMissing().isEmpty()) { Toast.makeText(this, S.t("Pirma importuokite MPQ failus."), Toast.LENGTH_LONG).show(); return; }
+        if (!mpqMissing().isEmpty()) { Kit.toast(this, S.t("Pirma importuokite MPQ failus."), Toast.LENGTH_LONG); return; }
         if (selectedMap == null && selectedMpqMap == null) {
-            Toast.makeText(this, S.t("Pasirinkite žemėlapį."), Toast.LENGTH_LONG).show();
+            Kit.toast(this, S.t("Pasirinkite žemėlapį."), Toast.LENGTH_LONG);
             return;
         }
         String mapId = selectedMpqMap != null ? selectedMpqMap : selectedMap.getName();
@@ -1481,8 +1450,8 @@ public class SetupActivity extends Activity {
 
     private void mpJoinHost(LanLobby.HostInfo h) {
         if (!mpHaveMap(h.map)) {
-            Toast.makeText(this, S.t("Tu neturi parsisiuntęs šio žemėlapio: ") + mapBasename(h.map)
-                    + S.t(". Importuok jį arba pridėk MPQ."), Toast.LENGTH_LONG).show();
+            Kit.toast(this, S.t("Tu neturi parsisiuntęs šio žemėlapio: ") + mapBasename(h.map)
+                    + S.t(". Importuok jį arba pridėk MPQ."), Toast.LENGTH_LONG);
             return;
         }
         mpResolveMapSelection(h.map);
@@ -1626,7 +1595,7 @@ public class SetupActivity extends Activity {
             // Race picker on my own slot.
             if (isMe) {
                 final String[] races = raceNames();
-                TextView raceBtn = kit.smallButton(races[indexOfRace(sl.race)] + "  \u25BE", () -> new AlertDialog.Builder(this)
+                TextView raceBtn = kit.smallButton(races[indexOfRace(sl.race)] + "  \u25BE", () -> new KitDialog(this)
                         .setItems(races, (d, which) -> {
                             int rv = RACE_VALUES[which];
                             prefs().edit().putInt("race", rv).apply();
@@ -1659,7 +1628,7 @@ public class SetupActivity extends Activity {
         Intent i = new Intent(this, OpenBWActivity.class);
         if (selectedMpqMap != null) i.putExtra(OpenBWActivity.EXTRA_MAP_MPQ, selectedMpqMap);
         else if (selectedMap != null) i.putExtra(OpenBWActivity.EXTRA_MAP, selectedMap.getAbsolutePath());
-        else { Toast.makeText(this, S.t("Žemėlapis nerastas."), Toast.LENGTH_LONG).show(); return; }
+        else { Kit.toast(this, S.t("Žemėlapis nerastas."), Toast.LENGTH_LONG); return; }
         i.putExtra(OpenBWActivity.EXTRA_RACE, race);
         i.putExtra(OpenBWActivity.EXTRA_PLAYERS, players > 0 ? players : clampCount(prefs().getInt("playerCount", 2)));
         if (isHost) i.putExtra(OpenBWActivity.EXTRA_NET_HOST, true);
@@ -1720,7 +1689,7 @@ public class SetupActivity extends Activity {
             launchNetGame(isHost, hostIp, race, sp, pl);
         }
         @Override public void onError(String msg) {
-            Toast.makeText(SetupActivity.this, S.t(msg), Toast.LENGTH_LONG).show();
+            Kit.toast(SetupActivity.this, S.t(msg), Toast.LENGTH_LONG);
             mpLeaveLobby();
             if (activeTab != TAB_MULTI) setLanAttention(true);
         }
@@ -1757,7 +1726,7 @@ public class SetupActivity extends Activity {
     // (launchNetGame / launchCampaignMission).
     private void startGame() {
         if (!mpqMissing().isEmpty()) {
-            Toast.makeText(this, S.t("Pirma importuokite MPQ failus."), Toast.LENGTH_LONG).show();
+            Kit.toast(this, S.t("Pirma importuokite MPQ failus."), Toast.LENGTH_LONG);
             return;
         }
         if (activeTab == TAB_REPLAY) {
@@ -1774,7 +1743,7 @@ public class SetupActivity extends Activity {
         if (activeTab != TAB_SINGLE) return;
         // melee from the selected map (imported file or a map bundled inside the MPQ archives)
         if (selectedMap == null && selectedMpqMap == null) {
-            Toast.makeText(this, S.t("Pasirinkite žemėlapį."), Toast.LENGTH_LONG).show();
+            Kit.toast(this, S.t("Pasirinkite žemėlapį."), Toast.LENGTH_LONG);
             return;
         }
         int race = spSlotRace(0);
@@ -1822,9 +1791,11 @@ public class SetupActivity extends Activity {
     // post-victory "Continue" progression).
     private void launchCampaignMission(String campaignDir) {
         if (!mpqMissing().isEmpty()) {
-            Toast.makeText(this, S.t("Pirma importuokite MPQ failus."), Toast.LENGTH_LONG).show();
+            Kit.toast(this, S.t("Pirma importuokite MPQ failus."), Toast.LENGTH_LONG);
             return;
         }
+        // the progression on return reads the played mission from here
+        setCampaignDir(campaignDir);
         // v0.79 item 1: remember which episode this mission came from, so the
         // launcher returns to that mission list rather than dumping the player
         // back on Single Player - which is where recreate() lands by default.
@@ -1857,6 +1828,44 @@ public class SetupActivity extends Activity {
         if (!rep.exists()) return false;
         selectTab(TAB_REPLAY);
         selectReplayFile(rep);
+        return true;
+    }
+
+    // campaign-next.txt -> {played mission, next mission ("" = the episode is over)},
+    // with the played one marked done and the profile moved on; null when absent.
+    private String[] consumeCampaignNext() {
+        File f = new File(getExternalFilesDir(null), "campaign-next.txt");
+        if (!f.isFile()) return null;
+        String next = "";
+        try (java.io.FileInputStream in = new java.io.FileInputStream(f)) {
+            byte[] b = new byte[(int) f.length()];
+            int n = in.read(b);
+            next = n > 0 ? new String(b, 0, n).trim() : "";
+        } catch (Exception ignored) {
+        }
+        f.delete();
+        String prev = getCampaignDir();
+        if (!prev.isEmpty()) {
+            java.util.Set<String> done = new java.util.HashSet<>(getCampaignDone());
+            done.add(prev);
+            setCampaignDone(done);
+        }
+        setCampaignDir(next);
+        return new String[]{prev, next};
+    }
+
+    // Score screen buttons that start a game go through a rebuild first, so the
+    // launcher underneath is the normal one again when the game returns.
+    private void launchAfterRecreate(String campaignDir) {
+        prefs().edit().putString("launchAfterRecreate", campaignDir).apply();
+        recreate();
+    }
+
+    private boolean launchIfPending() {
+        String dir = prefs().getString("launchAfterRecreate", "");
+        if (dir.isEmpty()) return false;
+        prefs().edit().remove("launchAfterRecreate").apply();
+        launchCampaignMission(dir);
         return true;
     }
 
@@ -2336,10 +2345,7 @@ public class SetupActivity extends Activity {
                 actionSummary.setText(mpState.slots.size() < 2 ? S.t("Laukiama žaidėjų…")
                         : waiting == 0 ? S.t("Visi pasiruošę.") : S.t("Laukiama pasirengimo: ") + waiting);
             } else if (mpSub == 0) {
-                String m = selectedMpqMap != null ? (selectedMpqMapName != null ? selectedMpqMapName : mapBasename(selectedMpqMap))
-                        : selectedMap != null ? selectedMap.getName() : S.t("žemėlapis nepasirinktas");
-                actionSummary.setText(clampCount(prefs().getInt("playerCount", 2)) + " " + S.t("žaidėjai") + "  ·  " + m
-                        + "  ·  " + S.t("greitis: ") + gameSpeedName(String.valueOf(prefs().getInt("gameSpeed", 100))));
+                actionSummary.setText("");   // v1.0.26: the map list already shows the pick
             } else {
                 actionSummary.setText(mpSelHost == null ? S.t("Pasirink hostą sąraše.")
                         : S.t("Pasirinktas hostas: ") + (mpSelHost.name.isEmpty() ? mpSelHost.ip : mpSelHost.name) + "  ·  " + mapBasename(mpSelHost.map));
@@ -2367,12 +2373,8 @@ public class SetupActivity extends Activity {
             actionSummary.setText(dir.isEmpty() ? S.t("Pasirink epizodą.") : campaignDisplayName(dir));
             return;
         }
-        if (activeTab != TAB_SINGLE) { actionSummary.setText(""); return; }
-        int count = clampCount(prefs().getInt("playerCount", 2));
-        String map = selectedMpqMap != null ? (selectedMpqMapName != null ? selectedMpqMapName : mapBasename(selectedMpqMap))
-                : selectedMap != null ? selectedMap.getName() : S.t("žemėlapis nepasirinktas");
-        String opp = opponentKindLabel();
-        actionSummary.setText(count + " " + S.t("žaidėjai") + "  ·  " + map + "  ·  " + opp);
+        // Single Player: nothing -- players, map and opponent are on the screen itself (v1.0.26)
+        actionSummary.setText("");
     }
 
     // Game mode (v0.20): melee (default), UMS (map's own triggers/units) or a
@@ -2485,36 +2487,26 @@ public class SetupActivity extends Activity {
             final String[] filters = {S.t("Visi"), S.t("Aktyvūs"), S.t("Įdiegtieji"), S.t("Talpykloje")};
             final TextView[] filterBtn = new TextView[1];
             filterBtn[0] = kit.smallButton(filters[modFilter] + "  \u25BE", () -> {
-                android.widget.PopupMenu pm = new android.widget.PopupMenu(this, filterBtn[0]);
-                for (int i = 0; i != filters.length; ++i) pm.getMenu().add(0, i, i, filters[i]);
-                pm.setOnMenuItemClickListener(it -> {
-                    modFilter = it.getItemId();
+                new KitDialog(this).setItems(filters, (d, which) -> {
+                    modFilter = which;
                     filterBtn[0].setText(filters[modFilter] + "  \u25BE");
                     renderModList();
-                    return true;
-                });
-                pm.show();
+                }).show();
             });
             LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34));
             flp.leftMargin = dp(6);
             row.addView(filterBtn[0], flp);
             final TextView[] more = new TextView[1];
             more[0] = kit.smallButton("\u22EF", () -> {
-                android.widget.PopupMenu pm = new android.widget.PopupMenu(this, more[0]);
-                pm.getMenu().add(0, 0, 0, S.t("Atnaujinti sąrašą"));
-                pm.getMenu().add(0, 1, 1, S.t("+ Modas (.zip)"));
-                pm.getMenu().add(0, 2, 2, S.t("+ Botas (.so)"));
-                pm.getMenu().add(0, 3, 3, S.t("Talpykla…"));
-                pm.setOnMenuItemClickListener(it -> {
-                    switch (it.getItemId()) {
+                new KitDialog(this).setItems(new String[]{S.t("Atnaujinti sąrašą"), S.t("+ Modas (.zip)"),
+                        S.t("+ Botas (.so)"), S.t("Talpykla…")}, (d, which) -> {
+                    switch (which) {
                         case 0: reloadRepo(); break;
                         case 1: pickFiles(REQ_PICK_MOD); break;
                         case 2: pickFiles(REQ_PICK_BOT); break;
                         default: configureRepo(); break;
                     }
-                    return true;
-                });
-                pm.show();
+                }).show();
             });
             more[0].setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
             LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(dp(44), dp(34));
@@ -2914,7 +2906,7 @@ public class SetupActivity extends Activity {
     private void activateMod(ModEntry e) {
         String why = modIncompatibleReason(e);
         if (why != null) {
-            new AlertDialog.Builder(this)
+            new KitDialog(this)
                     .setTitle(S.t("Nesuderinamas modas"))
                     .setMessage(e.name + "\n\n" + why)
                     .setPositiveButton(S.t("Gerai"), null)
@@ -2941,7 +2933,7 @@ public class SetupActivity extends Activity {
             msg.append("• ").append(c.getKey()).append(": ").append(c.getValue().name).append('\n');
             toDisable.add(c.getValue().id);
         }
-        new AlertDialog.Builder(this)
+        new KitDialog(this)
                 .setTitle(S.t("Ta pati kategorija jau užimta"))
                 .setMessage(S.t("Šias kategorijas jau teikia kitas aktyvus modas:") + "\n\n" + msg
                         + "\n" + S.t("Variklis kiekvienai kategorijai naudoja tik VIENĄ modą. Pakeisti?"))
@@ -3011,13 +3003,13 @@ public class SetupActivity extends Activity {
         return b;
     }
     private void confirmUninstallMod(ModEntry e) {
-        new AlertDialog.Builder(this)
+        new KitDialog(this)
                 .setTitle(S.t("Pašalinti modą?"))
                 .setMessage(e.name + "\n" + S.t("Failai bus ištrinti iš įrenginio."))
                 .setPositiveButton(S.t("Pašalinti"), (d, w) -> {
                     deleteRecursive(new File(new File(getExternalFilesDir(null), "mods"), e.id));
                     prefs().edit().remove("mod_" + e.id).apply();
-                    Toast.makeText(this, S.t("Pašalinta: ") + e.name, Toast.LENGTH_SHORT).show();
+                    Kit.toast(this, S.t("Pašalinta: ") + e.name, Toast.LENGTH_SHORT);
                     selectMod(null);
                 })
                 .setNegativeButton(S.t("Atšaukti"), null)
@@ -3072,7 +3064,7 @@ public class SetupActivity extends Activity {
         note.setPadding(0, dp(8), 0, 0);
         box.addView(note);
 
-        new AlertDialog.Builder(this)
+        new KitDialog(this)
                 .setTitle(S.t("Modų talpyklos adresas"))
                 .setView(box)
                 .setPositiveButton(S.t("Išsaugoti + gauti"), (d, w) -> {
@@ -3090,10 +3082,10 @@ public class SetupActivity extends Activity {
 
     private void reloadRepo() {
         String base = modRepoUrl();
-        if (base.isEmpty()) { Toast.makeText(this, S.t("Nustatyk talpyklos adresą (mygtukas žemiau)."), Toast.LENGTH_SHORT).show(); return; }
+        if (base.isEmpty()) { Kit.toast(this, S.t("Nustatyk talpyklos adresą (mygtukas žemiau)."), Toast.LENGTH_SHORT); return; }
         final boolean quiet = repoQuiet;
         repoQuiet = false;
-        if (!quiet) Toast.makeText(this, S.t("Gaunamas talpyklos sąrašas…"), Toast.LENGTH_SHORT).show();
+        if (!quiet) Kit.toast(this, S.t("Gaunamas talpyklos sąrašas…"), Toast.LENGTH_SHORT);
         final String b = base;
         new Thread(() -> {
             try {
@@ -3131,7 +3123,7 @@ public class SetupActivity extends Activity {
                     repoCache.clear();
                     repoCache.addAll(mods);
                     renderModList();
-                    if (!quiet) Toast.makeText(this, S.t("Talpykla: ") + mods.size() + S.t(" modų."), Toast.LENGTH_SHORT).show();
+                    if (!quiet) Kit.toast(this, S.t("Talpykla: ") + mods.size() + S.t(" modų."), Toast.LENGTH_SHORT);
                 });
             } catch (Exception e) {
                 // v0.83.010: log it. A toast is gone in three seconds and says
@@ -3141,7 +3133,7 @@ public class SetupActivity extends Activity {
                 android.util.Log.w("openbw-mods", "repo fetch failed: " + e, e);
                 final String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
                 if (!quiet) new Handler(Looper.getMainLooper()).post(() ->
-                        Toast.makeText(this, S.t("Talpykla nepasiekiama: ") + msg, Toast.LENGTH_LONG).show());
+                        Kit.toast(this, S.t("Talpykla nepasiekiama: ") + msg, Toast.LENGTH_LONG));
             }
         }, "modstore").start();
     }
@@ -3150,7 +3142,7 @@ public class SetupActivity extends Activity {
         final String id = m.optString("id", "").replaceAll("[^A-Za-z0-9._-]", "_");
         String u = m.optString("url", "");
         if (id.isEmpty() || u.isEmpty()) {
-            Toast.makeText(this, S.t("Netinkamas talpyklos įrašas."), Toast.LENGTH_LONG).show();
+            Kit.toast(this, S.t("Netinkamas talpyklos įrašas."), Toast.LENGTH_LONG);
             return;
         }
         final String url = u.startsWith("http") ? u : base + "/" + u;
@@ -3163,7 +3155,7 @@ public class SetupActivity extends Activity {
         int emin = m.optInt("engine_min", 0), emax = m.optInt("engine_max", 0);
         int vc = versionCodeOf();
         if ((emin > 0 && vc < emin) || (emax > 0 && vc > emax)) {
-            new AlertDialog.Builder(this)
+            new KitDialog(this)
                     .setTitle(S.t("Nesuderinamas modas"))
                     .setMessage(id + "\n\n" + (emin > 0 && vc < emin
                             ? S.t("Modui reikia naujesnės programos versijos (versionCode ≥ ") + emin + ")"
@@ -3178,7 +3170,7 @@ public class SetupActivity extends Activity {
         progressText.setPadding(pad, pad, pad, pad);
         progressText.setTextColor(Color.WHITE);
         progressText.setText(S.t("Siunčiama…"));
-        final AlertDialog dialog = new AlertDialog.Builder(this)
+        final Dialog dialog = new KitDialog(this)
                 .setTitle(S.t("Diegiamas modas: ") + id)
                 .setView(progressText).setCancelable(false).create();
         dialog.show();
@@ -3252,9 +3244,9 @@ public class SetupActivity extends Activity {
             new Handler(Looper.getMainLooper()).post(() -> {
                 dialog.dismiss();
                 if (errF != null) {
-                    Toast.makeText(this, S.t("Nepavyko įdiegti: ") + errF, Toast.LENGTH_LONG).show();
+                    Kit.toast(this, S.t("Nepavyko įdiegti: ") + errF, Toast.LENGTH_LONG);
                 } else {
-                    Toast.makeText(this, S.t("Įdiegta: ") + id, Toast.LENGTH_LONG).show();
+                    Kit.toast(this, S.t("Įdiegta: ") + id, Toast.LENGTH_LONG);
                     if (modListBox != null) selectMod(id); else renderModList();
                 }
             });
@@ -3903,17 +3895,18 @@ public class SetupActivity extends Activity {
         row.setPadding(dp(10), dp(compact ? 4 : 8), dp(10), dp(compact ? 4 : 8));
         row.setMinimumHeight(hdp(52));
 
-        TextView mark = kit.text(isDone ? "\u2713" : current ? "\u25B6" : unlocked ? "\u2022" : "\uD83D\uDD12",
-                isDone ? Kit.LABEL : current ? Kit.ACCENT : Kit.TEXT2, compact ? 14 : 16);
+        // v1.0.26: a tick for done missions, nothing else -- a locked one is
+        // only greyed out and cannot be picked.
+        TextView mark = kit.text(isDone ? "\u2713" : "", Kit.LABEL, compact ? 14 : 16);
         mark.setMinWidth(dp(compact ? 26 : 34));
         row.addView(mark);
         // the mark says the state; the detail panel's tag spells it out for the picked one
-        TextView tv = kit.text(name, unlocked ? Color.WHITE : Kit.TEXT2, compact ? 13 : 15);
+        TextView tv = kit.text(name, unlocked ? Color.WHITE : 0xFF55605A, compact ? 13 : 15);
         tv.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
         row.addView(tv);
 
         final int k = idx;
-        row.setOnClickListener(v -> selectMission(k));
+        if (unlocked) row.setOnClickListener(v -> selectMission(k));
         return row;
     }
 
@@ -3922,12 +3915,7 @@ public class SetupActivity extends Activity {
     private void selectMission(int idx) {
         Episode ep = campaignDetailEp;
         if (ep == null || idx < 0 || idx >= ep.missions.length) return;
-        if (!campaignRowUnlocked[idx]) {
-            Toast.makeText(this,
-                    S.t("Užrakinta — pirma įveik ankstesnę misiją."),
-                    Toast.LENGTH_LONG).show();
-            return;
-        }
+        if (!campaignRowUnlocked[idx]) return;   // locked rows are not clickable
         campaignSelIdx = idx;
         for (int k = 0; k < campaignRows.length; k++) {
             View row = campaignRows[k];
@@ -3959,7 +3947,7 @@ public class SetupActivity extends Activity {
         }
 
         int sc = isDone ? Kit.LABEL : current ? Kit.ACCENT : Kit.TEXT2;
-        detailStatus.setText(isDone ? "\u2713 " + S.t("Įveikta") : current ? "\u25B6 " + S.t("Dabartinė misija") : S.t("Prieinama"));
+        detailStatus.setText(isDone ? "\u2713 " + S.t("Įveikta") : current ? S.t("Dabartinė misija") : S.t("Prieinama"));
         detailStatus.setTextColor(sc);
         detailStatus.setBackground(kit.box(0x00000000, sc));
         updateStartButtonVisibility();   // START MISSION / REPLAY MISSION for this pick
@@ -4145,8 +4133,11 @@ public class SetupActivity extends Activity {
         LinearLayout.LayoutParams indLp = new LinearLayout.LayoutParams(dp(12), dp(12));
         indLp.rightMargin = dp(10);
         mpqRow.addView(mpqIndicator, 0, indLp);
-        mpqRow.addView(kit.smallButton(S.t("Importuoti MPQ failus"), () -> pickFiles(REQ_PICK_MPQ)),
+        mpqRow.addView(kit.smallButton(S.t("Pasirinkti aplanką"), this::pickMpqFolder),
                 new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(40)));
+        LinearLayout.LayoutParams mpqFilesLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(40));
+        mpqFilesLp.leftMargin = dp(8);
+        mpqRow.addView(kit.smallButton(S.t("Importuoti MPQ failus"), () -> pickFiles(REQ_PICK_MPQ)), mpqFilesLp);
         files.addView(mpqRow);
         mpqStatus = kit.text("", Kit.TEXT2, 12);
         mpqStatus.setPadding(dp(22), 0, 0, dp(10));
@@ -4165,7 +4156,7 @@ public class SetupActivity extends Activity {
         updateScrIndicator();
         // reset settings (keeps profiles, stats, campaign)
         LinearLayout resetRow = setRow(S.t("Atstatyti numatytus nustatymus"), S.t("Profiliai ir progresas lieka."));
-        resetRow.addView(kit.smallButton(S.t("Atstatyti"), () -> new AlertDialog.Builder(this)
+        resetRow.addView(kit.smallButton(S.t("Atstatyti"), () -> new KitDialog(this)
                 .setTitle(S.t("Atstatyti nustatymus?"))
                 .setMessage(S.t("Garsas, grafika, valdymas ir greitis grįš į numatytus. ")
                         + S.t("Profiliai, statistika ir kampanijos progresas NEBUS liesti."))
@@ -4530,7 +4521,7 @@ public class SetupActivity extends Activity {
         t.setPadding(dp(18), dp(10), dp(18), dp(10));
         ScrollView sv = new ScrollView(this);
         sv.addView(t);
-        new AlertDialog.Builder(this).setTitle(S.t("Licencijos")).setView(sv).setPositiveButton(S.t("Uždaryti"), null).show();
+        new KitDialog(this).setTitle(S.t("Licencijos")).setView(sv).setPositiveButton(S.t("Uždaryti"), null).show();
     }
 
     // Extract the APK-bundled bots (assets/bots/<abi>/lib<id>.so + assets/bots/
@@ -4614,7 +4605,7 @@ public class SetupActivity extends Activity {
         // All-files access is required so the native CASC reader can fopen the
         // real path. Ask for it first; the user grants it once, then re-taps.
         if (android.os.Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
-            new AlertDialog.Builder(this)
+            new KitDialog(this)
                     .setTitle(S.t("Reikia „Visų failų prieigos“"))
                     .setMessage(S.t("Suteik „Visų failų prieigą“ ir vėl paspausk „Pasirinkti SC:R aplanką“."))
                     .setPositiveButton(S.t("Atidaryti nustatymus"), (d, w) -> {
@@ -4633,7 +4624,7 @@ public class SetupActivity extends Activity {
         try {
             startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_PICK_SCR);
         } catch (Exception e) {
-            Toast.makeText(this, S.t("Nepavyko atidaryti aplankų parinkiklio"), Toast.LENGTH_SHORT).show();
+            Kit.toast(this, S.t("Nepavyko atidaryti aplankų parinkiklio"), Toast.LENGTH_SHORT);
         }
     }
 
@@ -4658,13 +4649,13 @@ public class SetupActivity extends Activity {
     private void onScrFolderPicked(Uri treeUri) {
         String path = treeUriToPath(treeUri);
         if (path == null) {
-            Toast.makeText(this, S.t("Nepavyko nustatyti aplanko kelio"), Toast.LENGTH_LONG).show();
+            Kit.toast(this, S.t("Nepavyko nustatyti aplanko kelio"), Toast.LENGTH_LONG);
             return;
         }
         File root = new File(path);
         boolean ok = new File(root, ".build.info").exists() && new File(root, "data/data").isDirectory();
         if (!ok) {
-            new AlertDialog.Builder(this)
+            new KitDialog(this)
                     .setTitle(S.t("Ne SC:R šaknis?"))
                     .setMessage(S.t("Tai ne SC:R įdiegimo aplankas. Pasirink aplanką, kuriame yra „data“ ir „.build.info“.") + "\n\n" + path)
                     .setPositiveButton(S.t("Gerai"), null)
@@ -4674,8 +4665,65 @@ public class SetupActivity extends Activity {
         // Faze 6: choosing a valid folder auto-enables CASC (no separate toggle).
         prefs().edit().putString("scrCascDir", path).apply();
         updateScrIndicator();
-        Toast.makeText(this, S.t("SC:R aplankas nustatytas"), Toast.LENGTH_SHORT).show();
+        Kit.toast(this, S.t("SC:R aplankas nustatytas"), Toast.LENGTH_SHORT);
         if (gateMode) setContentView(buildSetupGate());
+    }
+
+    // v1.0.26: the BW 1.16.1 game folder, picked once like the SC:R folder. The MPQs are
+    // still copied (the native reader needs them in app storage), but through SAF, so no
+    // all-files access is needed; only the known archive names are taken.
+    private void pickMpqFolder() {
+        try {
+            startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_PICK_MPQ_DIR);
+        } catch (Exception e) {
+            Kit.toast(this, S.t("Nepavyko atidaryti aplankų parinkiklio"), Toast.LENGTH_SHORT);
+        }
+    }
+
+    /** Known MPQs directly in the tree, else one folder level down (e.g. the parent of the install). */
+    private List<Uri> findMpqsInTree(Uri treeUri) {
+        List<Uri> found = new ArrayList<>();
+        String rootId = DocumentsContract.getTreeDocumentId(treeUri);
+        List<String> subdirs = new ArrayList<>();
+        listMpqChildren(treeUri, rootId, found, subdirs);
+        if (found.isEmpty()) {
+            for (String d : subdirs) {
+                listMpqChildren(treeUri, d, found, null);
+                if (!found.isEmpty()) break;
+            }
+        }
+        return found;
+    }
+
+    private void listMpqChildren(Uri treeUri, String docId, List<Uri> found, List<String> subdirs) {
+        Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId);
+        try (Cursor c = getContentResolver().query(children, new String[]{
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE}, null, null, null)) {
+            while (c != null && c.moveToNext()) {
+                String id = c.getString(0), name = c.getString(1), mime = c.getString(2);
+                if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) {
+                    if (subdirs != null) subdirs.add(id);
+                } else if (name != null && canonicalMpqName(name) != null) {
+                    found.add(DocumentsContract.buildDocumentUriUsingTree(treeUri, id));
+                }
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void onMpqFolderPicked(Uri treeUri) {
+        List<Uri> mpqs = findMpqsInTree(treeUri);
+        if (mpqs.isEmpty()) {
+            new KitDialog(this)
+                    .setTitle(S.t("MPQ failų nerasta"))
+                    .setMessage(S.t("Šiame aplanke nėra StarCraft 1.16.1 MPQ failų. Pasirink aplanką, kuriame yra StarDat.mpq, BrooDat.mpq ir Patch_rt.mpq (nebūtina: StarCraft.mpq, BroodWar.mpq)."))
+                    .setPositiveButton(S.t("Gerai"), null)
+                    .show();
+            return;
+        }
+        importInBackground(mpqs, REQ_PICK_MPQ);
     }
 
     @Override
@@ -4683,6 +4731,10 @@ public class SetupActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQ_PICK_SCR) {
             if (resultCode == RESULT_OK && data != null && data.getData() != null) onScrFolderPicked(data.getData());
+            return;
+        }
+        if (requestCode == REQ_PICK_MPQ_DIR) {
+            if (resultCode == RESULT_OK && data != null && data.getData() != null) onMpqFolderPicked(data.getData());
             return;
         }
         if (resultCode != RESULT_OK || data == null) return;
@@ -4707,12 +4759,13 @@ public class SetupActivity extends Activity {
         int pad = dp(24);
         progressText.setPadding(pad, pad, pad, pad);
         progressText.setTextColor(Color.WHITE);
+        progressText.setMinLines(2);   // "Copying:" + the file name; the dialog sizes to the first text
         progressText.setText(S.t("Ruošiamasi…"));
-        final AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle(isMpq ? "Importuojami MPQ failai"
+        final Dialog dialog = new KitDialog(this)
+                .setTitle(S.t(isMpq ? "Importuojami MPQ failai"
                         : isMap ? "Importuojami žemėlapiai"
                         : isBot ? "Importuojami botai"
-                        : isMod ? "Importuojami modai" : "Importuojami replay failai")
+                        : isMod ? "Importuojami modai" : "Importuojami replay failai"))
                 .setView(progressText)
                 .setCancelable(false)
                 .create();
@@ -4797,14 +4850,14 @@ public class SetupActivity extends Activity {
             ui.post(() -> {
                 dialog.dismiss();
                 if (!warnings.isEmpty()) {
-                    new AlertDialog.Builder(this)
+                    new KitDialog(this)
                             .setTitle(S.t("Importuota su pastabomis"))
                             .setMessage(S.t("Nukopijuota failų: ") + copiedFinal + "\n\n"
                                     + android.text.TextUtils.join("\n\n", warnings))
                             .setPositiveButton(S.t("Gerai"), null)
                             .show();
                 } else {
-                    Toast.makeText(this, S.t("Nukopijuota failų: ") + copiedFinal, Toast.LENGTH_SHORT).show();
+                    Kit.toast(this, S.t("Nukopijuota failų: ") + copiedFinal, Toast.LENGTH_SHORT);
                 }
                 refresh();
             });
@@ -4831,7 +4884,7 @@ public class SetupActivity extends Activity {
         final String msg = S.t("Šiame mode yra vykdomo kodo (botų bibliotekų):") + list
                 + "\n\n" + S.t("Jos veiks su visomis šios programos teisėmis. "
                 + "Diegti jas tik jei pasitiki šaltiniu.");
-        runOnUiThread(() -> new AlertDialog.Builder(this)
+        runOnUiThread(() -> new KitDialog(this)
                 .setTitle(S.t("Įdiegti vykdomą kodą?") + " — " + zipName)
                 .setMessage(msg)
                 .setCancelable(false)
@@ -5049,11 +5102,20 @@ public class SetupActivity extends Activity {
         for (int i = 0; i < MPQ_NAMES.length; ++i) {
             if (MPQ_NAMES[i].equalsIgnoreCase(f.getName())) { idx = i; break; }
         }
-        try (InputStream in = new java.io.FileInputStream(f)) {
+        try (java.io.RandomAccessFile in = new java.io.RandomAccessFile(f, "r")) {
+            if (in.length() < 32) return f.getName() + ": failas per mažas, tai ne MPQ archyvas.";
+            // The CD StarCraft.mpq / BroodWar.mpq start with an MZ installer stub; like
+            // Storm (and data_loading.h) look for the header at 512-byte boundaries.
+            boolean found = false;
+            long limit = Math.min(in.length() - 4, 16L * 1024 * 1024);
             byte[] head = new byte[4];
-            if (in.read(head) < 4) return f.getName() + ": failas per mažas, tai ne MPQ archyvas.";
-            int magic = (head[0] & 0xff) | ((head[1] & 0xff) << 8) | ((head[2] & 0xff) << 16) | ((head[3] & 0xff) << 24);
-            if (magic != MPQ_MAGIC) {
+            for (long pos = 0; pos <= limit && !found; pos += 512) {
+                in.seek(pos);
+                in.readFully(head);
+                int magic = (head[0] & 0xff) | ((head[1] & 0xff) << 8) | ((head[2] & 0xff) << 16) | ((head[3] & 0xff) << 24);
+                found = magic == MPQ_MAGIC;
+            }
+            if (!found) {
                 return f.getName() + ": tai ne MPQ archyvas (blogas antraštės parašas). "
                         + "OpenBW reikia originalių StarCraft 1.16.1 MPQ failų, ne Remastered (CASC) versijos.";
             }
@@ -5187,7 +5249,14 @@ public class SetupActivity extends Activity {
         bw.addView(new android.widget.Space(this), new LinearLayout.LayoutParams(1, 0, 1f));
         LinearLayout.LayoutParams bwBtn = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         bwBtn.topMargin = dp(12);
-        bw.addView(kit.button(S.t("Pasirinkti MPQ failus"), 0, () -> pickFiles(REQ_PICK_MPQ)), bwBtn);
+        LinearLayout bwButtons = new LinearLayout(this);
+        bwButtons.setOrientation(LinearLayout.HORIZONTAL);
+        bwButtons.setGravity(Gravity.CENTER_VERTICAL);
+        bwButtons.addView(kit.button(S.t("Pasirinkti žaidimo aplanką"), 0, this::pickMpqFolder));
+        LinearLayout.LayoutParams orFiles = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        orFiles.leftMargin = dp(10);
+        bwButtons.addView(kit.smallButton(S.t("arba failus"), () -> pickFiles(REQ_PICK_MPQ)), orFiles);
+        bw.addView(bwButtons, bwBtn);
 
         // --- StarCraft: Remastered (optional) ---
         LinearLayout sc = gateCard(scrOk ? GOOD : (!scrDir.isEmpty() && !scrOk) ? BAD : Kit.STEEL);
@@ -5320,11 +5389,11 @@ public class SetupActivity extends Activity {
     // than extracting the 640x480 art (variant V2).
     private static final int[] RACE_COLOR = {0xFF9A6BC8, 0xFF4E8BD6, 0xFFD6B24E};
 
-    private boolean showScoreScreenIfPending() {
+    private boolean showScoreScreenIfPending(String[] outcome) {
         File f = new File(getExternalFilesDir(null), "score.txt");
         if (!f.isFile()) return false;
         java.util.List<String[]> rows = new java.util.ArrayList<>();
-        boolean won = false;
+        boolean won = false, campaign = false;
         int local = -1, frames = 0;
         try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(f))) {
             String line;
@@ -5340,11 +5409,12 @@ public class SetupActivity extends Activity {
                 if (kv.containsKey("won")) won = "1".equals(kv.get("won"));
                 if (kv.containsKey("local")) local = parseIntSafe(kv.get("local"), -1);
                 if (kv.containsKey("frames")) frames = parseIntSafe(kv.get("frames"), 0);
+                if (kv.containsKey("campaign")) campaign = "1".equals(kv.get("campaign"));
                 if (kv.containsKey("p")) rows.add(new String[]{
                         kv.get("p"), kv.get("race"), kv.get("units"), kv.get("buildings"),
                         kv.get("kills"), kv.get("losses"), kv.get("killscore"),
                         kv.get("razescore"), kv.get("minerals"), kv.get("gas"),
-                        kv.get("color"), kv.get("portrait"), kv.get("name")});
+                        kv.get("color"), kv.get("portrait"), kv.get("name"), kv.get("ai")});
             }
         } catch (Exception e) {
             f.delete();
@@ -5352,7 +5422,10 @@ public class SetupActivity extends Activity {
         }
         f.delete();
         if (rows.isEmpty()) return false;
-        setContentView(buildScoreScreen(won, local, frames, rows));
+        // campaign: the mission just played and the one it unlocked (victory only)
+        String played = outcome != null ? outcome[0] : getCampaignDir();
+        String next = outcome != null && won ? outcome[1] : null;
+        setContentView(buildScoreScreen(won, local, frames, rows, campaign ? played : null, next));
         return true;
     }
 
@@ -5365,7 +5438,19 @@ public class SetupActivity extends Activity {
     // row marked like every selected row in the launcher, the total in amber, and
     // the launcher's buttons (it still had the pre-redesign look: stock Android
     // buttons on a flat navy page with a race-coloured bar).
-    private View buildScoreScreen(boolean won, int local, int frames, java.util.List<String[]> rows) {
+    // Back on the score screen = its way out (Mission list / Return); null elsewhere.
+    private Runnable scoreBack;
+
+    @Override
+    public void onBackPressed() {
+        if (scoreBack != null) { Runnable r = scoreBack; scoreBack = null; r.run(); return; }
+        super.onBackPressed();
+    }
+
+    // campaignDir != null: a campaign mission -- Mission list / Restart / Continue
+    // (Continue only after a victory that unlocked a next mission).
+    private View buildScoreScreen(boolean won, int local, int frames, java.util.List<String[]> rows,
+                                  final String campaignDir, final String nextDir) {
         if (kit == null) kit = new Kit(this);
         FrameLayout shell = new FrameLayout(this);
         shell.setBackgroundColor(0xFF05080A);
@@ -5397,6 +5482,11 @@ public class SetupActivity extends Activity {
         TextView sub = kit.text(String.format(Locale.ROOT, "%d:%02d", secs / 60, secs % 60), Kit.TEXT2, 13);
         sub.setGravity(Gravity.CENTER_HORIZONTAL);
         sub.setPadding(0, dp(2), 0, dp(14));
+        if (campaignDir != null && !campaignDir.isEmpty()) {
+            String mission = campaignDisplayName(campaignDir);
+            if (won && nextDir != null && nextDir.isEmpty()) mission += "  —  " + S.t("Epizodas įveiktas");
+            sub.setText(mission + "   " + sub.getText());
+        }
         panel.addView(sub);
 
         // Units / Structures / Resources, the original's three categories.
@@ -5422,7 +5512,8 @@ public class SetupActivity extends Activity {
             int race = Math.max(0, Math.min(2, parseIntSafe(p[1], 1)));
             int total = parseIntSafe(p[6], 0) + parseIntSafe(p[7], 0);
             String nm = p.length > 12 && p[12] != null ? p[12] : "";
-            if (nm.isEmpty()) nm = idx == local ? S.t("Tu") : "Žaidėjas " + (idx + 1);
+            boolean ai = p.length > 13 && "1".equals(p[13]);
+            if (nm.isEmpty()) nm = idx == local ? S.t("Tu") : ai ? S.t("Kompiuteris") : S.t("Žaidėjas") + " " + (idx + 1);
             String who = nm + " (" + RACE_NAME[race].charAt(0) + ")";
             View rowV = scoreRow(new String[]{who, p[2], p[3], p[4], p[5], p[8], p[9], String.valueOf(total)},
                     false, idx == local);
@@ -5466,18 +5557,43 @@ public class SetupActivity extends Activity {
             if (last.renameTo(dst)) {
                 saveRef[0].setEnabled(false);
                 saveRef[0].setAlpha(0.4f);
-                Toast.makeText(this, S.t("Išsaugota: ") + dst.getName(), Toast.LENGTH_LONG).show();
+                Kit.toast(this, S.t("Išsaugota: ") + dst.getName(), Toast.LENGTH_LONG);
             } else {
-                Toast.makeText(this, S.t("Nepavyko išsaugoti replay."), Toast.LENGTH_LONG).show();
+                Kit.toast(this, S.t("Nepavyko išsaugoti replay."), Toast.LENGTH_LONG);
             }
         });
         saveRef[0] = save;
         if (!last.isFile()) { save.setEnabled(false); save.setAlpha(0.4f); }
-        actions.addView(save, new LinearLayout.LayoutParams(dp(220), dp(48)));
-        TextView ret = kit.button(S.t("Grįžti"), 1, this::recreate);
-        LinearLayout.LayoutParams retLp = new LinearLayout.LayoutParams(dp(220), dp(48));
-        retLp.leftMargin = dp(12);
-        actions.addView(ret, retLp);
+        if (campaignDir == null) {
+            actions.addView(save, new LinearLayout.LayoutParams(dp(220), dp(48)));
+            TextView ret = kit.button(S.t("Grįžti"), 1, this::recreate);
+            LinearLayout.LayoutParams retLp = new LinearLayout.LayoutParams(dp(220), dp(48));
+            retLp.leftMargin = dp(12);
+            actions.addView(ret, retLp);
+            scoreBack = this::recreate;
+        } else {
+            // Campaign missions are not recorded (record_replay = melee only), and
+            // LastGame.rep may be an older melee game: no Save replay here.
+            actions.setGravity(Gravity.CENTER_VERTICAL);
+            actions.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1f));
+            final Runnable toList = () -> {
+                String ep = episodeTitleFor(campaignDir);
+                if (!ep.isEmpty()) prefs().edit().putString("returnToEpisode", ep).apply();
+                recreate();
+            };
+            final boolean canContinue = won && nextDir != null && !nextDir.isEmpty();
+            String[] labels = {S.t("Misijų sąrašas"), S.t("Iš naujo"), S.t("Tęsti")};
+            Runnable[] runs = {toList, () -> launchAfterRecreate(campaignDir),
+                    () -> { if (canContinue) launchAfterRecreate(nextDir); }};
+            for (int k = 0; k < 3; k++) {
+                TextView b = kit.button(labels[k], k == 2 ? 1 : 0, runs[k]);
+                if (k == 2 && !canContinue) { b.setEnabled(false); b.setAlpha(0.4f); }
+                LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(dp(compact ? 150 : 190), dp(48));
+                blp.leftMargin = dp(12);
+                actions.addView(b, blp);
+            }
+            scoreBack = toList;
+        }
         panel.addView(actions);
 
         ScrollView sv = new ScrollView(this);
@@ -5511,6 +5627,13 @@ public class SetupActivity extends Activity {
                 if (last || (i == 0 && local)) t.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
             }
             t.setSingleLine(true);
+            if (header && i > 0) {
+                // Phone widths: "STRUCTURES" did not fit its column and ran into "UNITS".
+                t.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                if (compact) t.setLetterSpacing(0.03f);
+                if (android.os.Build.VERSION.SDK_INT >= 26)
+                    t.setAutoSizeTextTypeUniformWithConfiguration(7, 12, 1, android.util.TypedValue.COMPLEX_UNIT_SP);
+            }
             t.setGravity(i == 0 ? Gravity.START : Gravity.END);
             t.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, i == 0 ? 2.4f : 1f));
             row.addView(t);
@@ -5771,13 +5894,12 @@ public class SetupActivity extends Activity {
     // archive path; otherwise mapArg is a filesystem path.
     private void showMinimapPreview(String title, boolean isInternal, String mapArg) {
         if (!minimapLibOk) {
-            Toast.makeText(this, S.t("Peržiūra neprieinama"), Toast.LENGTH_SHORT).show();
+            Kit.toast(this, S.t("Peržiūra neprieinama"), Toast.LENGTH_SHORT);
             return;
         }
         final String gameDir = getExternalFilesDir(null).getAbsolutePath();
         final File out = new File(getCacheDir(), "mm_preview.png");
-        final Toast wait = Toast.makeText(this, "Generuojama peržiūra…", Toast.LENGTH_SHORT);
-        wait.show();
+        final Runnable wait = Kit.toast(this, "Generuojama peržiūra…", Toast.LENGTH_SHORT);
         minimapExec.execute(() -> {
             String err;
             try {
@@ -5789,13 +5911,13 @@ public class SetupActivity extends Activity {
             }
             final String ferr = err;
             ui.post(() -> {
-                wait.cancel();
+                wait.run();
                 if (ferr != null || !out.exists()) {
-                    Toast.makeText(this, "Peržiūra nepavyko: " + (ferr == null ? "?" : ferr), Toast.LENGTH_LONG).show();
+                    Kit.toast(this, "Peržiūra nepavyko: " + (ferr == null ? "?" : ferr), Toast.LENGTH_LONG);
                     return;
                 }
                 android.graphics.Bitmap bmp = android.graphics.BitmapFactory.decodeFile(out.getAbsolutePath());
-                if (bmp == null) { Toast.makeText(this, "Peržiūra nepavyko (dekodavimas)", Toast.LENGTH_SHORT).show(); return; }
+                if (bmp == null) { Kit.toast(this, "Peržiūra nepavyko (dekodavimas)", Toast.LENGTH_SHORT); return; }
                 ImageView iv = new ImageView(this);
                 iv.setImageBitmap(bmp);
                 iv.setAdjustViewBounds(true);
@@ -5806,7 +5928,7 @@ public class SetupActivity extends Activity {
                 iv.setPadding(pad, pad, pad, pad);
                 iv.setMinimumWidth(dp(280));
                 iv.setMinimumHeight(dp(280));
-                new AlertDialog.Builder(this)
+                new KitDialog(this)
                         .setTitle(title)
                         .setView(iv)
                         .setPositiveButton(S.t("Uždaryti"), null)
@@ -6246,7 +6368,7 @@ public class SetupActivity extends Activity {
     }
 
     private void confirmDeleteSave(final File sv) {
-        new AlertDialog.Builder(this)
+        new KitDialog(this)
                 .setTitle(S.t("Pašalinti išsaugotą žaidimą?"))
                 .setMessage(saveSidecarName(sv) != null ? saveSidecarName(sv) : saveDisplayTitle(sv))
                 .setPositiveButton(S.t("Pašalinti"), (d, w) -> {
@@ -6254,7 +6376,7 @@ public class SetupActivity extends Activity {
                         new File(sv.getParentFile(), sv.getName().replaceFirst("\\.sav$", ".name")).delete();
                         if (sv.equals(selectedSave)) selectedSave = null;
                         renderSaveList();
-                    } else Toast.makeText(this, S.t("Nepavyko pašalinti."), Toast.LENGTH_SHORT).show();
+                    } else Kit.toast(this, S.t("Nepavyko pašalinti."), Toast.LENGTH_SHORT);
                 })
                 .setNegativeButton(S.t("Atšaukti"), null)
                 .show();
@@ -6422,7 +6544,7 @@ public class SetupActivity extends Activity {
     }
 
     private void confirmDeleteReplay(final File rep) {
-        new AlertDialog.Builder(this)
+        new KitDialog(this)
                 .setTitle(S.t("Pašalinti replay?"))
                 .setMessage(rep.getName())
                 .setPositiveButton(S.t("Pašalinti"), (d, w) -> {
@@ -6430,7 +6552,7 @@ public class SetupActivity extends Activity {
                         if (rep.equals(selectedReplay)) selectedReplay = null;
                         renderReplayList();
                         showReplayPlaceholder();
-                    } else Toast.makeText(this, S.t("Nepavyko pašalinti."), Toast.LENGTH_SHORT).show();
+                    } else Kit.toast(this, S.t("Nepavyko pašalinti."), Toast.LENGTH_SHORT);
                 })
                 .setNegativeButton(S.t("Atšaukti"), null)
                 .show();
@@ -6442,10 +6564,10 @@ public class SetupActivity extends Activity {
         File dst = new File(last.getParentFile(), stamp + ".rep");
         for (int k = 2; dst.exists() && k < 100; ++k) dst = new File(last.getParentFile(), stamp + "-" + k + ".rep");
         if (last.renameTo(dst)) {
-            Toast.makeText(this, S.t("Išsaugota: ") + dst.getName(), Toast.LENGTH_LONG).show();
+            Kit.toast(this, S.t("Išsaugota: ") + dst.getName(), Toast.LENGTH_LONG);
             selectReplayFile(dst);
         } else {
-            Toast.makeText(this, S.t("Nepavyko išsaugoti replay."), Toast.LENGTH_LONG).show();
+            Kit.toast(this, S.t("Nepavyko išsaugoti replay."), Toast.LENGTH_LONG);
         }
     }
 

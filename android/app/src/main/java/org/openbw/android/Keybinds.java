@@ -279,7 +279,7 @@ final class Keybinds {
             m.clear();
             m.putAll(load(p));
             refresh.run();
-            Toast.makeText(act, S.t("Klavišai atstatyti."), Toast.LENGTH_SHORT).show();
+            Kit.toast(act, S.t("Klavišai atstatyti."), Toast.LENGTH_SHORT);
         }), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, kit.hdp(40)));
         list.addView(head);
 
@@ -324,7 +324,7 @@ final class Keybinds {
                 MenuAudio.play(MenuAudio.CLICK);
                 capture(act, kit, a, code -> {
                     String err = assign(m, a, code);
-                    if (err != null) { Toast.makeText(act, err, Toast.LENGTH_SHORT).show(); return; }
+                    if (err != null) { Kit.toast(act, err, Toast.LENGTH_SHORT); return; }
                     save(p, m);
                     refresh.run();
                 });
@@ -333,7 +333,7 @@ final class Keybinds {
             row.addView(key, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, kit.hdp(36)));
             TextView reset = kit.smallButton("↺", () -> {
                 String err = assign(m, a, a.def);
-                if (err != null) { Toast.makeText(act, err, Toast.LENGTH_SHORT).show(); return; }
+                if (err != null) { Kit.toast(act, err, Toast.LENGTH_SHORT); return; }
                 save(p, m);
                 refresh.run();
             });
@@ -390,7 +390,7 @@ final class Keybinds {
             if (keyCode == KeyEvent.KEYCODE_BACK) return false;
             int code = sdlScancode(keyCode);
             if (code == 0 || a.mouseOnly) {
-                Toast.makeText(act, a.mouseOnly ? S.t("Čia tinka tik pelės mygtukas.") : S.t("Šio klavišo priskirti negalima."), Toast.LENGTH_SHORT).show();
+                Kit.toast(act, a.mouseOnly ? S.t("Čia tinka tik pelės mygtukas.") : S.t("Šio klavišo priskirti negalima."), Toast.LENGTH_SHORT);
                 return true;
             }
             d.dismiss();

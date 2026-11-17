@@ -1726,9 +1726,13 @@ struct ui_functions: ui_util_functions {
 	// sentences and were drawn from x to wherever they ended -- off the right
 	// edge, so the mission dialogue read as if it had been cut mid-word. Splits
 	// on spaces; a single unbroken word is cut, since something must give.
-	a_vector<a_string> wrap_hud_text(const a_string& s) const {
-		const int char_w = ui::unispace_w + 1;
+	a_vector<a_string> wrap_hud_text(const a_string& s) {
+		int char_w = ui::unispace_w + 1;
 		int avail = (int)screen_width - 32;
+		if (hud_v3 && hud3_phone()) {   // phones: the glyphs as drawn, from where the lines start
+			char_w = menu_text_adv(2);
+			avail = (int)screen_width - trigger_text_x() - hud_h_px(12);
+		}
 		size_t max_chars = avail > char_w * 8 ? (size_t)(avail / char_w) : (size_t)8;
 		a_vector<a_string> out;
 		size_t at = 0;
@@ -1758,7 +1762,7 @@ struct ui_functions: ui_util_functions {
 	// `wrap` = false leaves each of the map's lines whole, for a caller that wraps
 	// to its own width (the briefing transcript: wrapping here to the screen and
 	// there to the panel broke lines twice, leaving one- and two-word orphans).
-	a_vector<a_string> split_and_wrap(const a_string& raw, bool wrap = true) const {
+	a_vector<a_string> split_and_wrap(const a_string& raw, bool wrap = true) {
 		a_vector<a_string> out;
 		a_string cur;
 		auto flush = [&]() {
@@ -5227,7 +5231,14 @@ struct ui_functions: ui_util_functions {
 	int hud_text_pct(int pct) {
 		int b = base_render_h ? base_render_h : (int)screen_height;
 		long long v = (long long)pct * hud_us() * (int)screen_height / (b ? b : 1);
-		if (hud_v3) v = v * hud3_fit_milli() / 1000;   // v3 shrunk to fit a narrow surface: the text with it
+		if (hud_v3) {   // v3 shrunk to fit a narrow surface: the text with it
+			const int fit = hud3_fit_milli();
+			const long long fitted = v * fit / 1000;
+			// phones: +35 % back, never past the atlas size nor the dp grid's 1 atlas px per dp
+			if (fit < 1000 && hud3_phone())
+				v = std::max(fitted, std::min(v * std::min(1000, fit * 135 / 100) / 1000, (long long)pct * hud3_ppd_milli() / 1000));
+			else v = fitted;
+		}
 		return (int)v;
 	}
 	int hud2_bar_h() { int h = (int)screen_height * 24 / 100; int m = (int)screen_height * 32 / 100; int fl = hud_h_px(96); return h < fl ? fl : (h > m ? m : h); }
@@ -7583,6 +7594,11 @@ struct ui_functions: ui_util_functions {
 		return ms * 24 / 1000;
 	}
 
+	int trigger_text_x() {
+		if (hud_v3) return hud3_layout().idle.from.x + d3(64 + 12);
+		if (!ui_legacy) return hud2_ping_button().from.x;
+		return hud_scale_text ? hud_h_px(12) : 12;
+	}
 	void draw_trigger_texts(uint32_t* data, size_t pitch) {
 		while (!trigger_texts.empty()
 		       && (int)st.current_frame - trigger_texts.front().frame > trigger_texts.front().lifetime) {
@@ -7598,16 +7614,12 @@ struct ui_functions: ui_util_functions {
 		// SD/HD2 default zoom.
 		int lh = hud_scale_text ? (usp_h() + hud_h_px(4)) : (ui::unispace_h + 4);
 		int gap6 = hud_scale_text ? hud_h_px(6) : 6;
-		int x = hud_scale_text ? hud_h_px(12) : 12, bottom = (int)screen_height - (hud_scale_text ? hud_h_px(12) : 12);
+		int x = trigger_text_x(), bottom = (int)screen_height - (hud_scale_text ? hud_h_px(12) : 12);
 		if (hud_v3) {
 			// right of the group rail, above IDLE / ARMY / PING
-			hud3_layout_t L3 = hud3_layout();
-			x = L3.idle.from.x + d3(64 + 12);
-			bottom = L3.idle.from.y - gap6;
+			bottom = hud3_layout().idle.from.y - gap6;
 		} else if (!ui_legacy) {
-			rect p = hud2_ping_button();
-			x = p.from.x;
-			bottom = p.from.y - gap6;
+			bottom = hud2_ping_button().from.y - gap6;
 		} else {
 			bottom = playfield_bottom_y() - gap6;
 		}
@@ -11955,13 +11967,14 @@ struct ui_functions: ui_util_functions {
 			}
 		}
 	}
-	void menu_draw_panel(uint32_t* data, size_t pitch, const menu_lay_t& l, const char* title) {
-		dim_rect_rgba(data, pitch, {{0, 0}, {(int)screen_width, (int)screen_height}}, 115);   // 45% left = dimmed by 55%
+	void menu_draw_panel(uint32_t* data, size_t pitch, const menu_lay_t& l, const char* title, int dim_keep = 115, uint32_t title_color = 0) {
+		dim_rect_rgba(data, pitch, {{0, 0}, {(int)screen_width, (int)screen_height}}, dim_keep);   // 115: 45% left = dimmed by 55%
 		hud2_frame(data, pitch, l.panel);
 		draw_hud_tab(data, pitch, l.panel, 0);
 		int scale = 4;
 		while (scale > 2 && menu_text_w(title, scale) > l.x1 - l.x0) --scale;
-		draw_text_rgba(data, pitch, (l.x0 + l.x1) / 2 - menu_text_w(title, scale) / 2, l.panel.from.y + hud_h_px(22), title, hud_theme().menu_title, scale);
+		draw_text_rgba(data, pitch, (l.x0 + l.x1) / 2 - menu_text_w(title, scale) / 2, l.panel.from.y + hud_h_px(22), title,
+			title_color ? title_color : hud_theme().menu_title, scale);
 	}
 	// Button colours: normal; primary = the race's "on" colours (what the player
 	// most likely wants); danger = red line and text (leaves the game); disabled.
@@ -12354,6 +12367,7 @@ struct ui_functions: ui_util_functions {
 				L("Yes, leave"), menu_btn_danger, L("No, keep playing"), menu_btn_primary, hx, hy);
 		case 7: return menu_alliances(data, pitch, hx, hy);
 		case 8: case 9: return menu_slots(data, pitch, pause_screen == 9, hx, hy);
+		case 10: return menu_end_of_game(data, pitch, hx, hy);
 		}
 		return -1;
 	}
@@ -12460,6 +12474,8 @@ struct ui_functions: ui_util_functions {
 				// game the player left instead of finishing.
 				if (exit_on_close && !leave_through_host) std::exit(0);
 			} else if (hit == 1) pause_screen = 1;
+		} else if (screen == 10) { // end of game
+			if (hit == 0) { end_dialog_done = true; pause_screen = 0; }
 		} else if (screen == 7) { // alliances
 			// The last row is Back; the rest map to alliance_rows, which
 			// pause_menu_render() just rebuilt for this hit test.
@@ -12470,11 +12486,56 @@ struct ui_functions: ui_util_functions {
 		return true;
 	}
 
+	// v1.0.26: the game is over -- Victory / Defeat over the last frame (dimmed a
+	// little) until the player taps Continue; the host loop waits on end_dialog_done
+	// before it writes the score and returns to the launcher.
+	bool end_dialog_won = false;
+	bool end_dialog_done = false;
+	void open_end_dialog(bool won) {
+		cancel_save_name_prompt();
+		end_dialog_won = won;
+		end_dialog_done = false;
+		pause_screen = 10;
+		if (!is_net_game) is_paused = true;
+		play_end_jingle(won);
+	}
+	// BW's own victory / defeat music (music/<z|t|p>vict.wav, <z|t|p>defeat.wav)
+	// replaces the playlist; nothing follows it.
+	void play_end_jingle(bool won) {
+		music_playlist.clear();
+		music_initialized = true;
+		if (music_volume == 0 || !data_file_exists) { native_sound::stop_music(); return; }
+		char c = 't';
+		if (game_local_player >= 0 && game_local_player < 12) {
+			race_t r = st.players[game_local_player].race;
+			if (r == race_t::zerg) c = 'z';
+			else if (r == race_t::protoss) c = 'p';
+		}
+		char name[32];
+		snprintf(name, sizeof(name), "music/%c%s.wav", c, won ? "vict" : "defeat");
+		a_vector<uint8_t> data;
+		try { if (data_file_exists(name)) load_data_file(data, name); } catch (...) { data.clear(); }
+		bool ok = !data.empty() && native_sound::play_music(data.data(), data.size(), (128 - 4) * music_volume / 100);
+		if (!ok) native_sound::stop_music();
+		ui::log("music: end jingle %s %s\n", name, ok ? "playing" : "missing");
+	}
+	int menu_end_of_game(uint32_t* data, size_t pitch, int hx, int hy) {
+		menu_lay_t l = menu_layout([&](const menu_lay_t& m) { return m.bh; });
+		rect b = {{l.x0, l.y}, {l.x1, l.y + l.bh}};
+		if (hx >= 0) return menu_in(b, hx, hy) ? 0 : -1;
+		menu_draw_panel(data, pitch, l, end_dialog_won ? L("VICTORY!") : L("DEFEAT!"), 190,
+			end_dialog_won ? hud_theme().amber : 0xffff5a50u);
+		menu_button(data, pitch, b, L("Continue"), menu_btn_primary, true);
+		return -1;
+	}
+
 	void open_pause_menu() {
+		if (pause_screen == 10) return;
 		pause_screen = 1;
 		if (!is_net_game) is_paused = true;
 	}
 	void close_pause_menu() {
+		if (pause_screen == 10) { end_dialog_done = true; pause_screen = 0; return; }   // Back / MENU = Continue
 		pause_screen = 0;
 		if (!is_net_game) is_paused = false;
 		cancel_save_name_prompt();   // D5: don't leave a naming prompt open after the menu
@@ -13916,6 +13977,7 @@ struct ui_functions: ui_util_functions {
 			{"REPLAY", "KARTOTI"},
 			{"SKIP TUTORIAL", "PRALEISTI MOKYMUS"},
 			{"VICTORY!", "PERGALE!"},
+			{"Continue", "Testi"},
 			{"DEFEAT!", "PRALAIMEJIMAS"},
 			{"Group assigned", "Grupe priskirta"},
 			{"Defeat...", "Pralaimejimas..."},

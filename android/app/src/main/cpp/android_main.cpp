@@ -302,10 +302,13 @@ struct main_t {
 					// into the next mission dir and leave it for the launcher.
 					if (won && !campaign_dir.empty()) {
 						a_string next;
+						// CHK string refs are 1-based; the string is a file name ("Terran05a.scx").
 						size_t nsi = (size_t)ui.st.next_scenario_string;
-						if (nsi && nsi < ui.game_st.map_strings.size()) {
-							next = ui.game_st.map_strings[nsi];
+						if (nsi && nsi <= ui.game_st.map_strings.size()) {
+							next = ui.game_st.map_strings[nsi - 1];
 							for (auto& c : next) { if (c == '\\') c = '/'; if (c >= 'A' && c <= 'Z') c += 32; }
+							size_t dot = next.rfind('.');
+							if (dot != a_string::npos && (next.substr(dot) == ".scx" || next.substr(dot) == ".scm")) next.resize(dot);
 						}
 						a_string next_dir;
 						if (!next.empty()) {
@@ -313,6 +316,33 @@ struct main_t {
 							else {
 								size_t slash = campaign_dir.rfind('/');
 								next_dir = campaign_dir.substr(0, slash + 1) + next;
+							}
+						} else {
+							// Most missions carry no Set Next Scenario: BW takes the episode order.
+							// Branch points (terran04, zerg03, zerg04x, zerg09, bonus) always set it.
+							static const char* const order[] = {
+								"terran/tutorial", "terran/terran01", "terran/terran02", "terran/terran03", "terran/terran04",
+								"terran/terran05", "terran/terran06", "terran/terran07", "terran/terran08", "terran/terran09",
+								"terran/terran10", nullptr,
+								"zerg/tutorial", "zerg/zerg01", "zerg/zerg02", "zerg/zerg03", "zerg/zerg04", "zerg/zerg05",
+								"zerg/zerg06", "zerg/zerg07", "zerg/zerg08", "zerg/zerg09", "zerg/zerg10", nullptr,
+								"protoss/tutorial", "protoss/protoss01", "protoss/protoss02", "protoss/protoss03",
+								"protoss/protoss04", "protoss/protoss05", "protoss/protoss06", "protoss/protoss07",
+								"protoss/protoss08", "protoss/protoss09", "protoss/protoss10", nullptr,
+								"expprotoss/protoss01", "expprotoss/protoss02", "expprotoss/protoss03", "expprotoss/protoss04",
+								"expprotoss/protoss05", "expprotoss/protoss06", "expprotoss/protoss07", "expprotoss/protoss08", nullptr,
+								"expterran/terran01", "expterran/terran02", "expterran/terran03", "expterran/terran04",
+								"expterran/terran05a", "expterran/terran05b", "expterran/terran06", "expterran/terran07",
+								"expterran/terran08", nullptr,
+								"expzerg/zerg01", "expzerg/zerg02", "expzerg/zerg03", "expzerg/zerg05", "expzerg/zerg06",
+								"expzerg/zerg07", "expzerg/zerg08", "expzerg/zerg09", "expzerg/zerg10", nullptr,
+							};
+							const size_t n_order = sizeof(order) / sizeof(order[0]);
+							for (size_t i = 0; i + 1 < n_order; ++i) {
+								if (order[i] && campaign_dir == a_string("campaign/") + order[i]) {
+									if (order[i + 1]) next_dir = a_string("campaign/") + order[i + 1];
+									break;
+								}
 							}
 						}
 						a_string path = campaign_data_dir + "/campaign-next.txt";
@@ -2637,6 +2667,7 @@ extern "C" int main(int argc, char* argv[]) {
 		// there caches every speaker before any dialogue.
 		bool prewarm_pending = true;
 		bool prev_briefing = ui.briefing_active; // Faze 4.7: warm again on briefing->mission
+		bool end_dialog_shown = false;
 		while (true) {
 			// Keep the chat bar clear of the soft keyboard (see the JNI setter).
 			ui.ime_frac = g_ime_frac.load();
@@ -2706,7 +2737,16 @@ extern "C" int main(int argc, char* argv[]) {
 				log("test-cinematic: %s -> %s\n", test_cinematic.c_str(), ok ? "played" : "skipped");
 			}
 			// Cheats "there is no cow level" / "game over man" force the outcome.
-			if (ui.cheat_force_win) { ui.cheat_force_win = false; m.game_over = true; m.game_won = true; }
+			if (ui.cheat_force_win) {
+				ui.cheat_force_win = false;
+				// A campaign win goes through the mission-end hold so the next mission
+				// (Continue) and the story cinematic are resolved like a real victory.
+				if (!m.campaign_dir.empty() && m.local_player >= 0 && m.enemy_player >= 0 && !m.end_hold_started) {
+					m.end_hold_started = true;
+					m.end_hold_won = true;
+					m.end_hold_deadline = std::chrono::high_resolution_clock::now();
+				} else if (!m.end_hold_started) { m.game_over = true; m.game_won = true; }
+			}
 			if (ui.cheat_force_lose) { ui.cheat_force_lose = false; m.game_over = true; m.game_won = false; }
 			if (ui.request_exit || ui.window_closed) {
 				// Pause-menu "Leave game" / window close: tear down net, return.
@@ -2714,6 +2754,14 @@ extern "C" int main(int argc, char* argv[]) {
 				if (net_mode) net.leave_game(server);
 				return 0;
 			}
+			// v1.0.26: Victory / Defeat over the dimmed last frame first; the score and
+			// the return to the launcher wait for Continue (not in diagnostic runs).
+			if (m.game_over && !end_dialog_shown) {
+				end_dialog_shown = true;
+				if (ui.rgba_surface && ui.wnd && !bwgame::diag::enabled()) ui.open_end_dialog(m.game_won);
+				else ui.end_dialog_done = true;
+			}
+			if (m.game_over && !ui.end_dialog_done && !ui.window_closed) continue;
 			if (m.game_over) {
 				log("game over: %s\n", m.game_won ? "victory" : "defeat");
 				// v0.31: melee/LAN match result for profile statistics. Campaign
@@ -2761,13 +2809,24 @@ extern "C" int main(int argc, char* argv[]) {
 							// color= / portrait= / name= (launcher redesign F4): who this row is.
 							// name= is LAST and runs to the end of the line (names may hold spaces).
 							a_string nm = ui.player_display_name((size_t)p, m.local_player);
+							bool is_ai = c != player_t::controller_occupied;
+							// v1.0.26: a campaign / UMS computer player has no slot name; the map's
+							// force name is what the mission calls it ("Zerg Swarm", "Confederacy").
+							if (nm.empty() && is_ai) {
+								size_t fi = ui.st.players[p].force;
+								a_string fn = fi < 4 ? ui.game_st.forces[fi].name : a_string();
+								while (!fn.empty() && (fn.back() == ' ' || (unsigned char)fn.back() < 32)) fn.pop_back();
+								bool junk = fn.empty() || fn == "<null string>" || fn.find_first_not_of('-') == a_string::npos
+									|| (fn.size() == 7 && fn.compare(0, 6, "Force ") == 0);
+								if (!junk) nm = fn;
+							}
 							for (auto& ch : nm) if (ch == '\n' || ch == '\r') ch = ' ';
 							int prace = (int)ui.st.players[p].race;
 							int portrait = ui.player_portrait_id(p == m.local_player,
 								ui.player_is_ai((size_t)p, m.local_player), nm, prace);
 							fprintf(sf,
 								"p=%d race=%d units=%d buildings=%d kills=%d losses=%d "
-								"killscore=%d razescore=%d minerals=%d gas=%d color=%d portrait=%d name=%s\n",
+								"killscore=%d razescore=%d minerals=%d gas=%d color=%d portrait=%d ai=%d name=%s\n",
 								p, prace,
 								(int)ui.st.total_non_buildings_ever_completed[p],
 								(int)ui.st.total_buildings_ever_completed[p],
@@ -2775,7 +2834,7 @@ extern "C" int main(int argc, char* argv[]) {
 								(int)ui.st.kills_score[p], (int)ui.st.razings_score[p],
 								(int)ui.st.total_minerals_gathered[p],
 								(int)ui.st.total_gas_gathered[p],
-								(int)ui.st.players[p].color, portrait, nm.c_str());
+								(int)ui.st.players[p].color, portrait, is_ai ? 1 : 0, nm.c_str());
 						}
 						fclose(sf);
 						log("score written: %s\n", spath.c_str());

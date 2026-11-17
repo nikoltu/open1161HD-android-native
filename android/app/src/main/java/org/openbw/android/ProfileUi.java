@@ -1,7 +1,6 @@
 package org.openbw.android;
 
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.app.Dialog;
 import android.content.SharedPreferences;
 import android.graphics.Color;
@@ -95,7 +94,7 @@ final class ProfileUi extends Kit {
         final Dialog[] self = new Dialog[1];
         TextView change = button(S.t("Keisti portretą"), 0, () -> {
             if (!PortraitStore.available(gameDir)) {
-                Toast.makeText(a, S.t("Portretai atsiras importavus žaidimo failus."), Toast.LENGTH_LONG).show();
+                Kit.toast(a, S.t("Portretai atsiras importavus žaidimo failus."), Toast.LENGTH_LONG);
                 return;
             }
             showGallery(() -> { if (self[0] != null) self[0].dismiss(); host.reload(); });
@@ -169,7 +168,7 @@ final class ProfileUi extends Kit {
         final EditText input = new EditText(a);
         input.setHint(S.t("Vardas (rodomas žaidime)"));
         input.setInputType(android.text.InputType.TYPE_CLASS_TEXT);
-        new AlertDialog.Builder(a)
+        new KitDialog(a)
                 .setTitle(S.t("Naujas profilis"))
                 .setView(input)
                 .setPositiveButton(S.t("Sukurti"), (d, w) -> {
@@ -192,7 +191,7 @@ final class ProfileUi extends Kit {
         input.setText(old);
         input.setSelectAllOnFocus(true);
         input.setInputType(android.text.InputType.TYPE_CLASS_TEXT);
-        new AlertDialog.Builder(a)
+        new KitDialog(a)
                 .setTitle(S.t("Pervardyti profilį"))
                 .setView(input)
                 .setPositiveButton(S.t("Gerai"), (d, w) -> {
@@ -201,7 +200,7 @@ final class ProfileUi extends Kit {
                     SharedPreferences pr = host.prefs();
                     Set<String> set = new HashSet<>(pr.getStringSet("profiles", new HashSet<String>()));
                     if (set.contains(name)) {
-                        Toast.makeText(a, S.t("Toks profilis jau yra."), Toast.LENGTH_LONG).show();
+                        Kit.toast(a, S.t("Toks profilis jau yra."), Toast.LENGTH_LONG);
                         return;
                     }
                     SharedPreferences.Editor e = pr.edit();
@@ -242,7 +241,7 @@ final class ProfileUi extends Kit {
         LinearLayout list = new LinearLayout(a);
         list.setOrientation(LinearLayout.VERTICAL);
         list.setPadding(dp(16), dp(8), dp(16), dp(8));
-        final AlertDialog[] dlg = new AlertDialog[1];
+        final Dialog[] dlg = new Dialog[1];
         for (final String n : names) {
             LinearLayout row = new LinearLayout(a);
             row.setOrientation(LinearLayout.HORIZONTAL);
@@ -269,7 +268,7 @@ final class ProfileUi extends Kit {
         }
         ScrollView sv = new ScrollView(a);
         sv.addView(list);
-        dlg[0] = new AlertDialog.Builder(a)
+        dlg[0] = new KitDialog(a)
                 .setTitle(S.t("Pasirinkite profilį"))
                 .setView(sv)
                 .setPositiveButton(S.t("Naujas"), (d, w) -> showCreate(card))
