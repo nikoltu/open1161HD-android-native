@@ -231,26 +231,42 @@ public class LanLobby {
         }
         while (running) {
             try {
-                Socket s = server.accept();
-                handleNewClient(s);
+                final Socket s = server.accept();
+                new Thread(() -> handleNewClient(s), "lobby-hello").start();
             } catch (Exception e) {
                 break;
             }
         }
     }
 
-    private synchronized void handleNewClient(Socket s) {
+    private void handleNewClient(Socket s) {
         try {
-            // Lobby full? refuse.
-            if (state.started || state.slots.size() >= state.target) {
+            synchronized (this) {
+                if (state.started || state.slots.size() >= state.target) {
+                    try { s.close(); } catch (Exception ignored) {}
+                    return;
+                }
+            }
+            // A silent or flooding peer must not stall the lobby: bounded hello, read outside the lock.
+            s.setSoTimeout(HELLO_TIMEOUT_MS);
+            BufferedReader r = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
+            OutputStream o = s.getOutputStream();
+            String line = readLineBounded(r);
+            if (line == null) { s.close(); return; }
+            JSONObject hello = new JSONObject(line);
+            s.setSoTimeout(0);
+            registerClient(s, r, o, hello);
+        } catch (Exception e) {
+            try { s.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    private synchronized void registerClient(Socket s, BufferedReader r, OutputStream o, JSONObject hello) {
+        try {
+            if (!running || state.started || state.slots.size() >= state.target) {
                 try { s.close(); } catch (Exception ignored) {}
                 return;
             }
-            BufferedReader r = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
-            OutputStream o = s.getOutputStream();
-            String line = r.readLine();
-            if (line == null) { s.close(); return; }
-            JSONObject hello = new JSONObject(line);
             Slot sl = new Slot();
             sl.userId = hello.optString("hello", "Guest");
             sl.race = hello.optInt("race", -1);
@@ -273,7 +289,7 @@ public class LanLobby {
     private void hostClientReadLoop(ClientConn c, BufferedReader r) {
         try {
             String line;
-            while (running && (line = r.readLine()) != null) {
+            while (running && (line = readLineBounded(r)) != null) {
                 JSONObject m = new JSONObject(line);
                 synchronized (this) {
                     if (m.has("race")) c.slot.race = m.optInt("race", -1);
@@ -289,6 +305,21 @@ public class LanLobby {
         } finally {
             removeClient(c);
         }
+    }
+
+    private static final int HELLO_TIMEOUT_MS = 5000;
+    private static final int MAX_LINE = 64 * 1024;
+
+    /** readLine with a length cap; null on EOF, IOException when the peer floods without a newline. */
+    static String readLineBounded(BufferedReader r) throws java.io.IOException {
+        StringBuilder sb = new StringBuilder();
+        int ch;
+        while ((ch = r.read()) != -1) {
+            if (ch == '\n') return sb.toString();
+            if (ch != '\r') sb.append((char) ch);
+            if (sb.length() > MAX_LINE) throw new java.io.IOException("lobby line too long");
+        }
+        return sb.length() > 0 ? sb.toString() : null;
     }
 
     private synchronized void removeClient(ClientConn c) {
@@ -458,7 +489,7 @@ public class LanLobby {
                 JSONObject hello = new JSONObject().put("hello", userId).put("race", myRace).put("portrait", myPortrait).put("kbm", myKbm);
                 sendJoin(hello.toString());
                 String line;
-                while (running && (line = r.readLine()) != null) {
+                while (running && (line = readLineBounded(r)) != null) {
                     JSONObject m = new JSONObject(line);
                     if (m.has("state")) {
                         State s = State.fromJson(m.getJSONObject("state"));
