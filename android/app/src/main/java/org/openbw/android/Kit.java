@@ -45,6 +45,11 @@ class Kit {
             | View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
             | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN;
 
+    /** Game controller play: on in every build since v1.1.0. */
+    static boolean gamepadAllowed(android.content.Context c) {
+        return true;
+    }
+
     static boolean isCompact(android.content.Context c) {
         return c.getResources().getConfiguration().screenHeightDp < 480;
     }
@@ -140,7 +145,10 @@ class Kit {
     }
 
     /** A two-option segmented control; `sink` gets the picked index. */
-    LinearLayout segmented(String[] labels, int sel, final IntSink sink) {
+    LinearLayout segmented(String[] labels, int sel, final IntSink sink) { return segmented(labels, sel, sink, null); }
+
+    /** As above; a cell with enabled[i] == false is greyed out and cannot be picked. */
+    LinearLayout segmented(String[] labels, int sel, final IntSink sink, final boolean[] enabled) {
         final LinearLayout row = new LinearLayout(a);
         row.setOrientation(LinearLayout.HORIZONTAL);
         final TextView[] cells = new TextView[labels.length];
@@ -154,17 +162,60 @@ class Kit {
             t.setMinimumHeight(hdp(44));
             fitWords(t);
             t.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
-            t.setOnClickListener(v -> {
-                MenuAudio.play(MenuAudio.CLICK);
-                for (int k = 0; k != cells.length; ++k) styleSeg(cells[k], k == idx);
-                sink.set(idx);
-            });
+            final boolean on = enabled == null || enabled[i];
+            if (on) {
+                t.setOnClickListener(v -> {
+                    MenuAudio.play(MenuAudio.CLICK);
+                    for (int k = 0; k != cells.length; ++k) if (enabled == null || enabled[k]) styleSeg(cells[k], k == idx);
+                    sink.set(idx);
+                });
+            } else {
+                t.setOnClickListener(v -> MenuAudio.play(MenuAudio.LOCK));
+            }
             cells[i] = t;
             styleSeg(t, i == sel);
+            if (!on) {
+                t.setBackground(box(0x00000000, 0x55FFFFFF & STEEL));
+                t.setTextColor(0x66FFFFFF & TEXT2);
+            }
             row.addView(t);
         }
         return row;
     }
+    /** A tooltip on `anchor`: shown on long press or mouse hover, hidden on release / exit or after a while. */
+    void attachTip(final View anchor, final String text) {
+        final android.widget.PopupWindow[] tip = {null};
+        final Runnable hide = () -> { if (tip[0] != null) { tip[0].dismiss(); tip[0] = null; } };
+        final Runnable show = () -> {
+            hide.run();
+            TextView t = text(text, TEXT, 12);
+            int pad = dp(10);
+            t.setPadding(pad, dp(7), pad, dp(7));
+            t.setBackground(box(PANEL | 0xFF000000, LABEL));
+            int maxW = Math.min(dp(520), a.getResources().getDisplayMetrics().widthPixels - dp(32));
+            t.setMaxWidth(maxW);
+            t.measure(View.MeasureSpec.makeMeasureSpec(maxW, View.MeasureSpec.AT_MOST), View.MeasureSpec.UNSPECIFIED);
+            tip[0] = new android.widget.PopupWindow(t, ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, false);
+            tip[0].setTouchable(false);
+            int[] at = new int[2];
+            anchor.getLocationInWindow(at);
+            int above = at[1] - t.getMeasuredHeight() - dp(4);
+            tip[0].showAsDropDown(anchor, dp(8), above >= dp(8) ? -anchor.getHeight() - t.getMeasuredHeight() - dp(4) : dp(4));
+            anchor.removeCallbacks(hide);
+            anchor.postDelayed(hide, 6000);
+        };
+        anchor.setOnLongClickListener(v -> { show.run(); return true; });
+        anchor.setOnHoverListener((v, e) -> {
+            if (e.getActionMasked() == android.view.MotionEvent.ACTION_HOVER_ENTER) anchor.postDelayed(show, 450);
+            else if (e.getActionMasked() == android.view.MotionEvent.ACTION_HOVER_EXIT) { anchor.removeCallbacks(show); hide.run(); }
+            return false;
+        });
+        anchor.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override public void onViewAttachedToWindow(View v) {}
+            @Override public void onViewDetachedFromWindow(View v) { anchor.removeCallbacks(show); hide.run(); }
+        });
+    }
+
     void styleSeg(TextView t, boolean on) {
         t.setBackground(box(on ? SEL_BG : 0x00000000, on ? LABEL : STEEL));
         t.setTextColor(on ? Color.WHITE : TEXT2);
@@ -310,6 +361,12 @@ class Kit {
                 : new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
         lp.setMargins(m, m, m, m);
         scrim.addView(content, lp);
+        // With a game controller connected the focused scrim got the system focus highlight:
+        // an 8% white veil over the whole popup.
+        if (android.os.Build.VERSION.SDK_INT >= 26) {
+            scrim.setDefaultFocusHighlightEnabled(false);
+            content.setDefaultFocusHighlightEnabled(false);
+        }
         d.setContentView(scrim);
         Window w = d.getWindow();
         if (w != null) {
@@ -349,5 +406,166 @@ class Kit {
         final Runnable remove = () -> t.animate().alpha(0f).setDuration(200).withEndAction(() -> root.removeView(t)).start();
         t.postDelayed(remove, duration == android.widget.Toast.LENGTH_LONG ? 3500 : 2000);
         return () -> { t.removeCallbacks(remove); remove.run(); };
+    }
+
+    /** A download / copy panel: an optional subtitle, the step and a large percent, the
+     *  Meter, then the amount and the speed with the time left. Built on the UI thread;
+     *  update() and busy() are UI-thread calls too. */
+    ProgressPanel progressPanel(String subtitle) { return new ProgressPanel(this, subtitle); }
+
+    static final class ProgressPanel {
+        final LinearLayout view;
+        final TextView sub, status, pct, amount, rate;
+        final Meter meter;
+        private long lastT, lastB;
+        private double bps;
+
+        ProgressPanel(Kit k, String subtitle) {
+            view = new LinearLayout(k.a);
+            view.setOrientation(LinearLayout.VERTICAL);
+            sub = k.text(subtitle == null ? "" : subtitle, TEXT2, k.compact ? 12 : 13);
+            sub.setSingleLine(true);
+            sub.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+            if (subtitle == null) sub.setVisibility(View.GONE);
+            view.addView(sub);
+            LinearLayout top = new LinearLayout(k.a);
+            top.setOrientation(LinearLayout.HORIZONTAL);
+            top.setGravity(Gravity.BOTTOM);
+            status = k.text("", TEXT, k.compact ? 14 : 15);
+            status.setMinLines(1);
+            top.addView(status, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            pct = k.text("", ACCENT, k.compact ? 22 : 28);
+            pct.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+            pct.setGravity(Gravity.END);
+            top.addView(pct, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            tlp.topMargin = k.dp(k.compact ? 4 : 8);
+            view.addView(top, tlp);
+            meter = new Meter(k.a);
+            LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, k.dp(k.compact ? 12 : 16));
+            mlp.topMargin = k.dp(6);
+            view.addView(meter, mlp);
+            LinearLayout bottom = new LinearLayout(k.a);
+            bottom.setOrientation(LinearLayout.HORIZONTAL);
+            amount = k.text("", TEXT2, k.compact ? 12 : 13);
+            bottom.addView(amount, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            rate = k.text("", TEXT2, k.compact ? 12 : 13);
+            rate.setGravity(Gravity.END);
+            bottom.addView(rate, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            blp.topMargin = k.dp(6);
+            view.addView(bottom, blp);
+        }
+
+        /** got of total bytes (total <= 0: length unknown). */
+        void update(long got, long total) {
+            long now = android.os.SystemClock.uptimeMillis();
+            if (lastT == 0) { lastT = now; lastB = got; }
+            else if (now - lastT >= 500) {
+                double inst = (got - lastB) * 1000.0 / (now - lastT);
+                bps = bps == 0 ? inst : bps * 0.7 + inst * 0.3;
+                lastT = now;
+                lastB = got;
+                String r = bps > 0 ? mb((long) bps) + "/s" : "";
+                if (bps > 0 && total > got) {
+                    long s = (long) Math.ceil((total - got) / bps);
+                    r += "   " + S.t("liko ") + (s >= 3600 ? s / 3600 + ":" + two(s / 60 % 60) : s / 60 + "") + ":" + two(s % 60);
+                }
+                rate.setText(r);
+            }
+            if (total > 0) {
+                meter.setFraction(got / (float) total);
+                pct.setText((int) Math.min(100, got * 100 / total) + "%");
+                amount.setText(mb(got) + " / " + mb(total));
+            } else {
+                meter.setIndeterminate(true);
+                pct.setText("");
+                amount.setText(mb(got));
+            }
+        }
+
+        /** A step without a byte count: the sweeping meter and no speed. */
+        void busy(String s) {
+            status.setText(s);
+            meter.setIndeterminate(true);
+            rate.setText("");
+        }
+
+        static String mb(long bytes) { return String.format(java.util.Locale.ROOT, "%.1f MB", bytes / 1048576.0); }
+        private static String two(long v) { return v < 10 ? "0" + v : "" + v; }
+    }
+
+    /**
+     * The launcher's progress bar: a dark track in a steel frame, a green fill split into
+     * cells like the game's own meters, and a sweeping band while the length is unknown.
+     */
+    static final class Meter extends View {
+        private final android.graphics.Paint paint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        private final float d;
+        private float frac;
+        private boolean indeterminate;
+        private long sweepStart;
+
+        Meter(Activity a) {
+            super(a);
+            d = a.getResources().getDisplayMetrics().density;
+        }
+
+        void setFraction(float f) {
+            f = Math.max(0f, Math.min(1f, f));
+            if (f == frac && !indeterminate) return;
+            frac = f;
+            indeterminate = false;
+            invalidate();
+        }
+
+        void setIndeterminate(boolean on) {
+            if (on == indeterminate) return;
+            indeterminate = on;
+            sweepStart = android.os.SystemClock.uptimeMillis();
+            invalidate();
+        }
+
+        @Override protected void onMeasure(int w, int h) {
+            setMeasuredDimension(getDefaultSize(Math.round(160 * d), w), resolveSize(Math.round(14 * d), h));
+        }
+
+        @Override protected void onDraw(android.graphics.Canvas c) {
+            final float w = getWidth(), h = getHeight(), line = Math.max(1f, d);
+            paint.setStyle(android.graphics.Paint.Style.FILL);
+            paint.setShader(null);
+            paint.setColor(TRACK);
+            c.drawRect(0, 0, w, h, paint);
+            final float in = line * 2, top = in, bot = h - in, left = in, right = w - in;
+            if (indeterminate) {
+                float t = ((android.os.SystemClock.uptimeMillis() - sweepStart) % 1400) / 1400f;
+                float band = (right - left) * 0.28f;
+                float x0 = left - band + (right - left + band) * t;
+                paint.setShader(new android.graphics.LinearGradient(x0, 0, x0 + band, 0,
+                        new int[]{0x004FD46A, 0xFF4FD46A, 0x004FD46A}, null, android.graphics.Shader.TileMode.CLAMP));
+                c.save();
+                c.clipRect(left, top, right, bot);
+                c.drawRect(x0, top, x0 + band, bot, paint);
+                c.restore();
+                paint.setShader(null);
+                postInvalidateOnAnimation();
+            } else if (frac > 0f) {
+                float x = left + (right - left) * frac;
+                paint.setShader(new android.graphics.LinearGradient(0, top, 0, bot,
+                        0xFF6FE88A, 0xFF1F6B34, android.graphics.Shader.TileMode.CLAMP));
+                c.drawRect(left, top, x, bot, paint);
+                paint.setShader(null);
+                // cell gaps, as in the game's meters
+                paint.setColor(TRACK);
+                float cell = Math.max(6 * d, (right - left) / 40f);
+                for (float gx = left + cell; gx < x; gx += cell) c.drawRect(gx - line * 0.5f, top, gx + line * 0.5f, bot, paint);
+                paint.setColor(0x80FFFFFF);
+                c.drawRect(Math.max(left, x - line), top, x, bot, paint);
+            }
+            paint.setStyle(android.graphics.Paint.Style.STROKE);
+            paint.setStrokeWidth(line);
+            paint.setColor(STEEL);
+            c.drawRect(line / 2, line / 2, w - line / 2, h - line / 2, paint);
+        }
     }
 }

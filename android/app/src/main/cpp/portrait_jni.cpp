@@ -27,6 +27,7 @@
 #include "ui/casc_inflate.h"       // CASC reader + the stb-backed zlib inflate (HD portraits)
 #include "ui/webm.h"
 #include "ui/vp9_inter_pixels.h"   // the project VP9 decoder
+#include "ui/webm_art.h"           // SC:R menu art with alpha (campaign emblems)
 
 namespace {
 
@@ -406,6 +407,164 @@ Java_org_openbw_android_PortraitStore_nativeDecodeWebm(JNIEnv* env, jclass, jstr
 	}
 	env->ReleaseStringUTFChars(jCascDir, dir);
 	env->ReleaseStringUTFChars(jName, name);
+	if (px.empty()) return nullptr;
+	jintArray arr = env->NewIntArray((jsize)px.size());
+	if (arr) env->SetIntArrayRegion(arr, 0, (jsize)px.size(), px.data());
+	return arr;
+}
+
+// SC:R campaign emblem (glue/campaign/*.webm with alpha): [w, h, frames, us/frame, ARGB strip...]
+extern "C" JNIEXPORT jintArray JNICALL
+Java_org_openbw_android_PortraitStore_nativeDecodeArtWebm(JNIEnv* env, jclass, jstring jCascDir, jstring jName, jint step, jint maxH) {
+	const char* dir = env->GetStringUTFChars(jCascDir, nullptr);
+	const char* name = env->GetStringUTFChars(jName, nullptr);
+	bwgame::webm_art::strip_t s;
+	try {
+		std::vector<uint8_t> bytes;
+		{
+			std::lock_guard<std::mutex> lk(g_casc_mtx);
+			bwgame::casc::storage* c = get_casc(dir);
+			if (c && c->has_name(name)) c->read_name(name, bytes);
+		}
+		if (!bytes.empty()) s = bwgame::webm_art::decode(bytes.data(), bytes.size(), step, maxH);
+	} catch (...) {
+		s = bwgame::webm_art::strip_t();
+	}
+	env->ReleaseStringUTFChars(jCascDir, dir);
+	env->ReleaseStringUTFChars(jName, name);
+	if (s.frames <= 0 || s.px.empty()) return nullptr;
+	jintArray arr = env->NewIntArray((jsize)(4 + s.px.size()));
+	if (!arr) return nullptr;
+	jint head[4] = {s.w, s.h, s.frames, s.us_per_frame};
+	env->SetIntArrayRegion(arr, 0, 4, head);
+	env->SetIntArrayRegion(arr, 4, (jsize)s.px.size(), (const jint*)s.px.data());
+	return arr;
+}
+
+// Keyboard settings (Keybinds.java). The default bindings, from the table the game uses.
+#include "ui/kbm_defaults.h"
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_openbw_android_PortraitStore_nativeKeyDefaults(JNIEnv* env, jclass) {
+	std::string s;
+	for (int i = 0; i != kbm_defaults::count; ++i) {
+		if (i) s += ',';
+		s += kbm_defaults::table[i].id;
+		s += '=';
+		s += std::to_string(kbm_defaults::table[i].code);
+	}
+	return env->NewStringUTF(s.c_str());
+}
+
+// rez\stat_txt.tbl entries by 1-based index, raw bytes as chars 0..255 (a button
+// string is: hotkey byte, type byte, label with colour bytes). Missing -> "".
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_org_openbw_android_PortraitStore_nativeStatTxt(JNIEnv* env, jclass, jstring jGameDir, jintArray jIdx) {
+	const char* gamedir = env->GetStringUTFChars(jGameDir, nullptr);
+	const jsize n = env->GetArrayLength(jIdx);
+	std::vector<jint> idx((size_t)n);
+	if (n) env->GetIntArrayRegion(jIdx, 0, n, idx.data());
+	bwgame::a_vector<uint8_t> d;
+	try {
+		std::lock_guard<std::mutex> lk(g_mtx);
+		loader_t* l = get_loader(gamedir);
+		if (l && l->file_exists("rez\\stat_txt.tbl")) (*l)(d, "rez\\stat_txt.tbl");
+	} catch (...) {
+		d.clear();
+	}
+	env->ReleaseStringUTFChars(jGameDir, gamedir);
+	jobjectArray out = env->NewObjectArray(n, env->FindClass("java/lang/String"), nullptr);
+	if (!out) return nullptr;
+	const size_t count = d.size() >= 2 ? (size_t)(d[0] | (d[1] << 8)) : 0;
+	for (jsize i = 0; i != n; ++i) {
+		std::vector<jchar> s;
+		const size_t t = (size_t)idx[(size_t)i];
+		if (t >= 1 && t <= count && 2 + t * 2 <= d.size()) {
+			size_t off = (size_t)d[t * 2] | ((size_t)d[t * 2 + 1] << 8);
+			// a button string's type byte may be 0: keep it, stop at the next 0 after it
+			for (size_t k = off; k < d.size(); ++k) {
+				if (!d[k] && k != off + 1) break;
+				s.push_back((jchar)d[k]);
+			}
+		}
+		jstring js = env->NewString(s.data(), (jsize)s.size());
+		env->SetObjectArrayElement(out, i, js);
+		env->DeleteLocalRef(js);
+	}
+	return out;
+}
+
+// unit\cmdbtns\cmdicons.grp, every frame on its full canvas -> int[]{n, w, h, ARGB...}.
+// Pixel value 1..15 is a column of ticon.pcx's first (yellow) table, as the game draws
+// an enabled button; 0 is transparent.
+extern "C" JNIEXPORT jintArray JNICALL
+Java_org_openbw_android_PortraitStore_nativeCmdicons(JNIEnv* env, jclass, jstring jGameDir) {
+	const char* gamedir = env->GetStringUTFChars(jGameDir, nullptr);
+	std::vector<jint> px;
+	try {
+		bwgame::a_vector<uint8_t> g, p;
+		{
+			std::lock_guard<std::mutex> lk(g_mtx);
+			loader_t* l = get_loader(gamedir);
+			if (l && l->file_exists("unit\\cmdbtns\\cmdicons.grp")) (*l)(g, "unit\\cmdbtns\\cmdicons.grp");
+			if (l && l->file_exists("unit\\cmdbtns\\ticon.pcx")) (*l)(p, "unit\\cmdbtns\\ticon.pcx");
+		}
+		uint32_t col[256] = {};
+		for (int i = 0; i != 256; ++i) col[i] = 0xff000000u | ((uint32_t)i << 16) | ((uint32_t)i << 8) | (uint32_t)i;
+		if (p.size() > 128 + 769 && p[0] == 0x0a && p[3] == 8 && p[p.size() - 769] == 0x0c) {
+			const uint8_t* pal = p.data() + p.size() - 768;
+			for (int i = 0; i != 256; ++i) col[i] = 0xff000000u | ((uint32_t)pal[i * 3] << 16) | ((uint32_t)pal[i * 3 + 1] << 8) | pal[i * 3 + 2];
+			// first scanline of the 96x1 image: six 16-entry tables; table 0 = enabled
+			std::vector<uint8_t> line;
+			size_t pos = 128, end = p.size() - 769;
+			while (line.size() < 16 && pos < end) {
+				uint8_t b = p[pos++];
+				size_t k = 1;
+				if ((b & 0xc0) == 0xc0) { k = b & 0x3f; if (pos >= end) break; b = p[pos++]; }
+				while (k-- && line.size() < 16) line.push_back(b);
+			}
+			if (line.size() == 16) {
+				uint32_t t[16];
+				for (int i = 0; i != 16; ++i) t[i] = col[line[(size_t)i]];
+				for (int i = 1; i != 16; ++i) col[i] = t[i];
+			}
+		}
+		if (g.size() >= 6) {
+			const size_t n = (size_t)(g[0] | (g[1] << 8)), w = (size_t)(g[2] | (g[3] << 8)), h = (size_t)(g[4] | (g[5] << 8));
+			if (n > 0 && n < 4096 && w > 0 && h > 0 && w <= 256 && h <= 256 && 6 + n * 8 <= g.size()) {
+				px.assign(3 + n * w * h, 0);
+				px[0] = (jint)n; px[1] = (jint)w; px[2] = (jint)h;
+				for (size_t f = 0; f != n; ++f) {
+					const uint8_t* fh = g.data() + 6 + f * 8;
+					const size_t fx = fh[0], fy = fh[1], fw = fh[2], fhh = fh[3];
+					const size_t off = (size_t)fh[4] | ((size_t)fh[5] << 8) | ((size_t)fh[6] << 16) | ((size_t)fh[7] << 24);
+					jint* dst = px.data() + 3 + f * w * h;
+					for (size_t y = 0; y != fhh && fy + y < h; ++y) {
+						if (off + y * 2 + 2 > g.size()) break;
+						size_t pos = off + ((size_t)g[off + y * 2] | ((size_t)g[off + y * 2 + 1] << 8));
+						size_t x = 0;
+						while (x < fw && pos < g.size()) {
+							uint8_t c = g[pos++];
+							if (c & 0x80) { x += c & 0x7f; continue; }
+							if (c & 0x40) {
+								size_t k = c & 0x3f;
+								if (pos >= g.size()) break;
+								uint8_t v = g[pos++];
+								for (; k && x < fw; --k, ++x) if (v && fx + x < w) dst[(fy + y) * w + fx + x] = (jint)col[v];
+								continue;
+							}
+							for (size_t k = c; k && x < fw && pos < g.size(); --k, ++x) {
+								uint8_t v = g[pos++];
+								if (v && fx + x < w) dst[(fy + y) * w + fx + x] = (jint)col[v];
+							}
+						}
+					}
+				}
+			}
+		}
+	} catch (...) {
+		px.clear();
+	}
+	env->ReleaseStringUTFChars(jGameDir, gamedir);
 	if (px.empty()) return nullptr;
 	jintArray arr = env->NewIntArray((jsize)px.size());
 	if (arr) env->SetIntArrayRegion(arr, 0, (jsize)px.size(), px.data());

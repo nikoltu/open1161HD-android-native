@@ -47,7 +47,14 @@ namespace native_window {
 			// Mouse (Android, "classic" / "swapped" button modes): a click of the
 			// COMMAND button (right, or left when swapped) that neither moved nor was
 			// held -- the original's right click: the contextual order at the point.
-			type_command_click
+			type_command_click,
+			// Game controller (SDL_GameController): button = button index; for
+			// type_pad_axis button = axis index and mouse_x = the value (-32768..32767).
+			// type_pad_reset: a controller was disconnected.
+			type_pad_button_down,
+			type_pad_button_up,
+			type_pad_axis,
+			type_pad_reset
 		};
 		int type = type_none;
 		int sym = -1;

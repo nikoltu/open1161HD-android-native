@@ -3,6 +3,7 @@
 
 #include "bwgame.h"
 #include "replay.h"
+#include "ui/provenance.h"
 
 namespace bwgame {
 
@@ -546,6 +547,9 @@ struct replay_saver_state {
 	//   ai_script  per slot: the aiscript id the native AI was started with (0 = none)
 	//   alliances / shared_vision  as they stood before the first frame (teams)
 	bool has_setup = false;
+	// G10: game-data fingerprint of the active mods and their ids (0 = no data mods).
+	uint64_t mod_fp = 0;
+	a_string mods_csv;
 	std::array<uint32_t, 8> ai_script{};
 	std::array<std::array<uint8_t, 12>, 12> alliances{};
 	std::array<uint32_t, 12> shared_vision{};
@@ -671,7 +675,7 @@ struct replay_saver_functions {
 			giw.put<uint32_t>(replay_saver_st.players[i].color);
 		}
 		for (size_t i = 0; i != 8; ++i) {
-			giw.put<uint8_t>(0); // create_melee_units_for_player
+			giw.put<uint8_t>(replay_saver_st.setup_info.create_melee_units_for_player[i] ? 1 : 0);
 		}
 		
 		auto rw = data_loading::make_replay_file_writer(w);
@@ -695,7 +699,7 @@ struct replay_saver_functions {
 		// P5 trailer (raw, uncompressed, outside the crc/segment container):
 		// "OBQL" magic, version 1, qol bitmask. replay.h reads it back only when
 		// the bytes are there, so vanilla replays are untouched.
-		if (replay_saver_st.qol_bits || replay_saver_st.has_setup) {
+		if (replay_saver_st.qol_bits || replay_saver_st.has_setup || replay_saver_st.mod_fp) {
 			w.template put<uint32_t>(0x4C51424Fu); // 'O','B','Q','L' little-endian
 			w.template put<uint32_t>(replay_saver_st.has_setup ? 2 : 1);
 			w.template put<uint32_t>(replay_saver_st.qol_bits);
@@ -704,7 +708,22 @@ struct replay_saver_functions {
 				for (size_t i = 0; i != 12; ++i) for (size_t j = 0; j != 12; ++j) w.template put<uint8_t>(replay_saver_st.alliances[i][j]);
 				for (size_t i = 0; i != 12; ++i) w.template put<uint32_t>(replay_saver_st.shared_vision[i]);
 			}
+			// G10: "OBMD", version 1, fingerprint (lo, hi), mod ids (u32 length + bytes).
+			if (replay_saver_st.mod_fp) {
+				w.template put<uint32_t>(0x444D424Fu); // 'O','B','M','D'
+				w.template put<uint32_t>(1);
+				w.template put<uint32_t>((uint32_t)replay_saver_st.mod_fp);
+				w.template put<uint32_t>((uint32_t)(replay_saver_st.mod_fp >> 32));
+				size_t n = std::min(replay_saver_st.mods_csv.size(), (size_t)4096);
+				w.template put<uint32_t>((uint32_t)n);
+				for (size_t i = 0; i != n; ++i) w.template put<uint8_t>((uint8_t)replay_saver_st.mods_csv[i]);
+			}
 		}
+		// "OBAU": who made the program that recorded this replay. Readers skip it.
+		const std::string au = provenance::trailer_text();
+		w.template put<uint32_t>(provenance::trailer_magic);
+		w.template put<uint32_t>((uint32_t)au.size());
+		for (char c : au) w.template put<uint8_t>((uint8_t)c);
 	}
 	
 };

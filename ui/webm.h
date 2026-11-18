@@ -38,6 +38,7 @@ struct block_t {
 	bool keyframe = false;
 	size_t offset = 0;
 	size_t size = 0;
+	size_t alpha_offset = 0, alpha_size = 0;   // BlockAdditional (AlphaMode=1): a VP9 frame whose luma is alpha
 };
 
 struct file_t {
@@ -62,7 +63,7 @@ static inline bool is_master(uint64_t id) {
 	switch (id) {
 	case 0x1A45DFA3: case 0x18538067: case 0x1549A966: case 0x1654AE6B:
 	case 0xAE: case 0xE0: case 0x1F43B675: case 0x1C53BB6B: case 0xBB:
-	case 0xB7: case 0xA0:
+	case 0xB7: case 0xA0: case 0x75A1: case 0xA6:
 		return true;
 	default:
 		return false;
@@ -136,6 +137,11 @@ struct parser {
 			case 0x23E383: cur->default_dur = uint_at(p, size); return;      // DefaultDuration
 			default: return;
 			}
+		}
+		if (eid == 0xA5 && !f->frames.empty()) {     // BlockAdditional of the group's Block
+			f->frames.back().alpha_offset = p;
+			f->frames.back().alpha_size = size;
+			return;
 		}
 		if (eid == 0xA3 || eid == 0xA1) { // SimpleBlock / Block
 			size_t q = p;

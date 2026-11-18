@@ -35,9 +35,16 @@ struct sync_state {
 	// deterministic. Clients' own host_qol is unused (only the host broadcasts).
 	uint32_t host_qol = 0;
 	uint32_t start_game_qol = 0;
+	// Hash of this peer's exe requirement tables (0 = none); qol bit12 goes out only when all peers match.
+	uint32_t local_req_hash = 0;
 	// P4: the host's rules as seen in the LOBBY (carried by game_info, before the
 	// start message) so a joiner's lobby can show the "SCBW2 > N" badge.
 	uint32_t lobby_qol = 0;
+	// G10: game-data fingerprint of the host's active mods (0 = none). Sent after
+	// lobby_qol only when non-zero, so a classic lobby's bytes are unchanged.
+	uint64_t host_mod_fp = 0;
+	uint64_t lobby_mod_fp = 0;
+	bool lobby_info_seen = false;
 	bool game_started = false;
 
 	struct uid_t {
@@ -93,6 +100,7 @@ struct sync_state {
 		a_circular_vector<scheduled_action> scheduled_actions;
 		uint8_t frame = 0;
 		a_string name;
+		uint32_t req_hash = 0;
 		bool ready = false;            // v0.40 lobby ready-check
 		int picked_race = -1;         // v0.44 chosen race (0/1/2), -1 = random
 		bool game_started = false;
@@ -120,6 +128,7 @@ struct sync_state {
 
 	int successful_action_count = 0;
 	int failed_action_count = 0;
+	int rejected_action_count = 0;
 	std::array<uint32_t, 4> insync_hash{};
 	uint8_t insync_hash_index = 0;
 
@@ -195,11 +204,78 @@ namespace sync_messages {
 	};
 }
 
+// LAN command whitelist: a peer's message is one action. 0 = accept; otherwise the
+// reason it is dropped. Pure, so every peer reaches the same verdict.
+enum lan_reject_t {
+	lan_ok = 0, lan_reject_opcode, lan_reject_length, lan_reject_value
+};
+// ext_types: the Extended mod types installed (ids 256 .. 256 + ext_types - 1 are valid too).
+inline int lan_action_verdict(const uint8_t* p, size_t n, size_t ext_types = 0) {
+	if (n == 0) return lan_reject_length;
+	auto u16 = [&](size_t o) { return (size_t)(p[o] | p[o + 1] << 8); };
+	auto bad_type = [&](size_t t) { return t >= 228 && !(t >= 256 && t - 256 < ext_types); };
+	const int op = p[0];
+	size_t len = 0;
+	switch (op) {
+	case 9: case 10: case 11:
+		if (n < 2 || p[1] > 12) return lan_reject_value;
+		len = 2 + 2 * (size_t)p[1];
+		break;
+	case 12: len = 8; break;
+	case 13: len = 3; break;
+	case 14: len = 5; break;
+	case 19: len = 3; break;
+	case 20: len = 10; break;
+	case 21: len = 11; break;
+	case 24: case 25: case 27: case 28: case 39: case 42: case 46: case 49: case 51: case 52: case 54: case 90:
+		len = 1; break;
+	case 26: case 30: case 33: case 34: case 37: case 38: case 40: case 43: case 44: case 45: case 48: case 50: case 87:
+		len = 2; break;
+	case 31: case 32: case 35: case 41: case 53: len = 3; break;
+	case 47: case 88: len = 5; break;
+	case 92: len = 82; break;
+	case 211: // GE5 ability: cast / learn
+		if (n < 2 || p[1] > 1) return lan_reject_value;
+		len = p[1] == 0 ? 8 : 3;
+		break;
+	default: return lan_reject_opcode; // includes 18 (cheat), 210 (debug edits) and replay-only opcodes
+	}
+	if (n != len) return lan_reject_length;
+	switch (op) {
+	case 12:
+		if (p[1] >= 189 || bad_type(u16(6))) return lan_reject_value;
+		break;
+	case 14: {
+		uint32_t v = (uint32_t)p[1] | (uint32_t)p[2] << 8 | (uint32_t)p[3] << 16 | (uint32_t)p[4] << 24;
+		for (int i = 0; i != 12; ++i, v >>= 2) if ((v & 3) > 2) return lan_reject_value;
+		break;
+	}
+	case 20:
+		if (u16(7) > 228) return lan_reject_value;
+		break;
+	case 21:
+		if (u16(7) > 228 || p[9] >= 189) return lan_reject_value;
+		break;
+	case 31: case 35: case 53:
+		if (bad_type(u16(1))) return lan_reject_value;
+		break;
+	case 48:
+		if (p[1] >= 44) return lan_reject_value;
+		break;
+	case 50:
+		if (p[1] >= 61) return lan_reject_value;
+		break;
+	}
+	return lan_ok;
+}
+
 struct sync_functions: action_functions {
 	sync_state& sync_st;
 	explicit sync_functions(state& st, action_state& action_st, sync_state& sync_st) : action_functions(st, action_st), sync_st(sync_st) {}
 
 	std::function<void(int player_slot, data_loading::data_reader_le&)> on_custom_action;
+	// A peer message the whitelist dropped (lan_reject_t reason, opcode, size); the same on every peer.
+	std::function<void(int player_slot, int reason, int opcode, size_t size)> on_rejected_action;
 
 	template<typename action_F>
 	void execute_scheduled_actions(action_F&& action_f) {
@@ -416,6 +492,7 @@ struct sync_functions: action_functions {
 							if (!c) break;
 							client->name += c;
 						}
+						client->req_hash = r.left() >= 4 ? r.template get<uint32_t>() : 0;
 
 						for (int i = 0; i != 12; ++i) {
 							st.players[i].controller = sync_st.initial_slot_controllers[i];
@@ -514,10 +591,16 @@ struct sync_functions: action_functions {
 				w.put<uint8_t>(c);
 			}
 			w.put<uint8_t>(0);
+			w.put<uint32_t>(sync_st.local_req_hash);
 			send(w, h);
 		}
 
 		void send_start_game() {
+			bool req_ok = sync_st.local_req_hash != 0;
+			for (auto* c : ptr(sync_st.clients)) {
+				if (c->has_uid && c != sync_st.local_client && c->req_hash != sync_st.local_req_hash) req_ok = false;
+			}
+			const uint32_t qol = req_ok ? sync_st.host_qol | 4096u : sync_st.host_qol & ~4096u;
 			writer<9> w;
 			w.put<uint8_t>(sync_messages::id_start_game);
 			uint32_t seed = 0;
@@ -525,7 +608,7 @@ struct sync_functions: action_functions {
 				seed ^= v;
 			}
 			w.put<uint32_t>(seed);
-			w.put<uint32_t>(sync_st.host_qol); // task 1: negotiate house-rules to every peer
+			w.put<uint32_t>(qol); // task 1: negotiate house-rules to every peer
 			send(w);
 		}
 		void send_switch_to_slot(int n) {
@@ -595,6 +678,10 @@ struct sync_functions: action_functions {
 			}
 			w.put<uint8_t>(0);
 			w.put<uint32_t>(sync_st.host_qol); // P4: lobby badge on the joiner (after the 0 terminator)
+			if (sync_st.host_mod_fp) {
+				w.put<uint32_t>((uint32_t)sync_st.host_mod_fp);
+				w.put<uint32_t>((uint32_t)(sync_st.host_mod_fp >> 32));
+			}
 			send(w, h);
 		}
 
@@ -665,6 +752,20 @@ struct sync_functions: action_functions {
 				add(u->exact_position.x.raw_value);
 				add(u->exact_position.y.raw_value);
 			}
+			if (!st.game->ext_heroes.empty()) {
+				for (unit_t* u : ptr(st.visible_units)) {
+					if (u->hero < 0) continue;
+					add(u->hero_level);
+					add(u->hero_xp);
+					add(u->hero_points);
+					for (int a : u->hero_attr) add(a);
+				}
+			}
+			if (st.game->oescript.loaded) {
+				uint64_t h = st.oes.hash();
+				add((uint32_t)h);
+				add((uint32_t)(h >> 32));
+			}
 
 			if (sync_st.insync_hash_index == sync_st.insync_hash.size() - 1) sync_st.insync_hash_index = 0;
 			else ++sync_st.insync_hash_index;
@@ -724,20 +825,24 @@ struct sync_functions: action_functions {
 			// every peer), so it never desyncs, and it fixes races being lost to
 			// message ordering / the map's initial slot race gating.
 			for (auto* c : ptr(sync_st.clients)) {
-				if (c->player_slot >= 0 && c->player_slot < 12 && c->picked_race >= 0 && c->picked_race <= 2)
+				if (c->player_slot >= 0 && c->player_slot < 12 && c->picked_race >= 0 && c->picked_race <= 2
+						&& (sync_st.game_type_melee || (int)sync_st.initial_slot_races[c->player_slot] == 5))
 					st.players[c->player_slot].race = (bwgame::race_t)c->picked_race;
 			}
 
 			for (int i = 0; i != 12; ++i) {
 				auto& v = st.players[i];
 				if (v.controller == player_t::controller_computer) {
-					v.controller = player_t::controller_occupied;
+					// UMS: a map computer stays a computer (its triggers and AI run)
+					v.controller = sync_st.game_type_melee ? player_t::controller_occupied : player_t::controller_computer_game;
 				}
 				sync_st.picked_races[i] = v.race;
 				if (!funcs.player_slot_active(i)) {
 					v.controller = player_t::controller_inactive;
 				} else {
-					if ((int)v.race > 2) v.race = (bwgame::race_t)funcs.lcg_rand(144, 0, 2);
+					// UMS: only user-selectable / random slots; independent and neutral keep their race
+					if ((int)v.race > 2 && (sync_st.game_type_melee || (int)v.race == 5 || (int)v.race == 6))
+						v.race = (bwgame::race_t)funcs.lcg_rand(144, 0, 2);
 				}
 			}
 
@@ -774,12 +879,9 @@ struct sync_functions: action_functions {
 				}
 			};
 
+			// UMS keeps the map's slot order: each player is in the slot it took
 			if (sync_st.game_type_melee) {
 				randomize_slots([](size_t){return true;});
-			} else {
-				for (int force = 1; force <= 4; ++force) {
-					randomize_slots([&](size_t index){return st.players.at(index).force == force;});
-				}
 			}
 			sync_st.game_started = true;
 
@@ -827,9 +929,22 @@ struct sync_functions: action_functions {
 				funcs.execute_scheduled_actions([this](sync_state::client_t* client, auto& r) {
 					if (client->game_started) {
 						if (client->player_slot != -1) {
+							auto reject = [&](int reason, int opcode) {
+								++sync_st.rejected_action_count;
+								if (funcs.on_rejected_action) funcs.on_rejected_action(client->player_slot, reason, opcode, r.left());
+								return true;
+							};
+							if (r.left() == 0) return reject(lan_reject_length, -1);
 							int sync_message_id = r.template get<uint8_t>();
 							if (sync_message_id == sync_messages::id_game_started_escape) {
+								if (r.left() == 0) return reject(lan_reject_length, 0xdc);
 								int id = r.template get<uint8_t>();
+								if (id == sync_messages::id_create_unit || id == sync_messages::id_kill_unit || id == sync_messages::id_remove_unit) {
+									return reject(lan_reject_opcode, 0xdc00 | id);
+								}
+								if (id == sync_messages::id_insync_check && (r.left() != 5 || r.ptr[0] >= sync_st.insync_hash.size())) {
+									return reject(lan_reject_length, 0xdc00 | id);
+								}
 								switch (id) {
 								case sync_messages::id_insync_check: {
 									uint8_t index = r.template get<uint8_t>();
@@ -869,6 +984,7 @@ struct sync_functions: action_functions {
 							} else {
 								r.seek(r.tell() - 1);
 							}
+							if (int reason = lan_action_verdict(r.ptr, r.left(), st.game->ext_unit_types.size())) return reject(reason, sync_message_id);
 							if (sync_st.save_replay) {
 								size_t t = r.tell();
 								size_t n = r.left();
@@ -920,6 +1036,12 @@ struct sync_functions: action_functions {
 							}
 						}
 						sync_st.lobby_qol = r.template get<uint32_t>(); // P4: host's house-rules for the badge
+						if (r.left() >= 8) {
+							uint64_t lo = r.template get<uint32_t>();
+							uint64_t hi = r.template get<uint32_t>();
+							sync_st.lobby_mod_fp = lo | (hi << 32);
+						} else sync_st.lobby_mod_fp = 0;
+						sync_st.lobby_info_seen = true;
 						break;
 					case sync_messages::id_occupy_slot: {
 						int n = r.template get<uint8_t>();
@@ -948,6 +1070,7 @@ struct sync_functions: action_functions {
 							// start_game can re-apply it regardless of the map's
 							// initial slot race or message ordering (fixes the
 							// host race being knocked to random).
+							if (!sync_st.game_type_melee && (int)sync_st.initial_slot_races[client->player_slot] != 5) break;
 							client->picked_race = (int)race;
 							if ((int)race >= 0 && (int)race <= 2)
 								st.players[client->player_slot].race = race;

@@ -270,7 +270,7 @@
 		// v0.126.004: no captions under IDLE / ARMY / PING / SHIFT (they look
 		// bad) -- the icon and the count say it; both sit in the middle of the key.
 		struct { rect r; int icon; int n; } b[2] = {
-			{L.idle, cmdicon_repair, nidle}, {L.army, cmdicon_attack, narmy}};
+			{L.idle, idle_worker_icon(), nidle}, {L.army, cmdicon_attack, narmy}};
 		for (auto& k : b) {
 			const bool dim = k.n == 0;
 			hud3_box(data, pitch, k.r, false, hud_pressed(k.r), dim ? th.util_line_zero : th.util_line);
@@ -385,11 +385,12 @@
 
 	// ---- the dock (3x3 grid or arc) ---------------------------------------------
 	static bool hud3_instant(const card_button_t& b) {
-		return b.action == cardact_stop || b.action == cardact_ability || b.action == cardact_cancel
+		return b.action == cardact_stop || b.action == cardact_ability || b.action == cardact_cancel || b.action == cardact_ext_cast
 		    || b.action == cardact_liftoff || b.action == cardact_morph || b.action == cardact_morph_building;
 	}
 	static bool hud3_submenu(const card_button_t& b) {
-		return b.action == cardact_menu_build || b.action == cardact_menu_adv || b.action == cardact_select_larva;
+		return b.action == cardact_menu_build || b.action == cardact_menu_adv || b.action == cardact_menu_mods || b.action == cardact_select_larva
+		    || b.action == cardact_menu_abilities || b.action == cardact_ext_learn_menu;
 	}
 	// A lightning bolt (instant) or a small triangle (opens a menu) in a corner.
 	void hud3_corner_mark(uint32_t* data, size_t pitch, rect r, bool instant, bool submenu) {
@@ -425,7 +426,7 @@
 				fill_rect_rgba(data, pitch, r, armed ? th.armed_fill : (hud_pressed(r) ? th.btn_pressed : th.btn_fill));
 				line_rectangle_rgba(data, pitch, r, armed ? th.armed_line : th.btn_line);
 			}
-			int icon = card_icon_frame(b.action, b.arg);
+			int icon = button_icon(b);
 			rect ir = r;
 			if (hud3_labels_everywhere && !hud3_arc_dock()) ir.to.y -= d3(12);
 			if (icon >= 0 && cmdicons_ok) {
@@ -434,7 +435,7 @@
 			} else draw_card_label(data, pitch, r, b.label);
 			if (hud3_labels_everywhere && !hud3_arc_dock()) hud3_text_c(data, pitch, r, r.to.y - d3(7), b.label, 0xffb8c0c8u, 100);
 			hud3_corner_mark(data, pitch, r, hud3_instant(b), hud3_submenu(b));
-			kbm_draw_card_key(data, pitch, r, i, 85);
+			kbm_draw_card_key(data, pitch, r, b, i, 85);
 			if (!b.available) {
 				blend_rect_rgba(data, pitch, r, th.dim_rgb, 150);
 				if (!hud3_arc_dock()) line_rectangle_rgba(data, pitch, r, th.dim_line);
@@ -462,6 +463,7 @@
 			break;
 		}
 		case cardact_ability_target: en = hud3_order_energy(b.arg); break;
+		case cardact_ext_cast: en = hud3_ext_energy(b.arg); break;
 		default: break;
 		}
 		if (en > 0) snprintf(out, n, "%de", en);
@@ -471,10 +473,16 @@
 	}
 	// Energy a targeted spell costs (0 for orders that are not spells).
 	int hud3_order_energy(int order_id) {
+		if (order_id >= ext_target_base) return hud3_ext_energy(order_id - ext_target_base);
 		const order_type_t* o = get_order_type((Orders)order_id);
 		if (!o || o->tech_type == TechTypes::None) return 0;
 		const tech_type_t* t = get_tech_type(o->tech_type);
 		return t ? t->energy_cost : 0;
+	}
+	int hud3_ext_energy(int ability) {
+		unit_t* u = focus_or_primary();
+		int i = u ? ext_ability_index(u, ability) : -1;
+		return i < 0 ? 0 : ext_ability_cost(game_st.ext_abilities[(size_t)ability], std::max(1, (int)u->ab_rank[i]));
 	}
 	bool hud3_affordable(const card_button_t& b) {
 		if (game_local_player < 0) return true;
@@ -491,6 +499,7 @@
 			break;
 		}
 		case cardact_ability_target: en = hud3_order_energy(b.arg); break;
+		case cardact_ext_cast: en = hud3_ext_energy(b.arg); break;
 		default: break;
 		}
 		if (st.current_minerals[p] < mi || st.current_gas[p] < ga) return false;
@@ -600,7 +609,7 @@
 			const unit_type_t* act = u->build_queue[0];
 			w.rem = u->current_build_unit ? u->current_build_unit->remaining_build_time : u->remaining_build_time;
 			if (!bldg && !u->current_build_unit && w.rem == 0) return w;   // a worker still walking to its site
-			w.busy = true; w.icon = (int)act->id; w.total = act->build_time;
+			w.busy = true; w.icon = (int)act->behaves_as; w.total = act->build_time;
 			if (bldg && !u->current_build_unit) w.rem = w.total;            // queued this very frame: nothing done yet
 			if (!bldg) w.caption = "Morphing";                       // an Egg / Cocoon: it IS the thing being made
 			else if (ut_building(act)) w.caption = "Building";        // an addon going up
@@ -609,7 +618,7 @@
 			return w;
 		}
 		if (bldg && !u_completed(u)) {
-			w.busy = true; w.icon = (int)u->unit_type->id; w.total = u->unit_type->build_time; w.rem = u->remaining_build_time;
+			w.busy = true; w.icon = (int)u->unit_type->behaves_as; w.total = u->unit_type->build_time; w.rem = u->remaining_build_time;
 			w.caption = pr == race_t::zerg ? "Evolving" : pr == race_t::protoss ? "Warping" : "Building";
 			return w;
 		}
@@ -807,7 +816,7 @@
 				draw_text_rgba(data, pitch, n.from.x, n.from.y, nb, col);
 			};
 			const int hpp = unit_hp_percent(u);
-			pool((int)u->hp.integer_part(), (int)u->unit_type->hitpoints.integer_part(), hp_tint(hpp) | 0xff000000u);
+			pool((int)u->hp.integer_part(), (int)unit_max_hp(u).integer_part(), hp_tint(hpp) | 0xff000000u);
 			if (u->unit_type->has_shield) pool((int)u->shield_points.integer_part(), u->unit_type->shield_points, 0xff5cb0ffu);
 			if (u->unit_type->flags & unit_type_t::flag_has_energy) pool((int)u->energy.integer_part(), (int)unit_max_energy(u).integer_part(), 0xffc884ffu);
 			// a resource says what is left, on the next free row
@@ -838,6 +847,8 @@
 				cap = cbuf; capcol = 0xffa8b0b8u;
 				(void)n;
 			}
+			char hbuf[48];
+			if (!cap[0] && u->hero_level > 0 && ext_hero_line(u, hbuf, sizeof hbuf)) { cap = hbuf; capcol = th.amber; }
 			if (cap[0]) { rect cr = hud3_cr(88, 59, 170, 17); draw_text_rgba(data, pitch, cr.from.x, cr.from.y, cap, capcol); }
 		}
 		// the right side
@@ -857,7 +868,7 @@
 						draw_text_rgba(data, pitch, r.from.x + d3(3), r.from.y + 1, lv, th.amber);
 					}
 				} else if (i < (int)u->build_queue.size() && cmdicons_ok) {
-					draw_cmdicon_fit(data, pitch, (int)u->build_queue[(size_t)i]->id, r);
+					draw_cmdicon_fit(data, pitch, (int)u->build_queue[(size_t)i]->behaves_as, r);
 					blend_rect_rgba(data, pitch, {{r.from.x + 1, r.from.y + 1}, {r.to.x - 1, r.to.y - 1}}, th.dim_rgb, 110);   // waiting: dimmed
 				}
 				// only a training queue is cancelled slot by slot (a construction / egg slot does nothing)
@@ -935,7 +946,11 @@
 				if (u->parasite_flags) status("Parasite Detected", 0xffff8080u);
 				if (u_disabled(u)) status("Disabled", 0xffa0a8b0u);
 				const char* rank = unit_rank_name(u);
-				if (rank && !bldg) status(rank, 0xffc8b878u);
+				if (const ext_hero_def* hd = ext_hero(u)) {
+					status(hd->name.empty() ? hd->id.c_str() : hd->name.c_str(), th.amber);
+					char pts[32]; snprintf(pts, sizeof pts, "%s: %d", this->L("Skill points"), u->hero_points);
+					status(pts, 0xffc8b878u);
+				} else if (rank && !bldg) status(rank, 0xffc8b878u);
 				if (work.busy) {
 					rect r1 = UR(270, 8, 244, 17), r2 = UR(270, 25, 244, 17);
 					a_string what;
@@ -1039,7 +1054,7 @@
 		if (scv && unit_race(t) == race_t::terran) {
 			if (ut_building(t) && !u_completed(t)) return "BUILD";
 			const bool mech = ut_building(t) || ut_flag(t, unit_type_t::flag_mechanical);
-			if (mech && t->hp < t->unit_type->hitpoints) return "REPAIR";
+			if (mech && t->hp < unit_max_hp(t)) return "REPAIR";
 		}
 		return nullptr;
 	}
@@ -1485,7 +1500,7 @@
 					mark_box(data, pitch, px - 1, py - 1, px + 1, py + 1, th.ping_edge, (int)screen_height);
 				}
 			} else if (s.card >= 0 && (size_t)s.card < b.size()) {
-				const int icon = card_icon_frame(b[(size_t)s.card].action, b[(size_t)s.card].arg);
+				const int icon = button_icon(b[(size_t)s.card]);
 				if (icon >= 0 && cmdicons_ok) draw_cmdicon_fit(data, pitch, icon, ir, false, 6, hov ? 0xffffffu : th.icon_tint);
 				hud3_corner_mark(data, pitch, {{ir.to.x - d3(2), ir.from.y}, {ir.to.x + d3(10), ir.from.y + d3(12)}}, hud3_instant(b[(size_t)s.card]), hud3_submenu(b[(size_t)s.card]));
 			}

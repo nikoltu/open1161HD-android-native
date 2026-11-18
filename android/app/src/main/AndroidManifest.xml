@@ -12,8 +12,16 @@
     <!-- v1.0.24: in-app update (Updater.java) hands a downloaded release APK to PackageInstaller. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
+    <!-- World Editor "Test in engine": the game returns to the editor that started a test session. -->
+    <queries>
+        <package android:name="org.openbw.editor" />
+    </queries>
+
     <uses-feature
         android:glEsVersion="0x00020000"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.gamepad"
         android:required="false" />
 
     <application

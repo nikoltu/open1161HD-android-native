@@ -200,6 +200,9 @@ public class OpenBWActivity extends SDLActivity {
     public static final String EXTRA_ENEMY_RACE = "enemyRace";
     public static final String EXTRA_RACES = "races";         // String: per active slot race csv ("1,0,2"); index 0 = local
     public static final String EXTRA_COLORS = "colors";       // String: per active slot colour csv (0..7); index 0 = local (render-only)
+    public static final String EXTRA_UMS_SLOTS = "umsSlots";  // String: UMS lobby per map slot 0-7, 'c' computer / 'x' closed
+    public static final String EXTRA_UMS_RACES = "umsRaces";  // String: UMS lobby per map slot 0-7 race csv
+    public static final String EXTRA_UMS_LOCAL = "umsLocal";  // int: the human's map slot (.oecampaign mission), -1 = first
     public static final String EXTRA_NET_HOST = "netHost";    // boolean: host a LAN game
     public static final String EXTRA_NET_JOIN = "netJoin";    // String: host IP to join
     public static final String EXTRA_NET_FAST = "netFast";    // boolean: launcher lobby already agreed - auto-start, no in-game ready
@@ -212,6 +215,7 @@ public class OpenBWActivity extends SDLActivity {
     public static final String EXTRA_MODS = "mods"; // csv of active mod ids (files/mods/<id>/)
     public static final String EXTRA_GAME_MODE = "gameMode"; // melee | ums | <trg name>
     public static final String EXTRA_CAMPAIGN = "campaign"; // campaign/<race>/<mission> in the MPQ chain
+    public static final String EXTRA_OEC_MISSION = "oecMission"; // G11: "oec:<campaign>/<mission>" of a .oecampaign
     public static final String EXTRA_VS_AI = "vsAi"; // melee: opponents run the aiscript AI
     public static final String EXTRA_PLAYER_NAME = "playerName"; // UserID: shown as the player's "Name"
     public static final String EXTRA_NAME_PORTRAITS = "namePortraits"; // LAN: "id=name|id=name" (render-only)
@@ -223,6 +227,18 @@ public class OpenBWActivity extends SDLActivity {
     public static final String EXTRA_BOT = "botLib"; // v0.24: path to a bot .so (internal storage)
     public static final String EXTRA_LOAD_SAVE = "loadSave"; // v0.86: .sav path to resume from
     public static final String EXTRA_AUTOSAVE_AT = "autosaveAt"; // v0.86 test hook: write slot 1 at frame N
+    // World Editor "Test in engine": a single-player map run that writes an oetrace/1
+    // trace (ui/test_trace.h) and, on exit, starts the editor's return activity.
+    public static final String EXTRA_TEST_SESSION = "testSession";        // String [A-Za-z0-9._-]{1,64}
+    public static final String EXTRA_TEST_TRACE = "testTrace";            // String: absolute *.oetrace.jsonl path
+    public static final String EXTRA_TEST_RETURN_PACKAGE = "testReturnPackage";
+    public static final String EXTRA_TEST_RETURN_CLASS = "testReturnClass";
+    public static final String EXTRA_SEED = "seed";                       // int/long: fixed RNG seed (u32)
+    public static final String EXTRA_TEST_FRAMES = "testFrames";          // int: end the session at this sim frame
+    public static final String EXTRA_TEST_MAP_SHA256 = "testMapSha256"; // String: 64 hex, the staged map; a different loaded file ends the test
+    public static final String EXTRA_TEST_FRAME_HASH = "testFrameHash";    // int: frameHash trace event every n sim frames
+    public static final String EXTRA_OESCRIPT = "oescript";               // String: absolute *.obc path, the map's OEScript
+    public static final String ACTION_TEST_RESULT = "org.openbw.android.action.TEST_RESULT";
 
     // Render scale (half of native resolution) is handled on the native
     // side: ui/sdl2.cpp renders into a half-size texture and the GPU
@@ -257,6 +273,10 @@ public class OpenBWActivity extends SDLActivity {
                 // touch the deterministic sim -- so overriding is desync-safe; the
                 // game-defining args (map/race/players/mods/...) stay from the save.
                 appendDisplayArgs(args);
+                // G10: what the save's mods hash to today; native refuses a changed set.
+                String savedMods = ModFingerprint.modsArg(saved);
+                String fpNow = ModFingerprint.of(this, savedMods);
+                args.add("--mod-fingerprint-now"); args.add(fpNow.isEmpty() ? "0" : fpNow);
                 args.add("--version-code"); args.add(String.valueOf(appVersionCode()));
                 args.add("--load"); args.add(loadSave);
                 return args.toArray(new String[0]);
@@ -277,6 +297,12 @@ public class OpenBWActivity extends SDLActivity {
             if (races != null && !races.isEmpty()) { args.add("--races"); args.add(races); }
             String colors = getIntent().getStringExtra(EXTRA_COLORS);
             if (colors != null && !colors.isEmpty()) { args.add("--colors"); args.add(colors); }
+            String umsSlots = getIntent().getStringExtra(EXTRA_UMS_SLOTS);
+            if (umsSlots != null && !umsSlots.isEmpty()) { args.add("--ums-slots"); args.add(umsSlots); }
+            String umsRaces = getIntent().getStringExtra(EXTRA_UMS_RACES);
+            if (umsRaces != null && !umsRaces.isEmpty()) { args.add("--ums-races"); args.add(umsRaces); }
+            int umsLocal = getIntent().getIntExtra(EXTRA_UMS_LOCAL, -1);
+            if (umsLocal >= 0 && umsLocal < 8) { args.add("--ums-local"); args.add(String.valueOf(umsLocal)); }
             args.add("--players");
             args.add(String.valueOf(getIntent().getIntExtra(EXTRA_PLAYERS, 2)));
             // Player colour choice (0..7 = the classic BW colours; render-only). The
@@ -301,6 +327,23 @@ public class OpenBWActivity extends SDLActivity {
             }
             int netPort = getIntent().getIntExtra(EXTRA_NET_PORT, 0);
             if (netPort > 0) { args.add("--net-port"); args.add(String.valueOf(netPort)); }
+            String trace = testTracePath();
+            if (trace != null) {
+                args.add("--test-session"); args.add(getIntent().getStringExtra(EXTRA_TEST_SESSION));
+                args.add("--test-trace"); args.add(trace);
+                long seed = testSeed();
+                if (seed >= 0) { args.add("--seed"); args.add(String.valueOf(seed)); }
+                int frames = getIntent().getIntExtra(EXTRA_TEST_FRAMES, -1);
+                if (frames >= 0) { args.add("--test-frames"); args.add(String.valueOf(frames)); }
+                int frameHash = getIntent().getIntExtra(EXTRA_TEST_FRAME_HASH, getIntent().getIntExtra("frameHash", 0));
+                if (frameHash > 0) { args.add("--test-frame-hash"); args.add(String.valueOf(frameHash)); }
+                String sha = getIntent().getStringExtra(EXTRA_TEST_MAP_SHA256);
+                if (sha == null) sha = getIntent().getStringExtra("mapSha256");
+                if (sha != null && sha.matches("[0-9A-Fa-f]{64}")) { args.add("--test-map-sha256"); args.add(sha); }
+            }
+            String script = getIntent().getStringExtra(EXTRA_OESCRIPT);
+            if (script == null) script = getIntent().getStringExtra("script");
+            if (script != null && script.endsWith(".obc") && !script.contains("..")) { args.add("--oescript"); args.add(script); }
         } else if (replay != null) {
             args.add(replay);
         }
@@ -309,11 +352,17 @@ public class OpenBWActivity extends SDLActivity {
         args.add("--music-volume");
         args.add(String.valueOf(getIntent().getIntExtra(EXTRA_MUSIC_VOLUME, 40)));
         String mods = getIntent().getStringExtra(EXTRA_MODS);
-        if (mods != null && !mods.isEmpty()) { args.add("--mods"); args.add(mods); }
+        if (mods != null && !mods.isEmpty()) {
+            args.add("--mods"); args.add(mods);
+            String fp = ModFingerprint.of(this, mods);
+            if (!fp.isEmpty()) { args.add("--mod-fingerprint"); args.add(fp); }
+        }
         String gameMode = getIntent().getStringExtra(EXTRA_GAME_MODE);
         if (gameMode != null && !gameMode.isEmpty()) { args.add("--game-mode"); args.add(gameMode); }
         String campaignDir = getIntent().getStringExtra(EXTRA_CAMPAIGN);
         if (campaignDir != null && !campaignDir.isEmpty()) { args.add("--campaign"); args.add(campaignDir); }
+        String oecMission = getIntent().getStringExtra(EXTRA_OEC_MISSION);
+        if (oecMission != null && !oecMission.isEmpty()) { args.add("--oec-mission"); args.add(oecMission); }
         if (getIntent().getBooleanExtra(EXTRA_VS_AI, false)) { args.add("--vs-ai"); args.add("1"); }
         String playerName = getIntent().getStringExtra(EXTRA_PLAYER_NAME);
         if (playerName != null && !playerName.isEmpty()) { args.add("--player-name"); args.add(playerName); }
@@ -430,6 +479,7 @@ public class OpenBWActivity extends SDLActivity {
           if (sun) { args.add("--sun-shadow"); args.add("1");
             args.add("--sun-shadow-len"); args.add(String.valueOf(getIntent().getIntExtra("sunShadowLen", dev.getInt("sunShadowLen", 40))));
             args.add("--sun-shadow-sign"); args.add(String.valueOf(getIntent().getIntExtra("sunShadowSign", dev.getInt("sunShadowSign", 1)))); } }
+        if (getIntent().getBooleanExtra("scrFont", dev.getBoolean("scrFont", false))) { args.add("--scr-font"); args.add("1"); }
         { boolean pl = getIntent().getBooleanExtra("pointLights", dev.getBoolean("pointLights", false));
           if (pl) { args.add("--point-lights"); args.add("1");
             args.add("--light-strength"); args.add(String.valueOf(getIntent().getIntExtra("lightStrength", dev.getInt("lightStrength", 100)))); } }
@@ -450,6 +500,12 @@ public class OpenBWActivity extends SDLActivity {
         args.add("--input-mode");    args.add(Keybinds.kbm(dev) ? "kbm" : "touch");
         args.add("--edge-scroll");   args.add(dev.getBoolean("edgeScroll", true) ? "1" : "0");
         args.add("--key-binds");     args.add(Keybinds.arg(dev));
+        args.add("--key-layout");    args.add(Keybinds.classic(dev) ? "classic" : "grid");
+        args.add("--gamepad");       args.add(Kit.gamepadAllowed(this) && PadBinds.on(dev) ? "1" : "0");
+        args.add("--pad-map");       args.add(PadBinds.arg(dev));
+        args.add("--pad-speed");     args.add(String.valueOf(dev.getInt("padSpeed", 100)));
+        args.add("--pad-dead");      args.add(String.valueOf(dev.getInt("padDead", 18)));
+        if (dev.getBoolean("padSwap", false)) args.add("--pad-swap");
         args.add("--render-interp"); args.add(dev.getBoolean("renderInterp", true) ? "1" : "0");
         args.add("--zoom-buttons");  args.add(dev.getBoolean("showZoomButtons", false) ? "1" : "0");
         // HUD style (Settings > Interface): v2 "Klasikinis" (default) or v3 "Lietimo".
@@ -544,6 +600,29 @@ public class OpenBWActivity extends SDLActivity {
 
     private boolean isReplay;
 
+    // Native SDL message boxes in the launcher's look: no title, the text and the
+    // buttons. A lone "OK" on an error / information box ends the game, so it reads Quit.
+    @Override
+    protected void messageboxCreateAndShow(Bundle args) {
+        final int flags = args.getInt("flags");
+        final int[] ids = args.getIntArray("buttonIds");
+        final String[] texts = args.getStringArray("buttonTexts");
+        KitDialog d = new KitDialog(this).setMessage(args.getString("message")).setCancelable(false);
+        d.setOnDismissListener(unused -> { synchronized (messageboxSelection) { messageboxSelection.notify(); } });
+        final boolean warning = (flags & 0x20) != 0;   // SDL_MESSAGEBOX_WARNING: the game goes on
+        int n = texts == null ? 0 : Math.min(3, texts.length);
+        for (int i = 0; i < n; i++) {
+            final int id = ids[i];
+            String label = texts[i];
+            if (n == 1 && "OK".equals(label)) label = warning ? S.t("Gerai") : S.t("Baigti");
+            android.content.DialogInterface.OnClickListener l = (dd, w) -> messageboxSelection[0] = id;
+            if (i == 0) d.setPositiveButton(label, l);
+            else if (i == 1) d.setNegativeButton(label, l);
+            else d.setNeutralButton(label, l);
+        }
+        d.show();
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -593,8 +672,104 @@ public class OpenBWActivity extends SDLActivity {
     // launcher (SetupActivity, in the main process) is still on the back
     // stack and resumes automatically. The next game gets a fresh process.
     private void exitToLauncher() {
+        returnToEditor();
         finish();
         System.exit(0);
+    }
+
+    // ---- World Editor "Test in engine" ----
+
+    private static final java.util.regex.Pattern TEST_SESSION_ID = java.util.regex.Pattern.compile("[A-Za-z0-9._-]{1,64}");
+
+    private boolean isTestLaunch() {
+        String id = getIntent().getStringExtra(EXTRA_TEST_SESSION);
+        return id != null && TEST_SESSION_ID.matcher(id).matches() && getIntent().getStringExtra(EXTRA_MAP) != null;
+    }
+
+    // The trace file, or null when this is not a valid test launch. Only a *.oetrace.jsonl
+    // name is accepted, so a caller can never make the game truncate some other file.
+    private String testTracePath() {
+        if (!isTestLaunch()) return null;
+        String t = getIntent().getStringExtra(EXTRA_TEST_TRACE);
+        if (t == null || t.isEmpty()) {
+            String map = getIntent().getStringExtra(EXTRA_MAP);
+            int dot = map.lastIndexOf('.');
+            int slash = map.lastIndexOf('/');
+            t = (dot > slash ? map.substring(0, dot) : map) + ".oetrace.jsonl";
+        }
+        if (!t.startsWith("/") || !t.endsWith(".oetrace.jsonl") || t.contains("..")) return null;
+        return t;
+    }
+
+    private long testSeed() {
+        Object v = getIntent().getExtras() != null ? getIntent().getExtras().get(EXTRA_SEED) : null;
+        if (v instanceof Number) return ((Number) v).longValue() & 0xffffffffL;
+        if (v instanceof String) {
+            try { return Long.parseLong((String) v) & 0xffffffffL; } catch (NumberFormatException ignored) { }
+        }
+        return -1;
+    }
+
+    // The return target must be a World Editor build (org.openbw.editor or a suffixed variant).
+    private android.content.ComponentName testReturnTarget() {
+        String pkg = getIntent().getStringExtra(EXTRA_TEST_RETURN_PACKAGE);
+        String cls = getIntent().getStringExtra(EXTRA_TEST_RETURN_CLASS);
+        if (pkg == null || cls == null || cls.isEmpty()) return null;
+        if (!pkg.equals("org.openbw.editor") && !pkg.startsWith("org.openbw.editor.")) return null;
+        return new android.content.ComponentName(pkg, cls.startsWith(".") ? pkg + cls : cls);
+    }
+
+    private boolean testReturned = false;
+
+    // SDL calls finish() when the native game returns. The return intent goes out here,
+    // while the game window is still visible: from onDestroy Android 14 blocks it as a
+    // background activity start.
+    @Override
+    public void finish() {
+        returnToEditor();
+        super.finish();
+    }
+
+    // Called once the native game has ended (or the activity is going away regardless):
+    // hands the session result back to the editor that started it.
+    private void returnToEditor() {
+        if (testReturned || !isTestLaunch()) return;
+        testReturned = true;
+        android.content.ComponentName target = testReturnTarget();
+        if (target == null) return;
+        String trace = testTracePath();
+        String result = "aborted", replay = null, message = null;
+        int frame = -1;
+        if (trace != null) {
+            try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(trace))) {
+                String line, last = null;
+                while ((line = r.readLine()) != null) if (line.startsWith("{\"ev\":\"end\"")) last = line;
+                if (last != null) {
+                    JSONObject o = new JSONObject(last);
+                    result = o.optString("result", "aborted");
+                    frame = o.optInt("f", -1);
+                    replay = o.optString("replay", null);
+                    message = o.optString("message", null);
+                }
+            } catch (Exception e) {
+                result = "error";
+                message = "trace not readable: " + e.getMessage();
+            }
+        }
+        Intent i = new Intent(ACTION_TEST_RESULT);
+        i.setComponent(target);
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        i.putExtra(EXTRA_TEST_SESSION, getIntent().getStringExtra(EXTRA_TEST_SESSION));
+        i.putExtra("testResult", result);
+        i.putExtra("testFrame", frame);
+        if (trace != null) i.putExtra(EXTRA_TEST_TRACE, trace);
+        if (replay != null && !replay.isEmpty()) i.putExtra("testReplay", replay);
+        if (message != null && !message.isEmpty()) i.putExtra("testMessage", message);
+        try {
+            startActivity(i);
+        } catch (Throwable t) {
+            android.util.Log.w("OpenBW", "test: return to " + target + " failed: " + t);
+        }
     }
 
     // HUD v3 haptics, called from the native side (android_main hud3_vibrate_fn).
@@ -658,6 +833,14 @@ public class OpenBWActivity extends SDLActivity {
     // token replayed from history is stale.
     private boolean staleLaunch(Bundle savedInstanceState) {
         boolean stale = savedInstanceState != null;
+        if (!stale && isTestLaunch()) {
+            // An editor test session is started from another task, so it is often the
+            // task root; like directToken, each session id is honoured once.
+            String id = getIntent().getStringExtra(EXTRA_TEST_SESSION);
+            android.content.SharedPreferences p = getSharedPreferences("openbw", MODE_PRIVATE);
+            if (id.equals(p.getString("testSessionUsed", ""))) stale = true;
+            else { p.edit().putString("testSessionUsed", id).commit(); return false; }
+        }
         if (!stale && isTaskRoot()) {
             long tok = getIntent().getLongExtra("directToken", 0L);
             android.content.SharedPreferences p = getSharedPreferences("openbw", MODE_PRIVATE);
@@ -665,6 +848,7 @@ public class OpenBWActivity extends SDLActivity {
             else p.edit().putLong("directTokenUsed", tok).commit();
         }
         if (!stale) return false;
+        testReturned = true; // a replayed test intent must not report an old trace
         try {
             if (isTaskRoot()) startActivity(new Intent(this, SetupActivity.class));
         } catch (Throwable ignored) {
@@ -677,6 +861,7 @@ public class OpenBWActivity extends SDLActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        returnToEditor();
         // Kills only the ":game" process; the launcher process survives.
         System.exit(0);
     }

@@ -7,6 +7,8 @@
 #include "data_loading.h"
 #include "bwenums.h"
 #include "korean.h"
+#include "oescript.h"
+#include "eud.h"
 
 #include <algorithm>
 #include <utility>
@@ -16,6 +18,75 @@
 #include <bitset>
 
 namespace bwgame {
+
+// GE2: Extended mod unit / building types (data/oe/extensions.json) get ids from 256
+// (228 is None, 229-232 are trigger unit groups). Per-type tables hold that range too.
+constexpr size_t ext_unit_type_first = 256;
+constexpr size_t ext_unit_type_max = 128;
+constexpr size_t unit_type_capacity = ext_unit_type_first + ext_unit_type_max;
+template<typename T>
+using unit_type_array = type_indexed_array<T, UnitTypes, unit_type_capacity>;
+
+// An Extended mod type as installed into a game (made from the registry by the host).
+struct ext_unit_def {
+	a_string id;          // "<mod>:unit:<id>" / "<mod>:building:<id>"
+	a_string name;
+	bool building = false;
+	int parent = 0;       // classic type it is based on (graphics, orders, special cases)
+	int hp = 1, shields = 0, armor = 0, energy = 0, speed = -1, sight = 7, supply = 0;
+	int weapon = -1;      // weapons.dat id; -1 = the parent's weapons
+	int minerals = 0, gas = 0, time = 1, width = 1, height = 1;
+	int producer = -1;    // unit: the type that trains it (-1 any building that lists it)
+	int builder = -1;     // building: the unit type that builds it
+	a_vector<int> produces, requires;
+	a_vector<int> abilities; // GE5: ext_ability_def indices (rank 1, no learning)
+	a_string hotkey;
+};
+
+// GE4: an Extended mod hero. Every unit of `unit` is one; its level, XP and skill points live in the unit.
+struct ext_hero_def {
+	a_string id;          // "<mod>:hero:<id>"
+	a_string name;
+	int unit = -1;        // unit type id
+	int max_level = 1;
+	a_vector<int> xp;     // XP to reach level 2, 3, ...; past the list the last step repeats
+	int skill_points = 0, xp_kill = 0, xp_radius = 0;
+	bool xp_shared = false;
+	int strength = 0, agility = 0, intelligence = 0;
+	int hp_per_level = 0, armor_per_level = 0, damage_per_level = 0, energy_per_level = 0;
+	bool respawn = false, keep_xp = false, unique = false;
+	int respawn_time = 0; // seconds of 16 frames
+	a_vector<int> abilities;
+};
+struct ext_hero_respawn { int hero, owner, frame, level, xp, points, x, y, attr[3]; };
+// API 3 attribute effects, per point (agility: one per that many points).
+enum {
+	ext_attr_str_hp = 5,
+	ext_attr_agi_damage = 5,
+	ext_attr_agi_armor = 10,
+	ext_attr_int_energy = 3,
+	ext_attr_int_amount_pct = 1,
+};
+
+// GE5: an Extended mod ability. Values of rank r are base + perRank * (r - 1).
+struct ext_ability_def {
+	enum { t_none, t_unit, t_point, t_passive, t_aura };
+	enum { e_damage, e_heal, e_bonus, e_summon, e_teleport, e_script };
+	a_string id;          // "<mod>:ability:<id>"
+	a_string name, tooltip;
+	int target = t_none, effect = e_damage;
+	int ranks = 1, hero_level = 1, level_step = 0; // a hero learns rank r at hero_level + level_step * (r - 1)
+	int cost = 0, cost_per_rank = 0;               // energy
+	int cooldown = 0, cooldown_per_rank = 0;       // seconds of 16 frames
+	int amount = 0, amount_per_rank = 0;
+	int range = 0, radius = 0;                     // tiles; range 0 = no limit
+	int duration = 0, cast_time = 0;               // seconds; milliseconds
+	int summon = -1, slot = 1;
+	a_string hotkey;
+	a_string event;       // e_script: the signal it raises
+};
+// A cast walking into range (approach) or waiting for its cast time. Units as raw unit ids.
+struct ext_cast { int caster, ability, slot, target, x, y, frame, approach; };
 
 // Diagnostic hook for trigger tracing. Null unless the app installs a sink
 // (android_main does so for --trigger-trace), so normal runs pay nothing but
@@ -130,12 +201,19 @@ struct global_state {
 	a_vector<a_vector<a_vector<xy>>> lo_offsets;
 	a_vector<std::array<a_vector<a_vector<xy>>*, 6>> image_lo_offsets;
 
+	// 1.16.1 requirement tables (eud::req_base..req_end) read from the user's StarCraft.exe; empty = absent.
+	a_vector<uint8_t> req_tables;
 	a_vector<uint8_t> units_dat;
 	a_vector<uint8_t> weapons_dat;
 	a_vector<uint8_t> upgrades_dat;
 	a_vector<uint8_t> techdata_dat;
 
 	a_vector<uint8_t> melee_trg;
+
+	// GE2: the active Extended mods' types, installed into every game loaded from here.
+	a_vector<ext_unit_def> ext_unit_defs;
+	a_vector<ext_hero_def> ext_hero_defs;
+	a_vector<ext_ability_def> ext_ability_defs;
 
 	// aiscript VM (v0.21): raw bytecode blobs; the entry table sits at the
 	// start of each file (id, offset, string, flags; id == 0 terminates).
@@ -180,6 +258,18 @@ struct game_state {
 		// too so a recorded game can carry it -- playback used to run with it OFF and
 		// diverged as soon as a rally sat on a resource, an own unit or an enemy.
 		bool smart_rally = false;
+		// bit8: a UMS map's preplaced-unit state (CHK UNIT invincible / burrow / cloak / hangar /
+		// addon + nydus links). Set by the app for UMS maps; foreign UMS replays apply it too.
+		bool ums_unit_properties = false;
+		// bit9 (replays only, inverted): the recording says its game ran no OEScript --
+		// an older engine ignored the OESC chunk, so playback must ignore it too.
+		bool skip_oescript = false;
+		// bit10: trigger Pause / Unpause Game stop game time (single player; LAN ignores them, as the original does).
+		bool trigger_pause = false;
+		// bit11 (replays only, inverted): a recording from before game-second trigger timers.
+		bool legacy_trigger_seconds = false;
+		// bit12: the requirement tables read from the user's StarCraft.exe are in effect (LAN: every peer's tables match).
+		bool eud_requirements = false;
 	} qol;
 
 	size_t map_tile_width;
@@ -190,12 +280,15 @@ struct game_state {
 	size_t map_height;
 
 	a_vector<a_string> map_strings;
+	// Raw STR (or STRx, str_ext) section: EUD maps address it through the 0x5993D4 pointer.
+	a_vector<uint8_t> str_section;
+	bool str_ext = false;
 
 	a_string scenario_name;
 	a_string scenario_description;
 
-	type_indexed_array<int, UnitTypes> unit_air_strength;
-	type_indexed_array<int, UnitTypes> unit_ground_strength;
+	unit_type_array<int> unit_air_strength;
+	unit_type_array<int> unit_ground_strength;
 
 	struct force_t {
 		a_string name;
@@ -220,6 +313,11 @@ struct game_state {
 	// these for such a replay; everything else keeps the 1.16.1 values.
 	int halo_rocket_bullet_cap = 80;
 	int order_queue_cap = 1800;
+	int thingy_cap = 500;
+	// SC:R replays with a BFIX section: set_queued_order also refuses a new order at the
+	// order threshold or with 8 queued; GCFG build >= 9713 lets a constructing SCV reset collision.
+	bool scr_order_alloc_guard = false;
+	bool scr_scv_reset_exception = false;
 	a_vector<cv5_entry> cv5;
 	a_vector<vf4_entry> vf4;
 	a_vector<uint16_t> mega_tile_flags;
@@ -228,8 +326,14 @@ struct game_state {
 	weapon_types_t weapon_types;
 	upgrade_types_t upgrade_types;
 	tech_types_t tech_types;
+	// EUD: a map that writes flingy.dat gets its own copy (global flingy data stays shared)
+	a_vector<flingy_type_t> eud_flingy_types;
+	// Map value of every .dat element an EUD write changed (to undo edits on a state swap).
+	a_map<uint32_t, uint32_t> eud_dat_orig;
+	// The map has EUD/EPD Deaths or Set Deaths (savegames then carry the .dat journal).
+	bool eud_triggers = false;
 
-	std::array<type_indexed_array<bool, UnitTypes>, 12> unit_type_allowed;
+	std::array<unit_type_array<bool>, 12> unit_type_allowed;
 	std::array<type_indexed_array<int, UpgradeTypes>, 12> max_upgrade_levels;
 	std::array<type_indexed_array<bool, TechTypes>, 12> tech_available;
 
@@ -258,6 +362,20 @@ struct game_state {
 		uint16_t unit_flags = 0; // 0x1 cloak, 0x2 burrow, 0x4 in transit, 0x8 hallucinated, 0x10 invincible
 	};
 	std::array<unit_properties_t, 64> uprp{};
+
+	a_vector<a_string> location_names; // MRGN order, as st.locations
+	oescript::program oescript;        // CHK OESC chunk; not loaded = classic map
+
+	// GE2: Extended mod types of this game (none = classic); type 256 + k is ext_unit_types[k].
+	bool oe_ext = false;
+	a_vector<ext_unit_def> ext_defs;
+	a_vector<ext_hero_def> ext_heroes;
+	a_vector<ext_ability_def> ext_abilities;
+	a_vector<unit_type_t> ext_unit_types;     // reserved once per load, never reallocated after
+	a_vector<flingy_type_t> ext_flingy_types; // own speed
+	// Walking (iscript-moved) types with their own speed: iscript move scale, fp8 raw
+	// (0 = not measured yet, -1 = no walking motion). A pure function of the data.
+	mutable a_vector<int> ext_walk_scale;
 };
 
 struct state_base_copyable {
@@ -280,8 +398,8 @@ struct state_base_copyable {
 	std::array<type_indexed_array<bool, TechTypes>, 12> tech_researched;
 	std::array<type_indexed_array<bool, TechTypes>, 12> tech_researching;
 
-	std::array<type_indexed_array<int, UnitTypes>, 12> unit_counts;
-	std::array<type_indexed_array<int, UnitTypes>, 12> completed_unit_counts;
+	std::array<unit_type_array<int>, 12> unit_counts;
+	std::array<unit_type_array<int>, 12> completed_unit_counts;
 
 	std::array<int, 12> factory_counts;
 	std::array<int, 12> building_counts;
@@ -350,14 +468,29 @@ struct state_base_copyable {
 	// the deterministic sim (trigger actions / unit death accounting), so
 	// they are safe for lockstep multiplayer and replays.
 	std::array<bool, 256> trigger_switches;
-	std::array<type_indexed_array<int32_t, UnitTypes>, 12> unit_deaths;
-	std::array<type_indexed_array<int32_t, UnitTypes>, 12> unit_kills;
+	std::array<unit_type_array<int32_t>, 12> unit_deaths;
+	std::array<unit_type_array<int32_t>, 12> unit_kills;
 	// EUD (v0.25): sparse backing store for out-of-range deaths slots, which
 	// modern UMS maps use as extra variables. Keyed unit_id * 12 + player
 	// (the original deaths-table linear layout). Ordered map -> deterministic.
 	a_map<uint32_t, int32_t> eud_deaths;
+	// EUD: Set Deaths writes into per-game .dat tables, keyed by element address (replayed
+	// onto freshly loaded types by savegame load), and the trigger "current player" override.
+	a_map<uint32_t, uint32_t> eud_dat_journal;
+	int trigger_cp = -1;
+	// Copy of game_st.str_section once an EUD write changes it (dynamic map text).
+	a_vector<uint8_t> eud_str;
+	// Moves of the STR pointer (0x5993D4) away from the section start (eudplib reads it destructively).
+	uint32_t eud_str_delta = 0;
+	// Requirement tables and their five offset indexes once an EUD write touches them
+	// (permission checks then run the 1.16.1 interpreters); empty = the engine's own rules.
+	a_vector<uint8_t> eud_req;
+	a_vector<uint16_t> eud_req_idx;
 	int countdown_timer_ms;
 	bool countdown_paused;
+	bool trigger_paused;
+	int trigger_pause_ticks;
+	int trigger_ticks;   // every next_frame, paused or not: trigger UI timers (portraits) run on it
 	std::array<int32_t, 12> custom_score;
 	std::array<int32_t, 12> kills_score;
 	std::array<int32_t, 12> razings_score;
@@ -503,6 +636,11 @@ struct state_base_copyable {
 		int transport_since = -100000;  // frame the op/phase (re)started (timeout)
 	};
 	std::array<ai_player_t, 8> ai_players;
+
+	oescript::runtime oes;
+
+	a_vector<ext_hero_respawn> ext_hero_respawns; // GE4: fallen heroes waiting to respawn
+	a_vector<ext_cast> ext_casts;                 // GE5: casts on their way
 };
 
 struct psionic_matrix_link_f {
@@ -659,6 +797,7 @@ struct state_functions {
 	flingy_t* iscript_flingy = nullptr;
 	bullet_t* iscript_bullet = nullptr;
 	unit_t* iscript_unit = nullptr;
+	bool ext_walk_measure = false; // GE2: iscript move amounts unscaled and unmodified
 	mutable size_t unit_finder_search_index = 0;
 
 	const order_type_t* get_order_type(Orders id) const {
@@ -892,8 +1031,24 @@ struct state_functions {
 	}
 
 	const unit_type_t* get_unit_type(UnitTypes id) const {
-		if ((size_t)id >= 228) error("invalid unit id %d", (size_t)id);
+		if ((size_t)id >= 228) {
+			size_t k = (size_t)id - ext_unit_type_first;
+			if ((size_t)id >= ext_unit_type_first && k < game_st.ext_unit_types.size()) return &game_st.ext_unit_types[k];
+			error("invalid unit id %d", (size_t)id);
+		}
 		return &game_st.unit_types.vec[(size_t)id];
+	}
+	bool is_ext_unit_type(UnitTypes id) const {
+		return (size_t)id >= ext_unit_type_first && (size_t)id - ext_unit_type_first < game_st.ext_unit_types.size();
+	}
+	const ext_unit_def* ext_def(UnitTypes id) const {
+		return is_ext_unit_type(id) ? &game_st.ext_defs[(size_t)id - ext_unit_type_first] : nullptr;
+	}
+	// Every real unit type id: 0-227, then the Extended mod types.
+	template<typename F>
+	void for_each_unit_type_id(F&& f) const {
+		for (size_t i = 0; i != 228; ++i) f((UnitTypes)i);
+		for (size_t k = 0; k != game_st.ext_unit_types.size(); ++k) f((UnitTypes)(ext_unit_type_first + k));
 	}
 	const image_type_t* get_image_type(ImageTypes id) const {
 		if ((size_t)id >= 999) error("invalid image id %d", (size_t)id);
@@ -917,6 +1072,7 @@ struct state_functions {
 	}
 	const flingy_type_t* get_flingy_type(FlingyTypes id) const {
 		if ((size_t)id >= 209) error("invalid flingy id %d", (size_t)id);
+		if (!game_st.eud_flingy_types.empty()) return &game_st.eud_flingy_types[(size_t)id];
 		return &global_st.flingy_types.vec[(size_t)id];
 	}
 
@@ -1085,10 +1241,17 @@ struct state_functions {
 	}
 
 	void tiles_flags_and(size_t offset_x, size_t offset_y, size_t width, size_t height, int flags) {
-		if (offset_x >= game_st.map_tile_width) error("attempt to mask tile out of bounds");
-		if (offset_y >= game_st.map_tile_height) error("attempt to mask tile out of bounds");
-		if (width > game_st.map_tile_width || offset_x + width > game_st.map_tile_width) error("attempt to mask tile out of bounds");
-		if (height > game_st.map_tile_height || offset_y + height > game_st.map_tile_height) error("attempt to mask tile out of bounds");
+		if (offset_x >= game_st.map_tile_width || offset_y >= game_st.map_tile_height || offset_x + width > game_st.map_tile_width || offset_y + height > game_st.map_tile_height) {
+			// A building placed over the map edge (UMS/EUD maps): BW indexes the tile array linearly
+			// with no bounds check, so columns wrap into the neighbouring row; tiles past the array are skipped.
+			for (size_t y = 0; y != height; ++y) {
+				for (size_t x = 0; x != width; ++x) {
+					uint32_t i = (uint32_t)(offset_x + x) + (uint32_t)(offset_y + y) * (uint32_t)game_st.map_tile_width;
+					if (i < st.tiles.size()) st.tiles[i].flags &= flags;
+				}
+			}
+			return;
+		}
 		for (size_t y = offset_y; y != offset_y + height; ++y) {
 			for (size_t x = offset_x; x != offset_x + width; ++x) {
 				st.tiles[x + y * game_st.map_tile_width].flags &= flags;
@@ -1096,10 +1259,17 @@ struct state_functions {
 		}
 	}
 	void tiles_flags_or(size_t offset_x, size_t offset_y, size_t width, size_t height, int flags) {
-		if (offset_x >= game_st.map_tile_width) error("attempt to mask tile out of bounds");
-		if (offset_y >= game_st.map_tile_height) error("attempt to mask tile out of bounds");
-		if (width > game_st.map_tile_width || offset_x + width > game_st.map_tile_width) error("attempt to mask tile out of bounds");
-		if (height > game_st.map_tile_height || offset_y + height > game_st.map_tile_height) error("attempt to mask tile out of bounds");
+		if (offset_x >= game_st.map_tile_width || offset_y >= game_st.map_tile_height || offset_x + width > game_st.map_tile_width || offset_y + height > game_st.map_tile_height) {
+			// A building placed over the map edge (UMS/EUD maps): BW indexes the tile array linearly
+			// with no bounds check, so columns wrap into the neighbouring row; tiles past the array are skipped.
+			for (size_t y = 0; y != height; ++y) {
+				for (size_t x = 0; x != width; ++x) {
+					uint32_t i = (uint32_t)(offset_x + x) + (uint32_t)(offset_y + y) * (uint32_t)game_st.map_tile_width;
+					if (i < st.tiles.size()) st.tiles[i].flags |= flags;
+				}
+			}
+			return;
+		}
 		for (size_t y = offset_y; y != offset_y + height; ++y) {
 			for (size_t x = offset_x; x != offset_x + width; ++x) {
 				st.tiles[x + y * game_st.map_tile_width].flags |= flags;
@@ -1124,7 +1294,7 @@ struct state_functions {
 		return r;
 	}
 	int max_visible_hp(const unit_t* u) const {
-		int hp = u->unit_type->hitpoints.integer_part();
+		int hp = unit_max_hp(u).integer_part();
 		if (hp == 0) hp = u->hp.ceil().integer_part();
 		if (hp == 0) hp = 1;
 		return hp;
@@ -1174,7 +1344,7 @@ struct state_functions {
 	void update_unit_damage_overlay(unit_t* u) {
 		if (u->sprite->main_image->image_type->damage_filename_index == 0) return;
 		int states = damage_overlay_states(u);
-		fp8 max_hp = u->unit_type->hitpoints;
+		fp8 max_hp = unit_max_hp(u);
 		fp8 two_thirds_max_hp = max_hp - max_hp / 3;
 		fp8 hp_per_state = two_thirds_max_hp / (states + 1);
 		if (hp_per_state == 0_fp8) hp_per_state = 1_fp8;
@@ -1229,7 +1399,7 @@ struct state_functions {
 	}
 
 	void set_unit_hp(unit_t* u, fp8 hitpoints) {
-		u->hp = std::min(hitpoints, u->unit_type->hitpoints);
+		u->hp = std::min(hitpoints, unit_max_hp(u));
 		if (u_completed(u)) {
 			update_unit_damage_overlay(u);
 
@@ -1462,7 +1632,7 @@ struct state_functions {
 	}
 
 	fp8 unit_cloak_energy_cost(const unit_t* u) const {
-		switch (u->unit_type->id) {
+		switch (u->unit_type->behaves_as) {
 		case UnitTypes::Terran_Ghost:
 		case UnitTypes::Hero_Sarah_Kerrigan:
 		case UnitTypes::Hero_Alexei_Stukov:
@@ -1536,7 +1706,7 @@ struct state_functions {
 		}
 		if (u_completed(u)) {
 			if (ut_regens_hp(u)) {
-				if (u->hp > 0_fp8 && u->hp != u->unit_type->hitpoints) {
+				if (u->hp > 0_fp8 && u->hp != unit_max_hp(u)) {
 					set_unit_hp(u, u->hp + 4_fp8);
 				}
 			}
@@ -2016,7 +2186,7 @@ struct state_functions {
 
 	int weapon_max_range(const unit_t* u, const weapon_type_t* w) const {
 		auto range_upgrade_bonus = [&]() {
-			switch (u->unit_type->id) {
+			switch (u->unit_type->behaves_as) {
 			case UnitTypes::Terran_Marine:
 				return player_has_upgrade(u->owner, UpgradeTypes::U_238_Shells) ? 32 : 0;
 			case UnitTypes::Zerg_Hydralisk:
@@ -2417,7 +2587,7 @@ struct state_functions {
 	void unit_gather_resources_from(unit_t* u, unit_t* resource) {
 		const image_type_t* image_type = nullptr;
 		bool is_minerals = false;
-		switch (resource->unit_type->id) {
+		switch (resource->unit_type->behaves_as) {
 		case UnitTypes::Terran_Refinery:
 			image_type = get_image_type(ImageTypes::IMAGEID_Terran_Gas_Tank_Type1);
 			break;
@@ -2613,7 +2783,7 @@ struct state_functions {
 		auto supply_required = unit_type->supply_required;
 		if (ut_two_units_in_one_egg(unit_type)) supply_required *= 2;
 		if (supply_required == fp1::zero()) return true;
-		if (unit_type->id == UnitTypes::Zerg_Lurker) {
+		if (unit_type->behaves_as == UnitTypes::Zerg_Lurker) {
 			supply_required -= get_unit_type(UnitTypes::Zerg_Hydralisk)->supply_required;
 		}
 		auto race = unit_race(unit_type);
@@ -3021,11 +3191,327 @@ struct state_functions {
 		return true;
 	}
 
+	// GE4: XP for a kill. The killing hero and, for heroes that share, the owner's other
+	// heroes within their radius of the victim split the kill; each gets its own xpKill / n.
+	void ext_hero_award_kill(unit_t* killer, const unit_t* victim) {
+		int owner = killer->owner;
+		if (owner < 0 || owner >= 12) return;
+		static_vector<unit_t*, 64> to;
+		for (unit_t* h : ptr(st.player_units[owner])) {
+			if (h->hero < 0 || unit_dying(h) || !u_completed(h)) continue;
+			const ext_hero_def& d = game_st.ext_heroes[(size_t)h->hero];
+			bool in = h == killer;
+			if (!in && d.xp_shared && d.xp_radius > 0) in = xy_length(h->sprite->position - victim->sprite->position) <= d.xp_radius * 32;
+			if (in && to.size() < to.max_size()) to.push_back(h);
+		}
+		for (unit_t* h : to) ext_hero_add_xp(h, game_st.ext_heroes[(size_t)h->hero].xp_kill / (int)to.size());
+	}
+	// by_script: the script logs the level-ups itself.
+	void ext_hero_add_xp(unit_t* h, int amount, bool by_script = false) {
+		const ext_hero_def* d = ext_hero(h);
+		if (!d || amount <= 0) return;
+		h->hero_xp = (int)std::min<int64_t>((int64_t)h->hero_xp + amount, 0x7fffffff);
+		while (h->hero_level < d->max_level && h->hero_xp >= ext_hero_xp_for(*d, h->hero_level + 1)) ext_hero_level_up(h, *d, by_script);
+	}
+	void ext_hero_level_up(unit_t* h, const ext_hero_def& d, bool by_script) {
+		++h->hero_level;
+		h->hero_points += d.skill_points;
+		if (d.hp_per_level) set_unit_hp(h, h->hp + fp8::integer(d.hp_per_level));
+		if (d.energy_per_level) h->energy = std::min(h->energy + fp8::integer(d.energy_per_level), unit_max_energy(h));
+		if (!st.oes.active) return;
+		int type = (int)h->unit_type->id;
+		if (!by_script && oes_tracing()) oes_log(st.oes.frame, "P" + oescript::num(h->owner + 1) + " hero " + oes_type_text(type) + " reached level " + oescript::num(h->hero_level));
+		oes_raise(a_string(), h->owner, type, -1, -1, h->hero_level, game_st.oescript.wants_levels);
+	}
+	static int ext_hero_attr_base(const ext_hero_def& d, int k) { return k == 0 ? d.strength : k == 1 ? d.agility : d.intelligence; }
+	// Lower maximums cut the current hit points and energy.
+	void ext_hero_clamp(unit_t* u) {
+		if (u->hp > unit_max_hp(u)) set_unit_hp(u, u->hp);
+		fp8 e = unit_max_energy(u);
+		if (u->energy > e) u->energy = e;
+	}
+	void ext_hero_died(const unit_t* u) {
+		const ext_hero_def* d = ext_hero(u);
+		if (!d || !d->respawn || u->owner >= 12) return;
+		ext_hero_respawn r;
+		r.hero = u->hero;
+		r.owner = u->owner;
+		r.frame = (int)st.current_frame + d->respawn_time * 16;
+		r.level = d->keep_xp ? u->hero_level : 1;
+		r.xp = d->keep_xp ? u->hero_xp : 0;
+		r.points = d->skill_points;
+		for (int k = 0; k != 3; ++k) r.attr[k] = d->keep_xp ? u->hero_attr[k] : ext_hero_attr_base(*d, k);
+		if (d->keep_xp) {
+			r.points = u->hero_points;
+			auto s = ext_ability_slots(u);
+			for (size_t i = 0; i != s.size(); ++i) if (s[i].hero) r.points += u->ab_rank[i];
+		}
+		r.x = u->sprite->position.x;
+		r.y = u->sprite->position.y;
+		st.ext_hero_respawns.push_back(r);
+	}
+	// A fallen hero comes back at its owner's start location (where it fell if there is none).
+	void ext_hero_respawn_due() {
+		for (size_t i = 0; i < st.ext_hero_respawns.size();) {
+			ext_hero_respawn r = st.ext_hero_respawns[i];
+			if (r.frame > (int)st.current_frame) { ++i; continue; }
+			st.ext_hero_respawns.erase(st.ext_hero_respawns.begin() + i);
+			const ext_hero_def& d = game_st.ext_heroes[(size_t)r.hero];
+			xy pos = game_st.start_locations[(size_t)r.owner];
+			if (pos == xy()) pos = xy(r.x, r.y);
+			unit_t* u = trigger_create_unit(get_unit_type((UnitTypes)d.unit), pos, r.owner);
+			if (!u || u->hero != r.hero) continue;
+			u->hero_level = r.level;
+			u->hero_xp = r.xp;
+			u->hero_points = r.points;
+			for (int k = 0; k != 3; ++k) u->hero_attr[k] = r.attr[k];
+			set_unit_hp(u, unit_max_hp(u));
+		}
+	}
+	// A unique hero: one per player, counting the living one, one in training and one waiting to respawn.
+	bool ext_hero_unique_taken(int owner, int type) const {
+		int hero = ext_hero_of_type(type);
+		if (hero < 0 || !game_st.ext_heroes[(size_t)hero].unique) return false;
+		for (auto& r : st.ext_hero_respawns) if (r.hero == hero && r.owner == owner) return true;
+		for (const unit_t* u : ptr(st.player_units[owner])) {
+			if ((int)u->unit_type->id == type && !unit_dying(u)) return true;
+			for (const unit_type_t* q : u->build_queue) if ((int)q->id == type) return true;
+		}
+		return false;
+	}
+
+	// GE5: casting. One cast per caster: a new one replaces the one on its way.
+	bool ext_ability_cast(unit_t* u, int i, unit_t* target, xy pos) {
+		if (ext_ability_castable(u, i) != ext_cast_ok) return false;
+		auto s = ext_ability_slots(u);
+		const ext_ability_def& a = game_st.ext_abilities[(size_t)s[(size_t)i].ability];
+		if (a.target == ext_ability_def::t_unit) {
+			if (!target || unit_dying(target) || us_hidden(target) || u_invincible(target)) return false;
+			bool enemy = unit_target_is_enemy(u, target);
+			if (a.effect == ext_ability_def::e_damage ? !enemy : (a.effect == ext_ability_def::e_heal || a.effect == ext_ability_def::e_bonus) && enemy) return false;
+			pos = target->sprite->position;
+		} else if (a.target == ext_ability_def::t_point) {
+			target = nullptr;
+			pos = restrict_pos_to_map_bounds(pos);
+		} else {
+			target = nullptr;
+			pos = u->sprite->position;
+		}
+		ext_cast_cancel(u);
+		ext_cast c;
+		c.caster = (int)get_unit_id(u).raw_value;
+		c.ability = s[(size_t)i].ability;
+		c.slot = i;
+		c.target = target ? (int)get_unit_id(target).raw_value : 0;
+		c.x = pos.x;
+		c.y = pos.y;
+		c.frame = (int)st.current_frame;
+		c.approach = 0;
+		if (a.target != ext_ability_def::t_none && a.range > 0 && xy_length(pos - u->sprite->position) > a.range * 32) {
+			if (ut_building(u) || u_immovable(u)) return false;
+			c.approach = 1;
+			set_unit_order(u, get_order_type(Orders::Move), pos);
+			st.ext_casts.push_back(c);
+			return true;
+		}
+		ext_cast_start(u, c);
+		return true;
+	}
+	void ext_cast_cancel(const unit_t* u) {
+		int id = (int)get_unit_id(u).raw_value;
+		for (size_t k = 0; k < st.ext_casts.size();) {
+			if (st.ext_casts[k].caster == id) st.ext_casts.erase(st.ext_casts.begin() + k);
+			else ++k;
+		}
+	}
+	// In range: pay, start the cooldown, then the effect now or after the cast time.
+	void ext_cast_start(unit_t* u, ext_cast c) {
+		const ext_ability_def& a = game_st.ext_abilities[(size_t)c.ability];
+		int rank = u->ab_rank[c.slot];
+		u->energy -= fp8::integer(ext_ability_cost(a, rank));
+		u->ab_ready[c.slot] = (int)st.current_frame + ext_ability_cooldown(a, rank);
+		int delay = a.cast_time * 16 / 1000;
+		if (delay <= 0) {
+			ext_ability_apply(u, c);
+			return;
+		}
+		c.approach = 0;
+		c.frame = (int)st.current_frame + delay;
+		st.ext_casts.push_back(c);
+	}
+	bool ext_ability_hits(const unit_t* t) const {
+		return !unit_dying(t) && !us_hidden(t) && !u_invincible(t) && t->unit_type->id != UnitTypes::Spell_Scanner_Sweep && t->unit_type->id != UnitTypes::Special_Map_Revealer;
+	}
+	// Units within `radius` px of `center`: enemies of `u`, or its own and allied units.
+	static_vector<unit_t*, 256> ext_units_around(const unit_t* u, xy center, int radius, bool enemies) {
+		static_vector<unit_t*, 256> r;
+		if (radius <= 0) return r;
+		for (unit_t* t : find_units_noexpand(square_at(center, radius))) {
+			if (r.size() == r.max_size()) break;
+			if (!ext_ability_hits(t) || xy_length(t->sprite->position - center) > radius) continue;
+			if (enemies != unit_target_is_enemy(u, t)) continue;
+			if (!enemies && t->owner >= 8) continue;
+			r.push_back(t);
+		}
+		return r;
+	}
+	void ext_ability_damage(unit_t* u, unit_t* t, int amount) {
+		fp8 d = fp8::integer(amount);
+		if (t->unit_type->has_shield && t->shield_points > 0_fp8) {
+			fp8 s = std::min(t->shield_points, d);
+			t->shield_points -= s;
+			d -= s;
+		}
+		if (d > 0_fp8) unit_deal_damage(t, d, u, u->owner);
+	}
+	void ext_ability_heal(unit_t* t, int amount) {
+		fp8 max = unit_max_hp(t);
+		if (t->hp < max) set_unit_hp(t, std::min(max, t->hp + fp8::integer(amount)));
+	}
+	// The strongest running bonus wins; the longest lasts.
+	void ext_ability_buff(unit_t* t, int amount, int until) {
+		if (t->ab_bonus_until <= (int)st.current_frame) t->ab_bonus = 0;
+		t->ab_bonus = std::max(t->ab_bonus, amount);
+		t->ab_bonus_until = std::max(t->ab_bonus_until, until);
+	}
+	void ext_ability_apply(unit_t* u, const ext_cast& c) {
+		const ext_ability_def& a = game_st.ext_abilities[(size_t)c.ability];
+		int rank = std::max(1, (int)u->ab_rank[c.slot]);
+		int amount = ext_ability_power(u, a, rank);
+		int radius = a.radius * 32;
+		unit_t* target = nullptr;
+		if (a.target == ext_ability_def::t_unit) {
+			target = get_unit(unit_id((uint16_t)c.target));
+			if (!target || !ext_ability_hits(target)) return;
+		}
+		xy center = target ? target->sprite->position : a.target == ext_ability_def::t_point ? xy(c.x, c.y) : u->sprite->position;
+		switch (a.effect) {
+		case ext_ability_def::e_damage: {
+			auto set = ext_units_around(u, center, radius, true);
+			if (target && std::find(set.begin(), set.end(), target) == set.end() && set.size() < set.max_size()) set.push_back(target);
+			for (unit_t* t : set) if (!unit_dying(t)) ext_ability_damage(u, t, amount);
+			break;
+		}
+		case ext_ability_def::e_heal: case ext_ability_def::e_bonus: {
+			auto set = ext_units_around(u, center, radius, false);
+			unit_t* self = target ? target : a.target == ext_ability_def::t_none ? u : nullptr;
+			if (self && std::find(set.begin(), set.end(), self) == set.end() && set.size() < set.max_size()) set.push_back(self);
+			int until = (int)st.current_frame + std::max(1, a.duration) * 16;
+			for (unit_t* t : set) {
+				if (a.effect == ext_ability_def::e_heal) ext_ability_heal(t, amount);
+				else ext_ability_buff(t, amount, until);
+			}
+			break;
+		}
+		case ext_ability_def::e_summon: {
+			const unit_type_t* type = get_unit_type((UnitTypes)a.summon);
+			int n = std::min(std::max(amount, 1), 12);
+			for (int k = 0; k != n; ++k) {
+				unit_t* s = trigger_create_unit(type, center, u->owner);
+				if (s && a.duration > 0 && !ut_building(s)) s->remove_timer = a.duration * 16;
+			}
+			break;
+		}
+		case ext_ability_def::e_script: {
+			if (!st.oes.active || a.event.empty()) break;
+			int type = (int)u->unit_type->id;
+			if (oes_tracing()) oes_log(st.oes.frame, "signal " + a.event + " sent by " + oes_type_text(type) + " of P" + oescript::num(u->owner + 1));
+			oes_raise(a.event, u->owner, type, center.x, center.y, rank, game_st.oescript.wants_custom);
+			break;
+		}
+		case ext_ability_def::e_teleport: {
+			static_vector<unit_t*, 13> movers;
+			movers.push_back(u);
+			for (unit_t* t : ext_units_around(u, u->sprite->position, radius, false)) {
+				if (movers.size() == movers.max_size()) break;
+				if (t != u && t->owner == u->owner && !ut_building(t) && !u_immovable(t)) movers.push_back(t);
+			}
+			for (unit_t* t : movers) {
+				xy dst = center + (t->sprite->position - u->sprite->position);
+				move_unit(t, dst);
+				bool ok;
+				std::tie(ok, dst) = find_unit_placement(t, dst, false);
+				if (ok) {
+					move_unit(t, dst);
+					if (t->subunit) move_unit(t->subunit, dst);
+				}
+				set_unit_order(t, t->unit_type->return_to_idle);
+			}
+			break;
+		}
+		}
+	}
+	// Casts on their way, then (every second) passive and aura abilities.
+	void ext_ability_frame() {
+		int now = (int)st.current_frame;
+		for (size_t k = 0; k < st.ext_casts.size();) {
+			ext_cast c = st.ext_casts[k];
+			unit_t* u = get_unit(unit_id((uint16_t)c.caster));
+			bool keep = false, fire = false;
+			if (u && !unit_dying(u)) {
+				const ext_ability_def& a = game_st.ext_abilities[(size_t)c.ability];
+				if (c.approach) {
+					unit_t* target = c.target ? get_unit(unit_id((uint16_t)c.target)) : nullptr;
+					xy pos = target ? target->sprite->position : xy(c.x, c.y);
+					if (c.target && (!target || !ext_ability_hits(target))) keep = false;
+					else if (u->order_type->id != Orders::Move) keep = false;   // another order took over
+					else if (xy_length(pos - u->sprite->position) <= a.range * 32) fire = true;
+					else {
+						if (target && pos != u->order_target.pos) set_unit_order(u, get_order_type(Orders::Move), pos);
+						keep = true;
+					}
+				} else fire = c.frame <= now;
+				if (!fire && !c.approach) keep = true;
+			}
+			if (keep) { ++k; continue; }
+			st.ext_casts.erase(st.ext_casts.begin() + k);
+			if (!fire) continue;
+			if (c.approach) {
+				set_unit_order(u, u->unit_type->return_to_idle);
+				if (ext_ability_castable(u, c.slot) == ext_cast_ok) ext_cast_start(u, c);
+			} else ext_ability_apply(u, c);
+		}
+		if (now % 16 != 0) return;
+		for (int owner = 0; owner != 12; ++owner) {
+			for (unit_t* u : ptr(st.player_units[owner])) {
+				if (!u->ab_rank[0] && !u->ab_rank[1] && !u->ab_rank[2] && !u->ab_rank[3] && !u->ab_rank[4] && !u->ab_rank[5] && !u->ab_rank[6] && !u->ab_rank[7]) continue;
+				if (unit_dying(u) || !u_completed(u) || us_hidden(u)) continue;
+				auto s = ext_ability_slots(u);
+				for (size_t i = 0; i != s.size(); ++i) {
+					const ext_ability_def& a = game_st.ext_abilities[(size_t)s[i].ability];
+					if (!u->ab_rank[i] || (a.target != ext_ability_def::t_passive && a.target != ext_ability_def::t_aura)) continue;
+					int amount = ext_ability_power(u, a, u->ab_rank[i]);
+					if (a.effect == ext_ability_def::e_damage) {
+						if (a.target == ext_ability_def::t_aura)
+							for (unit_t* t : ext_units_around(u, u->sprite->position, a.radius * 32, true)) if (!unit_dying(t)) ext_ability_damage(u, t, amount);
+						continue;
+					}
+					if (a.effect != ext_ability_def::e_heal && a.effect != ext_ability_def::e_bonus) continue;
+					static_vector<unit_t*, 256> set;
+					if (a.target == ext_ability_def::t_aura) set = ext_units_around(u, u->sprite->position, a.radius * 32, false);
+					if (std::find(set.begin(), set.end(), u) == set.end() && set.size() < set.max_size()) set.push_back(u);
+					for (unit_t* t : set) {
+						if (a.effect == ext_ability_def::e_heal) ext_ability_heal(t, amount);
+						else ext_ability_buff(t, amount, now + 17);
+					}
+				}
+			}
+		}
+	}
+	bool ext_ability_learn(unit_t* u, int i) {
+		if (!ext_ability_learnable(u, i)) return false;
+		--u->hero_points;
+		++u->ab_rank[i];
+		return true;
+	}
+
 	void kill_unit(unit_t* u) {
 		// Death accounting for triggers (Deaths condition / Set Deaths action).
 		// Counted once here — every death path funnels through kill_unit.
 		if (!ut_turret(u) && !unit_dying(u) && u->owner < 12) {
 			++st.unit_deaths[u->owner][u->unit_type->id];
+			if (st.oes.active && !st.oes.ended && game_st.oescript.wants_kills) st.oes.kills.push_back({(int)u->owner, (int)u->unit_type->id});
+			if (u->hero >= 0) ext_hero_died(u);
 		}
 		drop_carried_items(u);
 		while (!u->order_queue.empty()) {
@@ -3641,7 +4127,7 @@ struct state_functions {
 				st.upgrade_levels[new_owner][id] = level;
 			}
 		};
-		switch (u->unit_type->id) {
+		switch (u->unit_type->behaves_as) {
 		case UnitTypes::Terran_Marine:
 			grant_upgrade(UpgradeTypes::U_238_Shells);
 			grant_tech(TechTypes::Stim_Packs);
@@ -3950,6 +4436,61 @@ struct state_functions {
 		}
 	}
 
+	// CHK UNIT state of a preplaced unit: only what its owner could do by command.
+	bool initial_unit_may_burrow(const unit_t* u) const {
+		if (!ut_can_burrow(u) || u_hallucination(u)) return false;
+		return ut_hero(u) || unit_is(u, UnitTypes::Zerg_Lurker) || player_has_researched(u->owner, TechTypes::Burrowing);
+	}
+	bool initial_unit_may_cloak(const unit_t* u) const {
+		if (u_hallucination(u)) return false;
+		if (unit_is_ghost(u)) return ut_hero(u) || player_has_researched(u->owner, TechTypes::Personnel_Cloaking);
+		if (unit_is_wraith(u)) return ut_hero(u) || player_has_researched(u->owner, TechTypes::Cloaking_Field);
+		return false;
+	}
+	void burrow_initial_unit(unit_t* u) {
+		for (image_t* image : ptr(u->sprite->images)) {
+			if (image->image_type->always_visible) continue;
+			hide_image(image);
+		}
+		u_set_status_flag(u, unit_t::status_flag_no_collide);
+		set_unit_burrowed(u);
+		set_secondary_order(u, get_order_type(Orders::Cloak));
+		u->detected_flags = 0x80000000;
+		set_unit_order(u, get_order_type(Orders::Burrowed));
+		u_unset_status_flag(u, unit_t::status_flag_order_not_interruptible);
+		order_done(u);
+	}
+	void cloak_initial_unit(unit_t* u) {
+		set_secondary_order(u, get_order_type(Orders::Cloak));
+	}
+	void fill_initial_hangar(unit_t* u, int count) {
+		const unit_type_t* fighter_type = nullptr;
+		int room = 0;
+		if (unit_is_carrier(u)) {
+			fighter_type = get_unit_type(UnitTypes::Protoss_Interceptor);
+			room = (int)unit_max_interceptor_count(u) - (int)unit_interceptor_count(u);
+		} else if (unit_is_reaver(u)) {
+			fighter_type = get_unit_type(UnitTypes::Protoss_Scarab);
+			room = (int)unit_max_scarab_count(u) - (int)unit_scarab_count(u);
+		}
+		for (int i = 0; i < std::min(count, room); ++i) {
+			unit_t* f = create_unit(fighter_type, u->sprite->position, u->owner);
+			if (!f) break;
+			f->fighter.parent = u;
+			finish_building_unit(f);
+			complete_unit(f);
+			hide_unit(f);
+			if (unit_is_carrier(u)) {
+				u->carrier.inside_units.push_front(*f);
+				++u->carrier.inside_count;
+			} else {
+				u->reaver.inside_units.push_front(*f);
+				++u->reaver.inside_count;
+			}
+			f->fighter.is_outside = false;
+		}
+	}
+
 	void set_unit_cloaked(unit_t* u) {
 		++u->cloak_counter;
 		if (u->cloak_counter == 1 && !u_requires_detector(u) && !u->cloaked_unit_link.first) {
@@ -4054,7 +4595,7 @@ struct state_functions {
 				}
 			} else if (st.alliances[u->owner][target->owner]) {
 				bool can_enter = unit_provides_space(target) && unit_can_load_target(target, u);
-				if ((ut_building(target) || !can_enter) && unit_race(target) == race_t::terran && ut_mechanical(target) && u_completed(target) && target->hp < target->unit_type->hitpoints) {
+				if ((ut_building(target) || !can_enter) && unit_race(target) == race_t::terran && ut_mechanical(target) && u_completed(target) && target->hp < unit_max_hp(target)) {
 					return get_order_type(Orders::Repair);
 				} else if (can_enter) {
 					return get_order_type(Orders::EnterTransport);
@@ -4071,7 +4612,7 @@ struct state_functions {
 
 	size_t default_action(unit_t* u) {
 		size_t action = 0;
-		if (u->unit_type->id == UnitTypes::Zerg_Lurker && u_burrowed(u)) {
+		if (u->unit_type->behaves_as == UnitTypes::Zerg_Lurker && u_burrowed(u)) {
 			action = 3;
 		} else {
 			action = u->unit_type->right_click_action;
@@ -4173,7 +4714,7 @@ struct state_functions {
 		if (!target || target == u) return false;
 		if (!ut_organic(target) || ut_building(target)) return false;
 		if (u_flying(target) || u_hallucination(target)) return false;
-		if (target->hp >= target->unit_type->hitpoints) return false;
+		if (target->hp >= unit_max_hp(target)) return false;
 		if (unit_target_is_enemy(u, target)) return false;
 		if (u->owner >= 8 || target->owner >= 8) return false;
 		if (unit_is_disabled(target)) return false;
@@ -4200,7 +4741,7 @@ struct state_functions {
 			move_to_target(u, target);
 		}
 		if (!unit_target_in_range(u, target, 30)) return 3;
-		fp8 heal_amount = target->unit_type->hitpoints - target->hp;
+		fp8 heal_amount = unit_max_hp(target) - target->hp;
 		if (heal_amount > 200_fp8) heal_amount = 200_fp8;
 		fp8 energy_required = heal_amount / 2;
 		if (u->energy < energy_required) return 2;
@@ -5021,7 +5562,7 @@ struct state_functions {
 						queue_order_front(u, get_order_type(Orders::ResetCollision), {});
 					}
 					unit_t* build_unit;
-					if (unit_type->id == UnitTypes::Terran_Refinery) build_unit = build_refinery(u, unit_type);
+					if (unit_type->behaves_as == UnitTypes::Terran_Refinery) build_unit = build_refinery(u, unit_type);
 					else build_unit = create_unit(unit_type, u->order_target.pos, u->owner);
 					build_queue_clear_single(u);
 					if (build_unit) {
@@ -5349,7 +5890,7 @@ struct state_functions {
 	void order_Repair(unit_t* u) {
 		if (!ut_worker(u)) error("order_Repair: unit is not a worker");
 		unit_t* target = u->order_target.unit;
-		if (!target || target->hp >= target->unit_type->hitpoints || target->stasis_timer || u_loaded(target) || !ut_mechanical(target) || !u_completed(target)) {
+		if (!target || target->hp >= unit_max_hp(target) || target->stasis_timer || u_loaded(target) || !ut_mechanical(target) || !u_completed(target)) {
 			sprite_run_anim(u->sprite, iscript_anims::WalkingToIdle);
 			order_done(u);
 			if (target && !u_loaded(target)) target->connected_unit = nullptr;
@@ -5369,7 +5910,7 @@ struct state_functions {
 			int target_gas_cost = target->unit_type->gas_cost;
 			int lowest_cost = target_gas_cost == 0 ? target_mineral_cost : std::min(target_mineral_cost, target_gas_cost);
 			if (lowest_cost) {
-				auto target_max_hp = target->unit_type->hitpoints;
+				auto target_max_hp = unit_max_hp(target);
 				auto hp_construction_rate = target->hp_construction_rate;
 				if (st.cheat_operation_cwal) hp_construction_rate *= 16;
 				time_cost = target_max_hp.raw_value * 3 / (lowest_cost * hp_construction_rate.raw_value);
@@ -5414,7 +5955,7 @@ struct state_functions {
 			} else --u->worker.repair_timer;
 			if (st.cheat_operation_cwal) set_unit_hp(target, target->hp + target->hp_construction_rate * 16);
 			else set_unit_hp(target, target->hp + target->hp_construction_rate);
-			if (target->hp >= target->unit_type->hitpoints) {
+			if (target->hp >= unit_max_hp(target)) {
 				sprite_run_anim(u->sprite, iscript_anims::WalkingToIdle);
 				order_done(u);
 				if (target && !u_loaded(target)) target->connected_unit = nullptr;
@@ -6801,6 +7342,7 @@ struct state_functions {
 				else set_unit_heading(u, 0_dir);
 				finish_building_unit(u2);
 				complete_unit(u2);
+				if (st.oes.ext && !st.oes.ended) st.oes.born.push_back(get_unit_id(u2).raw_value);
 				copy_status_effects(u2, u);
 			} else display_last_error_for_player(u->owner);
 		}
@@ -7293,7 +7835,7 @@ struct state_functions {
 		while (!u->order_queue.empty()) remove_queued_order(u, &u->order_queue.front());
 		if (u_grounded_building(u)) sprite_run_anim(u->sprite, iscript_anims::WorkingToIdle);
 		if (u->unit_type->construction_animation) create_image(u->unit_type->construction_animation, u->sprite, {}, image_order_above);
-		set_unit_hp(u, u->unit_type->hitpoints);
+		set_unit_hp(u, unit_max_hp(u));
 		u_unset_status_flag(u, unit_t::status_flag_order_not_interruptible);
 		order_done(u);
 	}
@@ -7401,7 +7943,7 @@ struct state_functions {
 						st.current_minerals[u->owner] -= build_type->mineral_cost;
 						st.current_gas[u->owner] -= build_type->gas_cost;
 						unit_t* build_unit;
-						if (build_type->id == UnitTypes::Protoss_Assimilator) build_unit = build_refinery(u, build_type);
+						if (build_type->behaves_as == UnitTypes::Protoss_Assimilator) build_unit = build_refinery(u, build_type);
 						else build_unit = create_unit(build_type, u->order_target.pos, u->owner);
 						build_queue_clear_single(u);
 						if (build_unit) {
@@ -7701,8 +8243,8 @@ struct state_functions {
 	}
 
 	void order_InterceptorAttack(unit_t* u) {
-		if (!unit_is_fighter(u)) error("order_InterceptorAttack: unit is not a fighter");
-		unit_t* parent = u->fighter.parent;
+		// An EUD map can give any unit this order (units.dat orders); BW reads a zero parent then.
+		unit_t* parent = unit_is_fighter(u) ? u->fighter.parent : nullptr;
 		if (parent && u->shield_points < fp8::integer(u->unit_type->shield_points) / 4) {
 			set_unit_order(u, get_order_type(Orders::InterceptorReturn));
 			return;
@@ -7775,8 +8317,8 @@ struct state_functions {
 	}
 
 	void order_InterceptorReturn(unit_t* u) {
-		if (!unit_is_fighter(u)) error("order_InterceptorReturn: unit is not a fighter");
-		unit_t* parent = u->fighter.parent;
+		// An EUD map can give any unit this order (units.dat orders); BW reads a zero parent then.
+		unit_t* parent = unit_is_fighter(u) ? u->fighter.parent : nullptr;
 		if (!parent) {
 			kill_unit(u);
 			return;
@@ -8215,7 +8757,7 @@ struct state_functions {
 			order_ResetHarvestCollision(u);
 			break;
 		case Orders::CTFCOP2:
-			error("CTFCOP2");
+			set_unit_order(u, u->unit_type->return_to_idle);
 			break;
 		case Orders::SelfDestructing:
 			order_SelfDestructing(u);
@@ -8563,10 +9105,10 @@ struct state_functions {
 			order_Patrol(u);
 			break;
 		case Orders::CTFCOPInit:
-			error("CTFCOPInit");
-			break;
 		case Orders::CTFCOP2:
-			error("CTFCOP2");
+			// Flag beacons (units 197-199): capture-the-flag was never a selectable game type,
+			// so outside it the beacon just idles (UMS maps place them as scenery).
+			set_unit_order(u, u->unit_type->return_to_idle);
 			break;
 		case Orders::ComputerAI:
 			// v0.21 slice A: until the aiscript VM lands, computer units use
@@ -8771,6 +9313,7 @@ struct state_functions {
 						if (unit_is(build_unit, UnitTypes::Terran_Nuclear_Missile)) hide_unit(build_unit);
 						else rally_unit(build_unit, u);
 						if (!u->build_queue.empty()) u->build_queue.erase(u->build_queue.begin());
+						u->build_queue_slot = (uint8_t)((uint8_t)(u->build_queue_slot + 1) % 5);
 						u->current_build_unit = nullptr;
 						u->secondary_order_state = 0;
 					}
@@ -8914,6 +9457,7 @@ struct state_functions {
 						build_unit->fighter.is_outside = false;
 					}
 					u->build_queue.erase(u->build_queue.begin());
+					u->build_queue_slot = (uint8_t)(u->build_queue_slot + 1) < 5 ? (uint8_t)(u->build_queue_slot + 1) : 0;
 					u->current_build_unit = nullptr;
 					u->secondary_order_state = 0;
 				}
@@ -8921,7 +9465,7 @@ struct state_functions {
 		} else if (u->secondary_order_state == 3) {
 			if (unit_is_carrier(u)) {
 				for (unit_t* n : ptr(u->carrier.inside_units)) {
-					if (n->hp >= n->unit_type->hitpoints) continue;
+					if (n->hp >= unit_max_hp(n)) continue;
 					set_unit_hp(n, n->hp + 128_fp8);
 					break;
 				}
@@ -9773,6 +10317,7 @@ struct state_functions {
 
 			all_nodes.clear();
 			open.clear();
+			goal_node = nullptr;   // a second find() must not reuse the first one's (now freed) goal
 
 			all_nodes.emplace_back();
 			node_t* start_node = &all_nodes.back();
@@ -11970,7 +12515,7 @@ struct state_functions {
 		bool being_repulsed = apply_repulse_field(u, ems);
 		ems.position = restrict_unit_pos_to_bounds(ems.position, u->unit_type, map_bounds());
 		finish_unit_movement(u, ems);
-		if (u_can_move(u) && !ut_building(u) && u->unit_type->id != UnitTypes::Protoss_Interceptor) {
+		if (u_can_move(u) && !ut_building(u) && u->unit_type->behaves_as != UnitTypes::Protoss_Interceptor) {
 			size_t index = repulse_index(u->position);
 			if (index != u->repulse_index) {
 				decrement_repulse_field(u);
@@ -12793,10 +13338,110 @@ struct state_functions {
 		return u->unit_type->target_acquisition_range + bonus;
 	}
 
+	// GE4: Extended heroes. A unit with hero_level > 1 gets its hero's per-level bonuses.
+	int ext_hero_of_type(int type) const {
+		for (size_t i = 0; i != game_st.ext_heroes.size(); ++i) if (game_st.ext_heroes[i].unit == type) return (int)i;
+		return -1;
+	}
+	const ext_hero_def* ext_hero(const unit_t* u) const {
+		return u->hero >= 0 && (size_t)u->hero < game_st.ext_heroes.size() ? &game_st.ext_heroes[(size_t)u->hero] : nullptr;
+	}
+	// XP to reach `level` (the editor's ModExtensions.xpFor).
+	static int64_t ext_hero_xp_for(const ext_hero_def& h, int level) {
+		if (level <= 1) return 0;
+		if (h.xp.empty()) return std::numeric_limits<int64_t>::max();
+		int64_t n = (int64_t)h.xp.size();
+		if (level - 2 < n) return h.xp[(size_t)(level - 2)];
+		int64_t last = h.xp.back(), step = n > 1 ? last - h.xp[(size_t)n - 2] : last;
+		return last + step * (level - 1 - n);
+	}
+	int ext_hero_bonus(const unit_t* u, int ext_hero_def::* per_level) const {
+		if (u->hero_level <= 1) return 0;
+		const ext_hero_def* h = ext_hero(u);
+		return h ? h->*per_level * (u->hero_level - 1) : 0;
+	}
+	fp8 unit_max_hp(const unit_t* u) const {
+		if (u->hero < 0) return u->unit_type->hitpoints;
+		return u->unit_type->hitpoints + fp8::integer(ext_hero_bonus(u, &ext_hero_def::hp_per_level) + u->hero_attr[0] * ext_attr_str_hp);
+	}
+	// Hero levels and agility plus a running ability bonus.
+	int ext_damage_bonus(const unit_t* u) const {
+		int r = u->hero >= 0 ? ext_hero_bonus(u, &ext_hero_def::damage_per_level) + u->hero_attr[1] / ext_attr_agi_damage : 0;
+		if (u->ab_bonus_until > (int)st.current_frame) r += u->ab_bonus;
+		return r;
+	}
+
+	// GE5: a unit's abilities in card order (by slot): its type's, then its hero's (learned).
+	struct ext_ability_slot { int ability; bool hero; };
+	static_vector<ext_ability_slot, 8> ext_ability_slots(const unit_t* u) const {
+		return ext_ability_slots(u->unit_type, u->hero);
+	}
+	static_vector<ext_ability_slot, 8> ext_ability_slots(const unit_type_t* type, int hero) const {
+		static_vector<ext_ability_slot, 8> r;
+		auto add = [&](int a, bool hero) {
+			if (a < 0 || (size_t)a >= game_st.ext_abilities.size() || r.size() == r.max_size()) return;
+			for (auto& s : r) if (s.ability == a) return;
+			r.push_back({a, hero});
+		};
+		if (const ext_unit_def* d = ext_def(type->id)) for (int a : d->abilities) add(a, false);
+		if (hero >= 0 && (size_t)hero < game_st.ext_heroes.size()) for (int a : game_st.ext_heroes[(size_t)hero].abilities) add(a, true);
+		std::stable_sort(r.begin(), r.end(), [&](const ext_ability_slot& a, const ext_ability_slot& b) {
+			return game_st.ext_abilities[(size_t)a.ability].slot < game_st.ext_abilities[(size_t)b.ability].slot;
+		});
+		return r;
+	}
+	int ext_ability_index(const unit_t* u, int ability) const {
+		auto s = ext_ability_slots(u);
+		for (size_t i = 0; i != s.size(); ++i) if (s[i].ability == ability) return (int)i;
+		return -1;
+	}
+	static int ext_rank_value(int base, int per_rank, int rank) { return base + per_rank * (rank - 1); }
+	int ext_ability_cost(const ext_ability_def& a, int rank) const { return std::max(0, ext_rank_value(a.cost, a.cost_per_rank, rank)); }
+	int ext_ability_cooldown(const ext_ability_def& a, int rank) const { return std::max(0, ext_rank_value(a.cooldown, a.cooldown_per_rank, rank)) * 16; }
+	int ext_ability_amount(const ext_ability_def& a, int rank) const { return std::max(0, ext_rank_value(a.amount, a.amount_per_rank, rank)); }
+	// What a cast does: damage, healing and bonuses grow with the caster's intelligence.
+	int ext_ability_power(const unit_t* caster, const ext_ability_def& a, int rank) const {
+		int r = ext_ability_amount(a, rank);
+		if (caster->hero < 0 || !caster->hero_attr[2]) return r;
+		if (a.effect != ext_ability_def::e_damage && a.effect != ext_ability_def::e_heal && a.effect != ext_ability_def::e_bonus) return r;
+		return (int)std::min<int64_t>(0x7fffffff, (int64_t)r * (100 + (int64_t)caster->hero_attr[2] * ext_attr_int_amount_pct) / 100);
+	}
+	// The hero level that rank `rank` needs.
+	static int ext_ability_learn_level(const ext_ability_def& a, int rank) { return a.hero_level + a.level_step * (rank - 1); }
+	bool ext_ability_learnable(const unit_t* u, int i) const {
+		auto s = ext_ability_slots(u);
+		if (i < 0 || (size_t)i >= s.size() || !s[(size_t)i].hero || u->hero_points <= 0) return false;
+		const ext_ability_def& a = game_st.ext_abilities[(size_t)s[(size_t)i].ability];
+		int next = u->ab_rank[i] + 1;
+		return next <= a.ranks && u->hero_level >= ext_ability_learn_level(a, next);
+	}
+	enum { ext_cast_ok, ext_cast_unlearned, ext_cast_passive, ext_cast_unsupported, ext_cast_energy, ext_cast_cooldown, ext_cast_unable };
+	int ext_ability_castable(const unit_t* u, int i) const {
+		auto s = ext_ability_slots(u);
+		if (i < 0 || (size_t)i >= s.size()) return ext_cast_unable;
+		const ext_ability_def& a = game_st.ext_abilities[(size_t)s[(size_t)i].ability];
+		int rank = u->ab_rank[i];
+		if (rank <= 0) return ext_cast_unlearned;
+		if (a.target == ext_ability_def::t_passive || a.target == ext_ability_def::t_aura) return ext_cast_passive;
+		if (a.effect == ext_ability_def::e_summon && a.summon < 0) return ext_cast_unsupported;
+		if (unit_dying(u) || !u_completed(u) || us_hidden(u) || unit_is_disabled(u)) return ext_cast_unable;
+		if (u->energy < fp8::integer(ext_ability_cost(a, rank))) return ext_cast_energy;
+		if (u->ab_ready[i] > (int)st.current_frame) return ext_cast_cooldown;
+		return ext_cast_ok;
+	}
 	fp8 unit_max_energy(const unit_t* u) const {
+		fp8 r = unit_base_max_energy(u);
+		if (u->hero >= 0) r += fp8::integer(ext_hero_bonus(u, &ext_hero_def::energy_per_level) + u->hero_attr[2] * ext_attr_int_energy);
+		return r;
+	}
+	fp8 unit_base_max_energy(const unit_t* u) const {
+		if (game_st.oe_ext) {
+			const ext_unit_def* d = ext_def(u->unit_type->id);
+			if (d && d->energy > 0) return fp8::integer(d->energy);
+		}
 		if (ut_hero(u)) return fp8::integer(250);
 		auto energy_upgrade = [&]() {
-			switch (u->unit_type->id) {
+			switch (u->unit_type->behaves_as) {
 			case UnitTypes::Terran_Ghost: return UpgradeTypes::Moebius_Reactor;
 			case UnitTypes::Terran_Wraith: return UpgradeTypes::Apollo_Reactor;
 			case UnitTypes::Terran_Science_Vessel: return UpgradeTypes::Titan_Reactor;
@@ -12847,6 +13492,7 @@ struct state_functions {
 	int get_ground_height_at(xy pos) const {
 		size_t index = tile_index(pos);
 		tile_id tile_id = game_st.gfx_tiles.at(index);
+		if (tile_id.group_index() >= game_st.cv5.size()) tile_id = {};
 		size_t megatile_index = game_st.cv5.at(tile_id.group_index()).mega_tile_index[tile_id.subtile_index()];
 		size_t ux = pos.x;
 		size_t uy = pos.y;
@@ -12868,6 +13514,7 @@ struct state_functions {
 		const size_t max_width = 11 * 2 + 3;
 		std::array<uint32_t, max_width * max_width> vision_propagation;
 		uint32_t required_tile_mask = (uint32_t)height_mask << 16 | (uint32_t)(uint8_t)~visibility_mask << 8 | (uint32_t)(uint8_t)~visibility_mask;
+		if (range > 11) range = 11;   // EUD units.dat sight range past the 1.16.1 table (0..11)
 		const auto& sight_vals = game_st.sight_values.at(range);
 		size_t tile_x = (size_t)pos.x / 32;
 		size_t tile_y = (size_t)pos.y / 32;
@@ -13650,6 +14297,8 @@ struct state_functions {
 	}
 
 	void process_frame() {
+		if (!st.ext_hero_respawns.empty()) ext_hero_respawn_due();
+		if (!game_st.ext_abilities.empty()) ext_ability_frame();
 		recede_creep();
 
 		if (st.update_tiles_countdown == 0) st.update_tiles_countdown = 100;
@@ -13670,8 +14319,8 @@ struct state_functions {
 	void process_triggers() {
 		int timer_step = 42;
 
-		if (st.countdown_timer_ms > 0 && !st.countdown_paused) {
-			st.countdown_timer_ms -= timer_step;
+		if (st.countdown_timer_ms > 0 && !st.countdown_paused && !st.trigger_paused) {
+			st.countdown_timer_ms -= st.game->qol.legacy_trigger_seconds ? 42 : 62 + (st.current_frame & 1);   // 1000 ms per 16 frames
 			if (st.countdown_timer_ms < 0) st.countdown_timer_ms = 0;
 		}
 
@@ -13700,6 +14349,7 @@ struct state_functions {
 
 		bool any_triggers_executed = false;
 		for (int i : active_players()) {
+			st.trigger_cp = i;   // EUD "current player" (0x6509B0); maps may redirect it
 			for (auto& rt : st.running_triggers[i]) {
 				if (rt.flags & 8) continue;
 				auto& t = *rt.t;
@@ -13718,7 +14368,7 @@ struct state_functions {
 							// failed -- a gating condition earlier in the list
 							// otherwise hides the interesting ones behind it.
 							if (trigger_tracing() && st.current_frame % 600 == 2) {
-								int idx = (int)(&rt - st.running_triggers[i].data());
+								int idx = t.source_index;
 								size_t cj = 0;
 								for (auto& c2 : t.conditions) {
 									if (c2.type == 0) break;
@@ -13746,7 +14396,13 @@ struct state_functions {
 			}
 		}
 
-		if (any_triggers_executed) {
+		st.trigger_cp = -1;
+		if (any_triggers_executed) apply_victory_states(ets);
+	}
+
+	template<typename ets_T>
+	void apply_victory_states(ets_T& ets) {
+		{
 			int winners = 0;
 			for (int p : active_players()) {
 				if (player_won(p)) {
@@ -13770,6 +14426,7 @@ struct state_functions {
 			for (int i = 0; i != 8; ++i) {
 				int s = ets.victory_state[i];
 				if (s != st.players[i].victory_state) {
+					if (trigger_tracing()) trigger_trace_sink()(format("trace f%d p%d victory_state %d\n", (int)st.current_frame, i, s));
 					st.players[i].victory_state = s;
 					on_victory_state(i, s);
 					if (s == 2) {
@@ -13785,10 +14442,349 @@ struct state_functions {
 	}
 
 	void next_frame() {
+		++st.trigger_ticks;
+		// SC:R measured: a trigger pause freezes the frame, the countdown and elapsed time; Wait and
+		// transmission timers still run 42 ms per tick and triggers keep running, so Unpause can come.
+		if (st.trigger_paused) {
+			// a map that never unpauses would hang replay seeking: give up after 10 minutes
+			if (++st.trigger_pause_ticks >= 10 * 60 * 1000 / 42) st.trigger_paused = false;
+			process_triggers();
+			return;
+		}
 		++st.current_frame;
+		st.oes.raised_early = st.oes.raised.size();
 		process_frame();
 		process_triggers();
+		if (st.oes.active) process_oescript();
 		process_ai();
+	}
+
+	void process_oescript() {
+		oescript::machine<state_functions> m(game_st.oescript, st.oes, *this);
+		if (!st.oes.started) m.start();
+		else m.step();
+	}
+
+	bool oes_tracing() const { return trigger_tracing(); }
+	void oes_log(int frame, const a_string& s) {
+		trigger_trace_sink()(format("oes f%d s%d %s\n", (int)st.current_frame, frame, s));
+	}
+	int oes_location(const a_string& name) const {
+		if (name.empty()) return -1;
+		for (size_t i = 0; i != game_st.location_names.size() && i != st.locations.size(); ++i) {
+			if (game_st.location_names[i] == name) return (int)i;
+		}
+		return -1;
+	}
+	bool& oes_switch(int i) { return st.trigger_switches.at(i); }
+	void oes_spawn(int p, int type, int n, int at) {
+		const unit_type_t* ut = get_unit_type((UnitTypes)type);
+		if (unit_is_mineral_field(ut) || unit_is(ut, UnitTypes::Resource_Vespene_Geyser)) p = 11;
+		xy pos = trigger_location_center(at + 1);
+		for (int i = 0; i != n; ++i) trigger_create_unit(ut, pos, p);
+	}
+	// OEScript unit arguments: a game id, or an Extended mod type (by id 256+ or "mod:kind:id").
+	bool oes_unit_valid(int type) const { return (type >= 0 && type < 228) || is_ext_unit_type((UnitTypes)type); }
+	int oes_unit_ref(const a_string& ref) const {
+		for (size_t k = 0; k != game_st.ext_defs.size(); ++k) if (game_st.ext_defs[k].id == ref) return (int)(ext_unit_type_first + k);
+		return -1;
+	}
+	int64_t oes_count(int p, int type, int at) const {
+		if (at < 0) return st.completed_unit_counts[p].at((UnitTypes)type);
+		return trigger_bring_count(st.locations.at(at)).completed_unit_counts[p].at((UnitTypes)type);
+	}
+	int oes_kill(int p, int type, int n, int at) {
+		int k = 0;
+		trigger_for_units(p, p, at + 1, type, n, [&](unit_t* u) {
+			kill_unit(u);
+			++k;
+		});
+		return k;
+	}
+	int oes_give(int from, int to, int type, int n, int at) {
+		int k = 0;
+		trigger_for_units(from, from, at + 1, type, n, [&](unit_t* u) {
+			if (trigger_give_unit_to(u, to)) ++k;
+		});
+		return k;
+	}
+	static int oes_clamp(int64_t v) { return (int)std::max<int64_t>(0, std::min<int64_t>(std::numeric_limits<int32_t>::max(), v)); }
+	int64_t oes_add_minerals(int p, int64_t d) { return st.current_minerals[p] = oes_clamp((int64_t)st.current_minerals[p] + d); }
+	int64_t oes_add_gas(int p, int64_t d) { return st.current_gas[p] = oes_clamp((int64_t)st.current_gas[p] + d); }
+	int64_t oes_minerals(int p) const { return st.current_minerals[p]; }
+	int64_t oes_gas(int p) const { return st.current_gas[p]; }
+	void oes_attack(int p, int at) {
+		xy target = trigger_location_center(at + 1);
+		const order_type_t* order = get_order_type(Orders::AttackMove);
+		a_vector<unit_t*> army;
+		for (unit_t* u : ptr(st.player_units[p])) army.push_back(u);
+		for (unit_t* u : army) {
+			if (u->owner != p || unit_dying(u) || ut_turret(u) || ut_building(u) || ut_worker(u) || u_loaded(u)) continue;
+			if (~u->unit_type->group_flags & GroupFlags::Men) continue;
+			if (!u_can_move(u) || unit_is_fighter(u) || unit_is_rescuable(u) || unit_is(u, UnitTypes::Terran_Nuclear_Missile)) continue;
+			if (u_burrowed(u)) {
+				unburrow_unit(u);
+				set_queued_order(u, false, order, target);
+			} else if (unit_can_receive_order(u, order, u->owner)) {
+				set_unit_order(u, order, target);
+			}
+		}
+	}
+	void oes_outcome(int p, bool victory) {
+		if (p >= 8) return;
+		execute_trigger_struct ets;
+		for (int i = 0; i != 8; ++i) ets.victory_state[i] = st.players[i].victory_state;
+		int c = st.players[p].controller;
+		if (c == player_t::controller_occupied || c == player_t::controller_computer_game) ets.victory_state[p] = victory ? 3 : 2;
+		apply_victory_states(ets);
+	}
+	void oes_text(int p, const a_string& s) { on_trigger_display_text(p, s); }
+	void oes_sound(int p, const a_string& s) { on_trigger_play_wav(p, s); }
+	void oes_camera(int p, int at) { on_trigger_center_view(p, trigger_location_center(at + 1)); }
+	int oes_random() { return lcg_rand(60); }
+	void oes_units_in(int at, a_vector<oescript::entered_unit>& out) {
+		auto& loc = st.locations.at(at);
+		for (unit_t* u : find_units(loc.area)) {
+			if (ut_turret(u) || unit_dying(u)) continue;
+			if (!unit_is_at_elevation_flags(u, loc.elevation_flags)) continue;
+			out.push_back({(uint16_t)(u->index + 1), (int8_t)u->owner, (int16_t)u->unit_type->id});
+		}
+		std::sort(out.begin(), out.end());
+	}
+
+	// OEScript API 2: each function reuses the classic TRIG action, so both behave the same.
+	void oes_classic(int type, int owner, int location1, int extra, int num, int group2) {
+		trigger::action a{};
+		a.type = type;
+		a.group_n = owner;
+		a.location = location1;
+		a.extra_n = extra;
+		a.num_n = num;
+		a.group2_n = group2;
+		execute_trigger_struct ets;
+		for (int i = 0; i != 8; ++i) ets.victory_state[i] = st.players[i].victory_state;
+		running_trigger rt;
+		running_trigger::action ra;
+		execute_trigger_action(ets, owner, rt, ra, a);
+		if (type == 56) apply_victory_states(ets);
+	}
+	int oes_remove(int p, int type, int n, int at) {
+		int before = st.unit_deaths[p][(UnitTypes)type];
+		oes_classic(25, p, at + 1, type, n, 0);
+		return st.unit_deaths[p][(UnitTypes)type] - before;
+	}
+	void oes_order(int p, int type, int at, int order, int to) {
+		static const int classic[3] = {0, 2, 1};
+		oes_classic(46, p, at + 1, type, classic[order], to + 1);
+	}
+	void oes_set_stat(int stat, int p, int type, int n, int at, int percent) {
+		static const int classic[3] = {49, 51, 50};
+		oes_classic(classic[stat], p, at + 1, type, n, percent);
+	}
+	void oes_invincible(int p, int type, int at, bool on) { oes_classic(43, p, at + 1, type, on ? 4 : 5, 0); }
+	void oes_set_resources(int p, int64_t minerals, int64_t gas) {
+		if (p >= 8) return;
+		oes_classic(26, p, 0, 0, 7, (int)minerals);
+		if (gas >= 0) oes_classic(26, p, 0, 1, 7, (int)gas);
+	}
+	int64_t oes_deaths(int p, int type) const { return st.unit_deaths[p][(UnitTypes)type]; }
+	void oes_set_deaths(int p, int type, int64_t v) { oes_classic(45, p, 0, type, 7, (int)v); }
+	int64_t oes_score(int p, int kind) const { return trigger_player_score(p, kind); }
+	void oes_set_score(int p, int64_t v) { oes_classic(27, p, 0, 7, 7, (int)v); }
+	bool oes_allied(int a, int b) const { return st.alliances[a][b] != 0; }
+	void oes_alliance(int a, int b, int state) {
+		execute_trigger_struct ets;
+		trigger::action t{};
+		t.type = 57;
+		t.group_n = b;
+		t.extra_n = state;
+		running_trigger rt;
+		running_trigger::action ra;
+		execute_trigger_action(ets, a, rt, ra, t);
+	}
+	void oes_draw() { oes_classic(56, 0, 0, 0, 0, 0); }
+	void oes_move_location(int which, int to) {
+		auto& loc = st.locations.at(which);
+		auto& target = st.locations.at(to);
+		xy diff = (target.area.from + target.area.to) / 2 - (loc.area.from + loc.area.to) / 2;
+		xy from = loc.area.from + diff;
+		xy end = loc.area.to + diff;
+		if (from.x < 0) { end.x -= from.x; from.x = 0; }
+		if (from.y < 0) { end.y -= from.y; from.y = 0; }
+		if (end.x >= (int)game_st.map_width) { from.x += (int)game_st.map_width - 1 - end.x; end.x = (int)game_st.map_width - 1; }
+		if (end.y >= (int)game_st.map_height) { from.y += (int)game_st.map_height - 1 - end.y; end.y = (int)game_st.map_height - 1; }
+		loc.area.from = from;
+		loc.area.to = end;
+	}
+	void oes_ping(int p, int at) { oes_classic(28, p, at + 1, 0, 0, 0); }
+	// OEScript API 3: heroes and abilities. Units are passed as unit indices.
+	bool oes_is_hero_type(int type) const { return ext_hero_of_type(type) >= 0; }
+	int oes_ability_ref(const a_string& ref) const {
+		for (size_t k = 0; k != game_st.ext_abilities.size(); ++k) if (game_st.ext_abilities[k].id == ref) return (int)k;
+		return -1;
+	}
+	// The player's live, completed units of a type (loaded ones too), lowest unit id first.
+	void oes_units_of(int p, int type, a_vector<int>& out) const {
+		for (const unit_t* u : ptr(st.player_units[p])) {
+			if ((int)u->unit_type->id == type && !unit_dying(u) && u_completed(u)) out.push_back((int)u->index);
+		}
+		std::sort(out.begin(), out.end());
+	}
+	unit_t* oes_unit(int index) { return get_unit((size_t)index); }
+	int oes_ability_slot(int index, int ability, bool hero_only) {
+		auto s = ext_ability_slots(oes_unit(index));
+		for (size_t i = 0; i != s.size(); ++i) if (s[i].ability == ability && (s[i].hero || !hero_only)) return (int)i;
+		return -1;
+	}
+	int oes_hero_level(int index) { return oes_unit(index)->hero_level; }
+	int oes_hero_xp(int index) { return oes_unit(index)->hero_xp; }
+	int oes_hero_points(int index) { return oes_unit(index)->hero_points; }
+	int oes_hero_max_level(int type) const { return game_st.ext_heroes[(size_t)ext_hero_of_type(type)].max_level; }
+	void oes_hero_add_xp(int index, int amount) { ext_hero_add_xp(oes_unit(index), amount, true); }
+	// Up: like XP, a level at a time (points, per-level gains, hero.leveled). Down: points back, then
+	// ranks off the highest one (the later slot on a tie), a point each, until the points and levels allow them.
+	int oes_hero_set_level(int index, int level) {
+		unit_t* u = oes_unit(index);
+		const ext_hero_def& d = *ext_hero(u);
+		int from = u->hero_level;
+		u->hero_xp = (int)std::min<int64_t>(ext_hero_xp_for(d, level), 0x7fffffff);
+		if (level > from) {
+			while (u->hero_level < level) ext_hero_level_up(u, d, true);
+			return from;
+		}
+		u->hero_points -= d.skill_points * (from - level);
+		u->hero_level = level;
+		auto s = ext_ability_slots(u);
+		while (true) {
+			bool over = u->hero_points < 0;
+			int top = -1;
+			for (size_t i = 0; i != s.size(); ++i) {
+				if (!s[i].hero || !u->ab_rank[i]) continue;
+				if (ext_ability_learn_level(game_st.ext_abilities[(size_t)s[i].ability], u->ab_rank[i]) > level) over = true;
+				if (top < 0 || u->ab_rank[i] >= u->ab_rank[top]) top = (int)i;
+			}
+			if (!over || top < 0) break;
+			--u->ab_rank[top];
+			++u->hero_points;
+		}
+		if (u->hero_points < 0) u->hero_points = 0;
+		ext_hero_clamp(u);
+		return from;
+	}
+	int oes_hero_add_points(int index, int n) {
+		unit_t* u = oes_unit(index);
+		u->hero_points = (int)std::max<int64_t>(0, std::min<int64_t>(0x7fffffff, (int64_t)u->hero_points + n));
+		return u->hero_points;
+	}
+	int oes_hero_learn(int index, int slot, bool free) {
+		unit_t* u = oes_unit(index);
+		if (free) {
+			const ext_ability_def& a = game_st.ext_abilities[(size_t)ext_ability_slots(u)[(size_t)slot].ability];
+			if (u->ab_rank[slot] >= a.ranks) return -1;
+			++u->ab_rank[slot];
+		} else if (!ext_ability_learn(u, slot)) return -1;
+		return u->ab_rank[slot];
+	}
+	int oes_hero_unlearn(int index, int slot) {
+		unit_t* u = oes_unit(index);
+		if (!u->ab_rank[slot]) return -1;
+		--u->ab_rank[slot];
+		++u->hero_points;
+		return u->ab_rank[slot];
+	}
+	int oes_hero_attr(int index, int k) { return oes_unit(index)->hero_attr[k]; }
+	void oes_hero_set_attr(int index, int k, int v) {
+		unit_t* u = oes_unit(index);
+		u->hero_attr[k] = v;
+		ext_hero_clamp(u);
+	}
+	int oes_ability_rank(int index, int slot) { return oes_unit(index)->ab_rank[slot]; }
+	int oes_ability_cooldown(int index, int slot) { return std::max(0, oes_unit(index)->ab_ready[slot] - (int)st.current_frame); }
+	bool oes_ability_ready(int index, int slot) { return ext_ability_castable(oes_unit(index), slot) == ext_cast_ok; }
+	void oes_ability_set_cooldown(int index, int slot, int frames) { oes_unit(index)->ab_ready[slot] = (int)st.current_frame + frames; }
+	// The lowest-id live unit of a player and type (inside a location, if one is given).
+	int oes_first_unit(int p, int type, int at) {
+		int r = -1;
+		auto consider = [&](unit_t* u) {
+			if (u->owner != p || (int)u->unit_type->id != type || unit_dying(u) || ut_turret(u)) return;
+			if (r < 0 || (int)u->index < r) r = (int)u->index;
+		};
+		if (at < 0) for (unit_t* u : ptr(st.player_units[p])) consider(u);
+		else for (unit_t* u : find_units(st.locations.at(at).area)) consider(u);
+		return r;
+	}
+	// mode 0: no target, 1: at a location's centre (arg = location), 2: on a unit (arg = unit index).
+	bool oes_ability_cast(int index, int slot, int mode, int arg) {
+		unit_t* u = oes_unit(index);
+		auto s = ext_ability_slots(u);
+		const ext_ability_def& a = game_st.ext_abilities[(size_t)s[(size_t)slot].ability];
+		static const int wants[3] = {ext_ability_def::t_none, ext_ability_def::t_point, ext_ability_def::t_unit};
+		if (a.target != wants[mode]) return false;
+		if (mode == 1) return ext_ability_cast(u, slot, nullptr, trigger_location_center(arg + 1));
+		if (mode == 2) return ext_ability_cast(u, slot, oes_unit(arg), xy());
+		return ext_ability_cast(u, slot, nullptr, xy());
+	}
+	void oes_set_center(int which, int x, int y) {
+		auto& loc = st.locations.at(which);
+		xy size = loc.area.to - loc.area.from;
+		xy from = xy(x, y) - size / 2;
+		xy end = from + size;
+		if (from.x < 0) { end.x -= from.x; from.x = 0; }
+		if (from.y < 0) { end.y -= from.y; from.y = 0; }
+		if (end.x >= (int)game_st.map_width) { from.x += (int)game_st.map_width - 1 - end.x; end.x = (int)game_st.map_width - 1; }
+		if (end.y >= (int)game_st.map_height) { from.y += (int)game_st.map_height - 1 - end.y; end.y = (int)game_st.map_height - 1; }
+		loc.area.from = from;
+		loc.area.to = end;
+	}
+	a_string oes_type_text(int type) const {
+		if (const char* n = oescript::unit_name(type)) return n;
+		if (const ext_unit_def* d = ext_def((UnitTypes)type)) return d->id;
+		return "#" + oescript::num(type);
+	}
+	// A signal (non-empty name) or a hero level-up for the script; nothing if no handler wants it.
+	void oes_raise(const a_string& name, int owner, int type, int x, int y, int value, bool wanted) {
+		if (!st.oes.active || st.oes.ended || !wanted || st.oes.raised.size() >= (size_t)oescript::max_raised) return;
+		oescript::raised_event e;
+		e.name = name;
+		e.ctx.owner = owner; e.ctx.type = type; e.ctx.x = x; e.ctx.y = y; e.ctx.value = value;
+		st.oes.raised.push_back(std::move(e));
+	}
+
+	void oes_countdown(int frames) {
+		st.countdown_timer_ms = st.game->qol.legacy_trigger_seconds ? frames * 42 : (int)((int64_t)frames * 125 / 2);
+	}
+	void oes_ai_run(int p, uint32_t script, int at) { oes_classic(at < 0 ? 15 : 16, p, at + 1, 0, 0, (int)script); }
+	bool oes_live_unit(uint16_t id1, oescript::entered_unit& out) const {
+		unit_t* u = get_unit((size_t)id1 - 1);
+		if (!u || unit_dying(u) || ut_turret(u)) return false;
+		out = {id1, (int8_t)u->owner, (int16_t)u->unit_type->id};
+		return true;
+	}
+	void oes_incomplete(a_vector<oescript::pending_unit>& out) {
+		for (int p = 0; p != 12; ++p) {
+			for (const unit_t* u : ptr(st.player_units[p])) {
+				if (u_completed(u) || unit_dying(u) || ut_turret(u)) continue;
+				const unit_type_t* becomes = u->unit_type;
+				bool egg = unit_is(u, UnitTypes::Zerg_Egg) || unit_is(u, UnitTypes::Zerg_Lurker_Egg) || unit_is(u, UnitTypes::Zerg_Cocoon);
+				if (!u->build_queue.empty() && (egg || unit_is_morphing_building(u))) becomes = u->build_queue.front();
+				out.push_back({get_unit_id(u).raw_value, (int16_t)becomes->id});
+			}
+		}
+		std::sort(out.begin(), out.end());
+	}
+	// Done = alive, completed, and the type it was being made into (a cancelled morph completes as something else).
+	bool oes_completed(uint16_t raw, int type, oescript::entered_unit& out, bool& building) const {
+		unit_t* u = get_unit(unit_id(raw));
+		if (!u || unit_dying(u) || !u_completed(u)) return false;
+		if (type >= 0 && (int)u->unit_type->id != type) return false;
+		out = {raw, (int8_t)u->owner, (int16_t)u->unit_type->id};
+		building = ut_building(u);
+		return true;
+	}
+	uint32_t oes_humans() const {
+		uint32_t r = 0;
+		for (int p = 0; p != 8; ++p) if (st.players[p].controller == player_t::controller_occupied) r |= 1u << p;
+		return r;
 	}
 
 	int lcg_rand(int source) {
@@ -13953,6 +14949,15 @@ struct state_functions {
 		return r;
 	}
 
+	// An iscript move amount; a walking Extended type with its own speed scales it.
+	fp8 ext_walk_move(const unit_t* u, int a) const {
+		if (!game_st.oe_ext || ext_walk_measure) return fp8::integer(a);
+		if (!is_ext_unit_type(u->unit_type->id)) return fp8::integer(a);
+		int scale = game_st.ext_walk_scale[(size_t)u->unit_type->id - ext_unit_type_first];
+		if (scale <= 0) return fp8::integer(a);
+		return fp8::from_raw((fp8::raw_type)((int64_t)a * scale));
+	}
+
 	fp8 get_modified_unit_speed(const unit_t* u, fp8 base_speed) const {
 		ufp8 speed = base_speed.as_unsigned();
 		int mod = 0;
@@ -14067,7 +15072,9 @@ struct state_functions {
 			if (damage < 500) damage = 500;
 			return fp8::integer(damage);
 		} else {
-			return weapon_damage_amount(b->weapon_type, b->owner);
+			fp8 r = weapon_damage_amount(b->weapon_type, b->owner);
+			if (b->bullet_owner_unit && game_st.oe_ext) r += fp8::integer(ext_damage_bonus(b->bullet_owner_unit));
+			return r;
 		}
 	}
 
@@ -14107,6 +15114,7 @@ struct state_functions {
 		fp8 r = fp8::integer(u->unit_type->armor);
 		if (unit_is_ultralisk(u) && player_has_upgrade(u->owner, UpgradeTypes::Chitinous_Plating)) r += fp8::integer(2);
 		r += fp8::integer(player_upgrade_level(u->owner, u->unit_type->armor_upgrade));
+		if (u->hero >= 0) r += fp8::integer(ext_hero_bonus(u, &ext_hero_def::armor_per_level) + u->hero_attr[1] / ext_attr_agi_armor);
 		return r;
 	}
 
@@ -14254,6 +15262,7 @@ struct state_functions {
 					// tank has one record, not two).
 					unit_t* credit = unit_main_unit(source_unit);
 					if (credit && credit->kill_count < 0x7fffffff) ++credit->kill_count;
+					if (credit && !game_st.ext_heroes.empty()) ext_hero_award_kill(credit, u);
 					if (killer < 12) {
 						++st.unit_kills[killer][u->unit_type->id];
 						if (u->unit_type->group_flags & GroupFlags::Building) st.razings_score[killer] += u->unit_type->destroy_score;
@@ -14374,7 +15383,9 @@ struct state_functions {
 		if (u_hallucination(u)) {
 			hallucinated_weapon_hit(w, target, u->heading, u);
 		} else {
-			weapon_deal_damage(w, weapon_damage_amount(w, u->owner), 1, target, u->heading, u, u->owner);
+			fp8 damage = weapon_damage_amount(w, u->owner);
+			if (game_st.oe_ext) damage += fp8::integer(ext_damage_bonus(u));
+			weapon_deal_damage(w, damage, 1, target, u->heading, u, u->owner);
 		}
 	}
 
@@ -15229,7 +16240,7 @@ struct state_functions {
 			st.free_thingies.pop_front();
 			return r;
 		}
-		if (st.thingies.size() >= 500) {
+		if ((int)st.thingies.size() >= game_st.thingy_cap) {
 			// harness: 2 = an effect sprite ("thingy") not created, pool of 500 in use
 			if (!st.dbg_threshold_hits[2]++) st.dbg_threshold_first_frame[2] = (int)st.current_frame;
 			return nullptr;
@@ -15294,7 +16305,7 @@ struct state_functions {
 		case TechTypes::Consume:
 			if (ut_building(target)) return false;
 			if (target->owner != u->owner) return false;
-			if (unit_race(target) == race_t::terran) return false;
+			if (unit_race(target) != race_t::zerg) return false;
 			if (unit_is(target, UnitTypes::Zerg_Larva)) return false;
 			return true;
 		default:
@@ -15468,7 +16479,8 @@ struct state_functions {
 				b = *p++;
 				c = *p++;
 				if (noop) break;
-				add_image((ImageTypes)a, image->offset + xy(b, c), opc == opc_imgol ? image_order_above : image_order_below);
+				// 1.16.1 (0x4D764A): parent offset byte + operand byte, 8-bit add, stored as signed char.
+				add_image((ImageTypes)a, xy((int8_t)(image->offset.x + b), (int8_t)(image->offset.y + c)), opc == opc_imgol ? image_order_above : image_order_below);
 				break;
 			case opc_imgolorig:
 			case opc_switchul:
@@ -15669,10 +16681,10 @@ struct state_functions {
 			case opc_move:
 				a = *p++;
 				if (distance_moved) {
-					if (iscript_unit) *distance_moved = get_modified_unit_speed(iscript_unit, fp8::integer(a));
+					if (iscript_unit) *distance_moved = ext_walk_measure ? fp8::integer(a) : get_modified_unit_speed(iscript_unit, ext_walk_move(iscript_unit, a));
 				}
 				if (noop) break;
-				if (iscript_unit) set_next_speed(iscript_unit, get_modified_unit_speed(iscript_unit, fp8::integer(a)));
+				if (iscript_unit) set_next_speed(iscript_unit, get_modified_unit_speed(iscript_unit, ext_walk_move(iscript_unit, a)));
 				break;
 			case opc_gotorepeatattk:
 				if (noop) break;
@@ -15855,7 +16867,9 @@ struct state_functions {
 		auto* script = image->iscript_state.current_script;
 		if (!script) error("attempt to start animation without a script");
 		auto& anims_pc = script->animation_pc;
-		if ((size_t)new_anim >= anims_pc.size()) error("script %d does not have animation %d", script->id, new_anim);
+		// UMS maps disable/enable units whose script has no Disable/Enable entry (e.g. set doodad
+		// state on a non-doodad); the image keeps its current animation instead of aborting.
+		if ((size_t)new_anim >= anims_pc.size() || !anims_pc[new_anim]) return true;
 		image->iscript_state.animation = new_anim;
 		image->iscript_state.program_counter = anims_pc[new_anim];
 		image->iscript_state.return_address = 0;
@@ -16076,7 +17090,7 @@ struct state_functions {
 
 	void update_unit_speed_upgrades(unit_t*u) {
 		auto speed_upgrade = [&]() {
-			switch (u->unit_type->id) {
+			switch (u->unit_type->behaves_as) {
 			case UnitTypes::Terran_Vulture:
 			case UnitTypes::Hero_Jim_Raynor_Vulture:
 				return UpgradeTypes::Ion_Thrusters;
@@ -16119,11 +17133,40 @@ struct state_functions {
 		}
 	}
 
+	// The parent's natural walking speed (32 frames of its Walking animation, no
+	// modifiers) gives the move scale that makes a walking mod type reach its speed.
+	void ext_walk_prepare(unit_t* u, image_t* image) {
+		const ext_unit_def* d = ext_def(u->unit_type->id);
+		if (!d || d->speed < 0) return;
+		int& scale = game_st.ext_walk_scale[(size_t)u->unit_type->id - ext_unit_type_first];
+		if (scale != 0) return;
+		scale = -1;
+		auto* script = image->iscript_state.current_script;
+		int anim = iscript_anims::Walking;
+		if ((size_t)anim >= script->animation_pc.size() || script->animation_pc[anim] == 0) return;
+		auto ius = make_thingy_setter(iscript_unit, u);
+		auto measure = make_thingy_setter(ext_walk_measure, true);
+		iscript_state_t ist;
+		ist.current_script = script;
+		ist.animation = anim;
+		ist.program_counter = script->animation_pc[anim];
+		ist.return_address = 0;
+		ist.wait = 0;
+		int64_t total = 0;
+		for (int i = 0; i < 32; ++i) {
+			fp8 distance_moved {};
+			if (!iscript_execute(image, ist, true, &distance_moved)) error("ext_walk_prepare: image destroyed");
+			total += distance_moved.raw_value;
+		}
+		if (total > 0) scale = (int)std::max<int64_t>(1, (int64_t)d->speed * 256 * 256 * 32 / total);
+	}
+
 	void update_unit_speed(unit_t* u) {
 
 		if (u->flingy_movement_type == 2) {
 			image_t* image = u->sprite->main_image;
 			if (!image) error("null image");
+			if (game_st.oe_ext) ext_walk_prepare(u, image);
 			auto* script = image->iscript_state.current_script;
 			auto& anims_pc = script->animation_pc;
 			int anim = iscript_anims::Walking;
@@ -16754,7 +17797,7 @@ struct state_functions {
 				u->building.resource.gather_queue.pop_front();
 			}
 		} else {
-			switch (u->unit_type->id) {
+			switch (u->unit_type->behaves_as) {
 			case UnitTypes::Protoss_Interceptor:
 			case UnitTypes::Protoss_Scarab:
 				if (u_completed(u)) {
@@ -16849,7 +17892,7 @@ struct state_functions {
 			st.player_units[u->owner].remove(*u);
 			bw_insert_list(st.dead_units, *u);
 		} else {
-			auto tid = u->unit_type->id;
+			auto tid = u->unit_type->behaves_as;
 			if (tid == UnitTypes::Terran_Refinery || tid == UnitTypes::Zerg_Extractor || tid == UnitTypes::Protoss_Assimilator) {
 				if (tid == UnitTypes::Zerg_Extractor) remove_extractor_creep(u, u->sprite->position, true);
 				if (u_completed(u)) add_completed_unit(u, -1, false);
@@ -16930,7 +17973,13 @@ struct state_functions {
 			destroy_unit(turret);
 			u->subunit = nullptr;
 		}
+		const unit_type_t* prev_type = u->unit_type;
 		destroy_unit_impl(u);
+		// A removed (hidden) gas building reverts to a live geyser; it keeps its sprite.
+		if (u->unit_type != prev_type) {
+			show_unit(u);
+			return;
+		}
 		u->order_type = get_order_type(Orders::Die);
 		u->order_state = 1;
 		destroy_sprite(u->sprite);
@@ -16953,6 +18002,18 @@ struct state_functions {
 		u->last_event_color = 0;
 		u->rank_increase = 0;
 		u->kill_count = 0;
+		u->hero = game_st.ext_heroes.empty() ? -1 : ext_hero_of_type((int)unit_type->id);
+		u->hero_level = u->hero >= 0 ? 1 : 0;
+		u->hero_xp = 0;
+		u->hero_points = u->hero >= 0 ? game_st.ext_heroes[u->hero].skill_points : 0;
+		for (int k = 0; k != 3; ++k) u->hero_attr[k] = u->hero >= 0 ? ext_hero_attr_base(game_st.ext_heroes[u->hero], k) : 0;
+		for (int i = 0; i != 8; ++i) u->ab_rank[i] = 0, u->ab_ready[i] = 0;
+		u->ab_bonus = 0;
+		u->ab_bonus_until = 0;
+		if (!game_st.ext_abilities.empty()) {
+			auto slots = ext_ability_slots(unit_type, u->hero);
+			for (size_t i = 0; i != slots.size(); ++i) u->ab_rank[i] = slots[i].hero ? 0 : 1;
+		}
 
 		u->remove_timer = 0;
 		u->defensive_matrix_hp = 0_fp8;
@@ -16985,6 +18046,7 @@ struct state_functions {
 
 		new (&u->build_queue) static_vector<const unit_type_t*, 5>();
 		new (&u->build_queue_limbo) static_vector<const unit_type_t*, 5>();
+		u->build_queue_slot = 0;
 		++u->unit_id_generation;
 		u->wireframe_randomizer = lcg_rand(15) & 0xff;
 		if (ut_turret(u)) u->hp = 1_fp8;
@@ -17050,7 +18112,7 @@ struct state_functions {
 		if (u_grounded_building(u)) bw_insert_list(st.visible_units, *u);
 		else bw_insert_list(st.hidden_units, *u);
 
-		if (unit_type->id < UnitTypes::Terran_Command_Center && unit_type->turret_unit_type) {
+		if (unit_type->behaves_as < UnitTypes::Terran_Command_Center && unit_type->turret_unit_type) {
 			unit_t* su = get_new(unit_type->turret_unit_type);
 			if (!su) {
 				destroy_unit(u);
@@ -17068,7 +18130,7 @@ struct state_functions {
 	}
 
 	unit_t* create_unit(UnitTypes unit_type_id, xy pos, int owner) {
-		if ((size_t)unit_type_id >= 228) error("attempt to create unit with invalid id %d", unit_type_id);
+		if ((size_t)unit_type_id >= 228 && !is_ext_unit_type(unit_type_id)) error("attempt to create unit with invalid id %d", unit_type_id);
 		return create_unit(get_unit_type(unit_type_id), pos, owner);
 	}
 
@@ -17190,6 +18252,7 @@ struct state_functions {
 			u->shield_points = fp8::integer(u->unit_type->shield_points);
 			u->remaining_build_time = 0;
 		}
+		if (u->hero >= 0) set_unit_hp(u, u->hp + (unit_max_hp(u) - u->unit_type->hitpoints));
 		if (u_grounded_building(u)) {
 			u->parasite_flags = 0;
 			u->blinded_by = 0;
@@ -17277,6 +18340,7 @@ struct state_functions {
 					const unit_t* n = find_unit(search_bb, blocking_unit_pred);
 					if (n) {
 						int inc = n->sprite->position.x + n->unit_type->dimensions.to.x + 1 - search_bb.from.x;
+						if (inc <= 0) inc = 8;   // EUD-resized unit with a stale finder box
 						inc += (8 - ((x + inc) & 7)) & 7;
 						search_bb.from.x += inc;
 						search_bb.to.x += inc;
@@ -17304,6 +18368,7 @@ struct state_functions {
 					const unit_t* n = find_unit(search_bb, blocking_unit_pred);
 					if (n) {
 						int dec = search_bb.to.y - (n->sprite->position.y - n->unit_type->dimensions.from.y - 1);
+						if (dec <= 0) dec = 8;
 						dec += (8 - ((y - dec) & 7)) & 7;
 						search_bb.from.y -= dec;
 						search_bb.to.y -= dec;
@@ -17335,6 +18400,7 @@ struct state_functions {
 					const unit_t* n = find_unit(search_bb, blocking_unit_pred);
 					if (n) {
 						int dec = search_bb.to.x - (n->sprite->position.x - n->unit_type->dimensions.from.x - 1);
+						if (dec <= 0) dec = 8;
 						dec += (8 - ((x - dec) & 7)) & 7;
 						search_bb.from.x -= dec;
 						search_bb.to.x -= dec;
@@ -17362,6 +18428,7 @@ struct state_functions {
 					const unit_t* n = find_unit(search_bb, blocking_unit_pred);
 					if (n) {
 						int inc = n->sprite->position.y + n->unit_type->dimensions.to.y + 1 - search_bb.from.y;
+						if (inc <= 0) inc = 8;
 						inc += (8 - ((y + inc) & 7)) & 7;
 						search_bb.from.y += inc;
 						search_bb.to.y += inc;
@@ -17536,6 +18603,11 @@ struct state_functions {
 			if (!o) break;
 			if ((!interrupt || !o->order_type->can_be_interrupted) && o->order_type != order_type) break;
 			remove_queued_order(u, o);
+		}
+		if (game_st.scr_order_alloc_guard && u->order_type->id != Orders::ResetHarvestCollision) {
+			bool many = u->order_queue_count >= 8;
+			if (many && game_st.scr_scv_reset_exception && u->order_type->id == Orders::ConstructingBuilding && order_type->id == Orders::ResetCollision) many = false;
+			if (many || (int)st.active_orders_size >= game_st.order_queue_cap) return;
 		}
 		if (order_type->id == Orders::Cloak) {
 			error("cloak fixme");
@@ -17954,7 +19026,10 @@ struct state_functions {
 		}
 		finish_building_unit(u);
 		if (!place_completed_unit(u)) {
-			error("place_completed_unit failed");
+			// No free spot (UMS maps stack or box in preplaced units): the unit is dropped
+			// instead of aborting the whole map load, as trigger Create Unit already does.
+			destroy_unit(u);
+			return nullptr;
 		}
 
 		complete_unit(u);
@@ -18010,9 +19085,18 @@ struct state_functions {
 		return st.upgrade_upgrading.at(owner).at(upgrade_id);
 	}
 	int player_upgrade_level(int owner, UpgradeTypes upgrade_id) const {
+		if ((size_t)upgrade_id >= 61) {
+			// EUD-edited weapons can name upgrade 61+: BW's 15-per-player table for 46..60 spills into the next player
+			size_t i = (size_t)owner * 15 + ((size_t)upgrade_id - 46);
+			return i / 15 < 12 ? st.upgrade_levels.at(i / 15).at((UpgradeTypes)(46 + i % 15)) : 0;
+		}
 		return st.upgrade_levels.at(owner).at(upgrade_id);
 	}
 	bool unit_is(unit_type_autocast ut, UnitTypes unit_type_id) const {
+		return ut->behaves_as == unit_type_id;
+	}
+	// The real type (triggers, AI groups): a mod type is not its parent here.
+	bool unit_is_type(unit_type_autocast ut, UnitTypes unit_type_id) const {
 		return ut->id == unit_type_id;
 	}
 	unit_t* unit_addon(const unit_t* u) const {
@@ -18063,7 +19147,279 @@ struct state_functions {
 		return false;
 	}
 
+	// 1.16.1 requirement interpreters (units 0x46E1C0, the rest 0x46D610 + wrappers). Used instead of the
+	// rules below once an EUD write touched the tables; 1 = allowed. Cheat flags are not modelled.
+	bool req_active() const {
+		return st.game->qol.eud_requirements && !st.eud_req_idx.empty();
+	}
+	uint32_t req_byte(uint32_t a) const {
+		bool engine;
+		return eud_byte_get(a, &engine);
+	}
+	uint32_t req_w(const eud::req_table& rt, uint32_t i) const {
+		uint32_t a = rt.table + 2 * i;
+		return req_byte(a) | req_byte(a + 1) << 8;
+	}
+	uint32_t req_completed(int player, uint32_t id) const {
+		return eud_read(0x00584DE4u + 4u * (id * 12u + (uint32_t)player));
+	}
+	uint32_t req_all(int player, uint32_t id) const {
+		return eud_read(0x00582324u + 4u * (id * 12u + (uint32_t)player));
+	}
+	bool req_researched(int player, uint32_t id) const {
+		return req_byte(id < 24 ? 0x0058CF44u + 24u * player + id : 0x0058F128u + 20u * player + id) != 0;
+	}
+	// The index value a map wrote, else what the game's lazy index builder would give for the current
+	// table (last entry with that id, 0 = none). Pure: UI-timed queries never change later results.
+	uint32_t req_offset(int kind, uint32_t id) const {
+		const eud::req_table& rt = eud::req_tables[kind];
+		if (id >= rt.count) return 0;
+		uint32_t v = st.eud_req_idx[rt.first + id];
+		if (v != 0xffff) return v;
+		v = 0;
+		for (uint32_t i = 1; i < 0x10000;) {
+			uint32_t cx = req_w(rt, i);
+			if (cx == 0xffff) break;
+			if (cx == id) v = i + 1;
+			while (++i < 0x10000 && req_w(rt, i) != 0xffff) {}
+			++i;
+		}
+		return v;
+	}
+	// CUnit +0xC0 / +0xC8 / +0xC9 / +0xD0 as the requirement opcodes read them.
+	bool req_unit_c0(const unit_t* u) const {
+		if (ut_building(u)) return u->building.addon != nullptr;
+		if (unit_is_vulture(u)) return u->vulture.spider_mine_count != 0;
+		if (unit_is_carrier(u)) return u->carrier.inside_count != 0;
+		if (unit_is_reaver(u)) return u->reaver.inside_count != 0;
+		return false;
+	}
+	uint32_t req_unit_c8(const unit_t* u) const {
+		if (unit_is_carrier(u)) return (uint8_t)u->carrier.inside_count;
+		if (unit_is_reaver(u)) return (uint8_t)u->reaver.inside_count;
+		if (ut_building(u)) return u->building.researching_type ? (uint32_t)u->building.researching_type->id : 44u;
+		return 0;
+	}
+	uint32_t req_unit_c9(const unit_t* u) const {
+		if (unit_is_carrier(u)) return (uint8_t)u->carrier.outside_count;
+		if (ut_building(u)) return u->building.upgrading_type ? (uint32_t)u->building.upgrading_type->id : 61u;
+		return 0;
+	}
+	bool req_unit_d0(const unit_t* u) const {
+		if (unit_is(u, UnitTypes::Terran_Nuclear_Silo)) return u->building.silo.nuke != nullptr;
+		if (unit_is_nydus(u)) return u->building.nydus.exit != nullptr;
+		if (ut_resource(u)) return u->building.resource.resource_count != 0;
+		return false;
+	}
+	bool req_busy(const unit_t* u) const {
+		return unit_is_constructing(u) || req_unit_c8(u) != 44 || req_unit_c9(u) != 61;
+	}
+	bool req_rally_building(const unit_t* u) const {
+		switch (u->unit_type->id) {
+		case UnitTypes::Terran_Command_Center: case UnitTypes::Terran_Barracks: case UnitTypes::Terran_Factory:
+		case UnitTypes::Terran_Starport: case UnitTypes::Zerg_Infested_Command_Center: case UnitTypes::Zerg_Hatchery:
+		case UnitTypes::Zerg_Lair: case UnitTypes::Zerg_Hive: case UnitTypes::Protoss_Nexus: case UnitTypes::Protoss_Gateway:
+		case UnitTypes::Protoss_Stargate: case UnitTypes::Protoss_Robotics_Facility:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	int req_unit_check(const unit_t* u, int unit_id, int player) const {
+		if (unit_id >= 228 || u->owner != player) return 0;
+		if (!u_completed(u) || unit_is_disabled(u)) return 0;
+		if (!game_st.unit_type_allowed[player][(UnitTypes)unit_id]) return 0;
+		if (u->build_queue.size() >= 5 && u->build_queue.back()->id <= UnitTypes::Spell_Disruption_Web) return 0;
+		if (u_hallucination(u)) return 0;
+		const eud::req_table& rt = eud::req_tables[eud::req_unit];
+		uint32_t i = req_offset(eud::req_unit, (uint32_t)unit_id);
+		if (i == 0) return 0;
+		bool a = true, b = true, e = false;
+		uint32_t op = req_w(rt, i);
+		while (op != 0xffff) {
+			uint32_t n = 0;
+			while (true) {
+				if (i >= 0x10000) return 0;
+				switch (op) {
+				case 0xff02: {
+					uint32_t x = req_w(rt, ++i);
+					if (req_completed(player, x)) a = false;
+					if (x == (uint32_t)u->unit_type->id) e = false, b = false, ++n;
+					else if (b) e = true;
+					break;
+				}
+				case 0xff03: {
+					uint32_t x = req_w(rt, ++i);
+					n += req_completed(player, x) + req_all(player, x);
+					break;
+				}
+				case 0xff04: {
+					uint32_t x = req_w(rt, ++i);
+					unit_t* addon = unit_addon(u);
+					if (!addon || (uint32_t)addon->unit_type->id != x) return -1;
+					++n;
+					break;
+				}
+				case 0xff05: if (!u_grounded_building(u)) return 0; ++n; break;
+				case 0xff07: if (req_busy(u)) return 0; ++n; break;
+				case 0xff08: if (unit_is_building_addon(u) || unit_is_building_protoss_thing(u)) return 0; ++n; break;
+				case 0xff09: if (req_unit_c8(u) != 44) return 0; ++n; break;
+				case 0xff0a: if (req_unit_c9(u) != 61) return 0; ++n; break;
+				case 0xff0b: if (unit_is(u, UnitTypes::Terran_SCV) && u->order_type->id == Orders::ConstructingBuilding) return 0; ++n; break;
+				case 0xff0c: if (unit_addon(u)) return 0; ++n; break;
+				case 0xff0e: {
+					uint8_t c = 0xff;
+					size_t mx = 0;
+					if (unit_is_carrier(u)) {
+						c = (uint8_t)(unit_queued_fighter_units(u) + u->carrier.outside_count + u->carrier.inside_count);
+						mx = unit_max_interceptor_count(u);
+					} else if (unit_is_reaver(u)) {
+						c = (uint8_t)(unit_queued_fighter_units(u) + u->reaver.inside_count);
+						mx = unit_max_scarab_count(u);
+					}
+					if (c >= mx) return 0;
+					++n;
+					break;
+				}
+				case 0xff10: if (req_unit_d0(u)) return 0; ++n; break;
+				case 0xff11: if (u_burrowed(u)) return 0; ++n; break;
+				case 0xff26: if (!u_burrowed(u)) return -1; ++n; break;
+				case 0xff22: return -1;
+				case 0xff23: return 0;
+				case 0xff24: ++n; break;
+				case 0xff25: if (!req_researched(player, req_w(rt, ++i))) return -1; ++n; break;
+				default: n += req_completed(player, op); break;
+				}
+				if (req_w(rt, ++i) != 0xff01) break;
+				op = req_w(rt, ++i);
+			}
+			if (n == 0 && a) return -1;
+			a = true;
+			op = req_w(rt, i);
+		}
+		return e ? -1 : 1;
+	}
+
+	int req_generic_check(const unit_t* u, int id, int player, int kind) const {
+		const eud::req_table& rt = eud::req_tables[kind];
+		uint32_t i = req_offset(kind, (uint32_t)id);
+		bool a = true, b = true, e = false, halluc_ok = false;
+		auto flag = [&](uint32_t f) {
+			return (u->unit_type->flags & f) != 0;
+		};
+		uint32_t op = req_w(rt, i);
+		while (op != 0xffff) {
+			uint32_t n = 0;
+			while (true) {
+				if (i >= 0x10000) return 0;
+				switch (op) {
+				case 0xff02: {
+					uint32_t x = req_w(rt, ++i);
+					if (req_completed(player, x)) a = false;
+					if (x == (uint32_t)u->unit_type->id) e = false, b = false, ++n;
+					else if (b) e = true;
+					break;
+				}
+				case 0xff03: {
+					uint32_t x = req_w(rt, ++i);
+					n += req_completed(player, x) + req_all(player, x);
+					break;
+				}
+				case 0xff05: if (!u_grounded_building(u)) return 0; ++n; break;
+				case 0xff06: if (u_grounded_building(u)) return 0; ++n; break;
+				case 0xff07: if (req_busy(u)) return 0; ++n; break;
+				case 0xff08: if (unit_is_building_addon(u) || unit_is_building_protoss_thing(u)) return 0; ++n; break;
+				case 0xff09: if (req_unit_c8(u) != 44) return 0; ++n; break;
+				case 0xff0a: if (req_unit_c9(u) != 61) return 0; ++n; break;
+				case 0xff0d: if (req_unit_d0(u)) return 0; ++n; break;
+				case 0xff0f:
+					if (id == (int)TechTypes::Burrowing && unit_is(u, UnitTypes::Zerg_Lurker)) ++n;
+					else if (req_researched(player, (uint32_t)id)) ++n;
+					break;
+				case 0xff11:
+					if (u_burrowed(u) && st.players[u->owner].controller != player_t::controller_computer_game) return 0;
+					++n;
+					break;
+				case 0xff26: if (!u_burrowed(u)) return 0; ++n; break;
+				case 0xff12: if (u_grounded_building(u)) return 0; ++n; break;
+				case 0xff13: if (!u_grounded_building(u)) return 0; ++n; break;
+				case 0xff14: if (!unit_can_move(u)) return 0; ++n; break;
+				case 0xff15: if (!unit_can_attack(u)) return 0; ++n; break;
+				case 0xff16: if (!flag(0x8)) return 0; ++n; break;
+				case 0xff17: if (!flag(0x20)) return 0; ++n; break;
+				case 0xff18:
+					if (u_hallucination(u)) break;
+					if (unit_is(u, UnitTypes::Zerg_Overlord) && !player_upgrade_level(u->owner, UpgradeTypes::Ventral_Sacs)) break;
+					if (u->unit_type->space_provided) ++n;
+					break;
+				case 0xff19: if (!flag(0x800)) return 0; ++n; break;
+				case 0xff1a: if (!flag(0x10)) return 0; ++n; break;
+				case 0xff1b: if (!req_unit_c0(u)) return 0; ++n; break;
+				case 0xff1c: if (flag(0x40)) ++n; break;
+				case 0xff1d:
+					if (!(unit_is(u, UnitTypes::Zerg_Lurker) && u_burrowed(u)) && !u->unit_type->right_click_action) {
+						if (!u_grounded_building(u) || !req_rally_building(u)) return 0;
+					}
+					++n;
+					break;
+				case 0xff1e: halluc_ok = true; ++n; break;
+				case 0xff1f: case 0xff20: case 0xff21: {
+					uint32_t lvl = req_byte((uint32_t)id < 46 ? 0x0058D2B0u + 46u * player + id : 0x0058F2FEu + 15u * player + id);
+					uint32_t mark = lvl == 1 ? 0xff20 : lvl == 2 ? 0xff21 : 0xff1f;
+					while (req_w(rt, i) != mark) {
+						if (++i >= 0x10000) return 0;
+					}
+					++n;
+					break;
+				}
+				case 0xff22: return -1;
+				case 0xff23: return 0;
+				case 0xff24: ++n; break;
+				default: n += req_completed(player, op); break;
+				}
+				if (req_w(rt, ++i) != 0xff01) break;
+				op = req_w(rt, ++i);
+			}
+			if (e) return 0;
+			if (n == 0 && a) return -1;
+			a = true;
+			op = req_w(rt, i);
+		}
+		if (u_hallucination(u) && !halluc_ok) return 0;
+		return 1;
+	}
+
+	int req_research_check(const unit_t* u, int tech, int player) const {
+		if (tech >= 44 || u->owner != player) return 0;
+		if (!u_completed(u) || unit_is_disabled(u)) return 0;
+		if (!player_tech_available(player, (TechTypes)tech)) return 0;
+		if (player_is_researching(player, (TechTypes)tech) || player_has_researched(player, (TechTypes)tech)) return 0;
+		if (!req_offset(eud::req_research, (uint32_t)tech)) return 0;
+		return req_generic_check(u, tech, player, eud::req_research);
+	}
+	int req_upgrade_check(const unit_t* u, int upgrade, int player) const {
+		if (upgrade >= 61 || u->owner != player) return 0;
+		if (!u_completed(u) || unit_is_disabled(u)) return 0;
+		if (player_upgrade_level(player, (UpgradeTypes)upgrade) >= player_max_upgrade_level(player, (UpgradeTypes)upgrade)) return 0;
+		if (player_is_upgrading(player, (UpgradeTypes)upgrade)) return 0;
+		if (!req_offset(eud::req_upgrade, (uint32_t)upgrade)) return 0;
+		return req_generic_check(u, upgrade, player, eud::req_upgrade);
+	}
+	int req_use_check(const unit_t* u, int tech, int player) const {
+		if (tech >= 44 || u->owner != player) return 0;
+		if (!u_completed(u) || unit_is_disabled(u) || u_hallucination(u)) return 0;
+		if (!player_tech_available(player, (TechTypes)tech)) return 0;
+		if (!req_offset(eud::req_use, (uint32_t)tech)) return 0;
+		return req_generic_check(u, tech, player, eud::req_use);
+	}
+	int req_order_check(const unit_t* u, int order) const {
+		if (order >= 189 || !req_offset(eud::req_order, (uint32_t)order)) return 0;
+		return req_generic_check(u, order, u->owner, eud::req_order);
+	}
+
 	bool unit_can_build(const unit_t* u, const unit_type_t* unit_type) const {
+		if (req_active()) return req_unit_check(u, (int)unit_type->id, u->owner) == 1;
 		if (!u_completed(u)) return false;
 		if (unit_is_disabled(u)) return false;
 		if (u_hallucination(u)) return false;
@@ -18071,6 +19427,30 @@ struct state_functions {
 		if (!game_st.unit_type_allowed[owner][unit_type->id]) return false;
 		if (u->build_queue.size() >= 5) {
 			if (u->build_queue.back()->id <= UnitTypes::Spell_Disruption_Web) return false;
+		}
+		if (!game_st.ext_heroes.empty() && ext_hero_unique_taken(owner, (int)unit_type->id)) return false;
+		if (game_st.oe_ext) {
+			// GE3: a mod type is made by its producer / builder (or a mod building that lists it)
+			// once its requirements are done; a mod building makes only what it lists.
+			const ext_unit_def* d = ext_def(unit_type->id);
+			const ext_unit_def* maker = ext_def(u->unit_type->id);
+			if (d) {
+				bool ok = false;
+				if (d->building) ok = (int)u->unit_type->id == d->builder;
+				else {
+					ok = (int)u->unit_type->id == d->producer;
+					if (maker) for (int p : maker->produces) ok |= p == (int)unit_type->id;
+					if (ok && ut_building(u) && (!u_grounded_building(u) || unit_is_building_addon(u) || unit_is_building_protoss_thing(u))) ok = false;
+				}
+				if (!ok) return false;
+				for (int r : d->requires) if (!player_has_completed_unit(owner, (UnitTypes)r)) return false;
+				return true;
+			}
+			if (maker && maker->building) {
+				// a classic unit from a mod building: only one it lists
+				for (int p : maker->produces) if (p == (int)unit_type->id) return u_grounded_building(u);
+				return false;
+			}
 		}
 
 		switch (unit_type->id) {
@@ -18507,6 +19887,7 @@ struct state_functions {
 	}
 
 	bool unit_order_allowed(const unit_t* u, const order_type_t* order) const {
+		if (req_active()) return req_order_check(u, (int)order->id) == 1;
 		switch (order->id) {
 		case Orders::Die:
 			return true;
@@ -18924,12 +20305,12 @@ struct state_functions {
 			return true;
 		case Orders::CTFCOP2:
 			if (st.current_frame > 600) return false;
-			if (!unit_is(u, unit_type->id)) return false;
+			if (!unit_is_type(u, unit_type->id) && !unit_is(u, unit_type->id)) return false;
 			if (!unit_can_receive_order(u, order, owner)) return false;
 			return true;
 		case Orders::BuildNydusExit:
 		case Orders::BuildingLand:
-			if (!unit_is(u, unit_type->id)) return false;
+			if (!unit_is_type(u, unit_type->id) && !unit_is(u, unit_type->id)) return false;
 			if (!unit_can_receive_order(u, order, owner)) return false;
 			return true;
 		default:
@@ -18943,6 +20324,7 @@ struct state_functions {
 	}
 
 	bool unit_can_research(const unit_t* u, const tech_type_t* tech) const {
+		if (req_active()) return req_research_check(u, (int)tech->id, u->owner) == 1;
 		if (!u_completed(u)) return false;
 		if (u_hallucination(u)) return false;
 		if (unit_is_disabled(u)) return false;
@@ -19078,6 +20460,7 @@ struct state_functions {
 	}
 
 	bool unit_can_upgrade(const unit_t* u, const upgrade_type_t* upgrade) const {
+		if (req_active()) return req_upgrade_check(u, (int)upgrade->id, u->owner) == 1;
 		if (!u_completed(u)) return false;
 		if (u_hallucination(u)) return false;
 		if (unit_is_disabled(u)) return false;
@@ -19385,20 +20768,13 @@ struct state_functions {
 	}
 
 	bool unit_can_use_tech(const unit_t* u, const tech_type_t* tech) const {
+		if (req_active()) return req_use_check(u, (int)tech->id, u->owner) == 1;
 		if (!u_completed(u)) return false;
 		if (u_hallucination(u)) return false;
 		if (unit_is_disabled(u)) return false;
 		int owner = u->owner;
-		// Heroes wield their innate abilities regardless of the player's
-		// tech-availability table (PTEC). Infested Kerrigan is a Zerg-owned unit
-		// casting Psionic Storm -- a Protoss tech her owner never has "available"
-		// -- so this gate silently blocked the hero exceptions the per-tech cases
-		// below already encode (Kerrigan/Tassadar for Psi Storm, etc.), leaving
-		// that code unreachable and her spells dead. The per-tech cases still
-		// restrict WHICH heroes may use each tech, so heroes gain only their
-		// intended kit; non-heroes keep the availability gate unchanged. Melee
-		// has no heroes -> the replay/LAN determinism path is byte-identical.
-		if (!ut_hero(u) && !player_tech_available(owner, tech->id)) return false;
+		// 1.16.1 checks availability for every unit, heroes included (0x46DD80 -> 0x4CE8A0 at 0x46DE31).
+		if (!player_tech_available(owner, tech->id)) return false;
 		switch (tech->id) {
 		case TechTypes::Stim_Packs:
 			if (!ut_hero(u) && !player_has_researched(owner, TechTypes::Stim_Packs)) return false;
@@ -19441,7 +20817,7 @@ struct state_functions {
 			return true;
 		case TechTypes::Personnel_Cloaking:
 			if (!ut_hero(u) && !player_has_researched(owner, TechTypes::Personnel_Cloaking)) return false;
-			if (!unit_is_ghost(u)) return false;
+			if (!unit_is_ghost(u) && !unit_is(u, UnitTypes::Hero_Infested_Kerrigan)) return false;
 			return true;
 		case TechTypes::Restoration:
 			if (!player_has_researched(owner, TechTypes::Restoration)) return false;
@@ -19548,28 +20924,30 @@ struct state_functions {
 				else if (unit_id == 230) r += count_obj.completed_non_building_counts[p];
 				else if (unit_id == 231) r += count_obj.completed_building_counts[p];
 				else if (unit_id == 232) r += count_obj.completed_factory_counts[p];
-				else if ((size_t)unit_id < 228) r += count_obj.completed_unit_counts[p].at((UnitTypes)unit_id);
+				else if ((size_t)unit_id < 228 || is_ext_unit_type((UnitTypes)unit_id)) r += count_obj.completed_unit_counts[p].at((UnitTypes)unit_id);
 			} else {
 				if (unit_id == 229) r += count_obj.non_building_counts[p] + count_obj.building_counts[p];
 				else if (unit_id == 230) r += count_obj.non_building_counts[p];
 				else if (unit_id == 231) r += count_obj.building_counts[p];
 				else if (unit_id == 232) r += count_obj.factory_counts[p];
-				else if ((size_t)unit_id < 228) r += count_obj.unit_counts[p].at((UnitTypes)unit_id);
+				else if ((size_t)unit_id < 228 || is_ext_unit_type((UnitTypes)unit_id)) r += count_obj.unit_counts[p].at((UnitTypes)unit_id);
 			}
 		}
 		return r;
 	}
 
 	bool trigger_count_comparison(const trigger::condition& c, int count) const {
-		if (c.num_n == 0) return count >= c.count_n; // at least
-		else if (c.num_n == 1) return count <= c.count_n; // at most
+		// BW compares unsigned dwords (EUD bit reads test "at least 0x80000000").
+		uint32_t v = (uint32_t)count, n = (uint32_t)c.count_n;
+		if (c.num_n == 0) return v >= n; // at least
+		else if (c.num_n == 1) return v <= n; // at most
 		// "exactly" is 10 in the CHK format (2 kept for safety)
-		else return count == c.count_n;
+		else return v == n;
 	}
 
 	struct bring_unit_counters {
-		std::array<type_indexed_array<int, UnitTypes>, 12> unit_counts;
-		std::array<type_indexed_array<int, UnitTypes>, 12> completed_unit_counts;
+		std::array<unit_type_array<int>, 12> unit_counts;
+		std::array<unit_type_array<int>, 12> completed_unit_counts;
 
 		std::array<int, 12> factory_counts;
 		std::array<int, 12> building_counts;
@@ -19638,18 +21016,18 @@ struct state_functions {
 	// Aggregate a per-player, per-unit-type counter table (kills/deaths) over a
 	// trigger player group, honoring the group unit ids (229 any, 230 men,
 	// 231 buildings, 232 factories).
-	int trigger_table_count(const std::array<type_indexed_array<int32_t, UnitTypes>, 12>& tbl, int owner, int player, int unit_id, bool eud = false) const {
+	int trigger_table_count(const std::array<unit_type_array<int32_t>, 12>& tbl, int owner, int player, int unit_id, bool eud = false) const {
 		int r = 0;
 		for (int p : trigger_players(owner, player)) {
 			if (unit_id == 229 || unit_id == 230 || unit_id == 231 || unit_id == 232) {
-				for (size_t i = 0; i != 228; ++i) {
-					const unit_type_t* ut = get_unit_type((UnitTypes)i);
-					if (unit_id == 230 && (~ut->group_flags & GroupFlags::Men)) continue;
-					if (unit_id == 231 && (~ut->group_flags & GroupFlags::Building)) continue;
-					if (unit_id == 232 && (~ut->group_flags & GroupFlags::Factory)) continue;
-					r += tbl[p].at((UnitTypes)i);
-				}
-			} else if ((size_t)unit_id < 228) {
+				for_each_unit_type_id([&](UnitTypes i) {
+					const unit_type_t* ut = get_unit_type(i);
+					if (unit_id == 230 && (~ut->group_flags & GroupFlags::Men)) return;
+					if (unit_id == 231 && (~ut->group_flags & GroupFlags::Building)) return;
+					if (unit_id == 232 && (~ut->group_flags & GroupFlags::Factory)) return;
+					r += tbl[p].at(i);
+				});
+			} else if ((size_t)unit_id < 228 || is_ext_unit_type((UnitTypes)unit_id)) {
 				r += tbl[p].at((UnitTypes)unit_id);
 			} else if (eud) {
 				// EUD (v0.25): out-of-range deaths slots are widely used as
@@ -19661,6 +21039,682 @@ struct state_functions {
 			}
 		}
 		return r;
+	}
+
+	// ---- EUD: 1.16.1 memory seen through Deaths / Set Deaths --------------------------
+	// Triggers address dword (addr) = 0x58A364 + 4 * (unit * 12 + player). Addresses with an
+	// engine equivalent (eud.h) read and write that state; every other byte behaves as plain
+	// memory in st.eud_deaths (keyed by dword index from the death table), which is what maps
+	// that use far death slots as variables rely on. Only reached by out-of-table indices or
+	// the "current player" override, so maps without EUD triggers are unaffected.
+
+	static uint32_t eud_index_addr(uint32_t index) {
+		return eud::deaths_base + 4u * index;
+	}
+
+	uint32_t eud_store_get(uint32_t addr) const {
+		auto i = st.eud_deaths.find((addr - eud::deaths_base) / 4u);
+		return i == st.eud_deaths.end() ? 0u : (uint32_t)i->second;
+	}
+	void eud_store_set(uint32_t addr, uint32_t v) {
+		st.eud_deaths[(addr - eud::deaths_base) / 4u] = (int32_t)v;
+	}
+
+	static uint32_t eud_u16pair(int lo, int hi) {
+		return (uint32_t)(uint16_t)lo | ((uint32_t)(uint16_t)hi << 16);
+	}
+
+	// BW's build queue: a 5-entry ring at CUnit +0x98, current entry at +0xA4. The engine keeps it from the
+	// current entry on (build_queue), or the entries after an emptied current one (build_queue_limbo).
+	uint16_t eud_queue_entry(const unit_t* u, uint32_t k) const {
+		uint32_t rel = (k + 5 - u->build_queue_slot % 5) % 5;
+		if (!u->build_queue.empty()) return rel < u->build_queue.size() ? (uint16_t)u->build_queue[rel]->id : (uint16_t)UnitTypes::None;
+		if (rel != 0 && rel - 1 < u->build_queue_limbo.size()) return (uint16_t)u->build_queue_limbo[rel - 1]->id;
+		return (uint16_t)UnitTypes::None;
+	}
+	// Entries past a second gap are dropped (the engine has no place for them). Orders that build or
+	// morph the current entry keep it: 1.16.1 would go on with type 228, the engine would stop the game.
+	void eud_queue_assign(unit_t* u, const std::array<uint16_t, 5>& q) {
+		uint32_t s = u->build_queue_slot % 5;
+		const unit_type_t* cur = u->build_queue.empty() ? nullptr : u->build_queue.front();
+		u->build_queue.clear();
+		u->build_queue_limbo.clear();
+		auto& dst = q[s] < (uint16_t)UnitTypes::None ? u->build_queue : u->build_queue_limbo;
+		for (uint32_t k = q[s] < (uint16_t)UnitTypes::None ? 0 : 1; k != 5 && q[(s + k) % 5] < (uint16_t)UnitTypes::None; ++k) {
+			dst.push_back(get_unit_type((UnitTypes)q[(s + k) % 5]));
+		}
+		if (cur && u->build_queue.empty()) {
+			switch (u->order_type->id) {
+			case Orders::PlaceBuilding: case Orders::PlaceProtossBuilding: case Orders::DroneBuild: case Orders::DroneLand:
+			case Orders::ZergUnitMorph: case Orders::ZergBuildingMorph:
+				u->build_queue.push_back(cur);
+				u->build_queue_limbo.clear();
+				break;
+			default:
+				break;
+			}
+		}
+	}
+	// Entries k and k + 1 (if any) from the low / high halves of v.
+	void eud_queue_set(unit_t* u, uint32_t k, uint32_t v) {
+		std::array<uint16_t, 5> q;
+		for (uint32_t i = 0; i != 5; ++i) q[i] = eud_queue_entry(u, i);
+		auto old = q;
+		q[k] = (uint16_t)v;
+		if (k + 1 < 5) q[k + 1] = (uint16_t)(v >> 16);
+		if (q != old) eud_queue_assign(u, q);
+	}
+
+	unit_t* eud_cunit(uint32_t index) const {
+		unit_t* u = st.units_container.try_get(index);
+		if (!u || !u->sprite || unit_dead(u)) return nullptr;
+		return u;
+	}
+
+	// Element value of a mapped region; *mapped = bit mask of the element bytes the engine owns
+	// (the rest come from the plain store).
+	uint32_t eud_elem_get(const eud::region& r, uint32_t i, uint32_t* mapped) const {
+		using namespace eud;
+		*mapped = r.elem_size >= 4 ? 0xffffffffu : (1u << (8 * r.elem_size)) - 1;
+		uint32_t id = i + r.first_id;
+		auto ut = [&]() -> const unit_type_t& { return game_st.unit_types.vec[id]; };
+		auto wt = [&]() -> const weapon_type_t& { return game_st.weapon_types.vec[id]; };
+		auto ft = [&]() -> const flingy_type_t& { return *get_flingy_type((FlingyTypes)id); };
+		auto upt = [&]() -> const upgrade_type_t& { return game_st.upgrade_types.vec[id]; };
+		auto tt = [&]() -> const tech_type_t& { return game_st.tech_types.vec[id]; };
+		auto uid = [&](const unit_type_t* t) -> uint32_t { return t ? (uint32_t)t->id : 228u; };
+		auto wid = [&](const weapon_type_t* t) -> uint32_t { return t ? (uint32_t)t->id : 130u; };
+		auto upid = [&](const upgrade_type_t* t) -> uint32_t { return t ? (uint32_t)t->id : 61u; };
+		auto oid = [&](const order_type_t* t) -> uint32_t { return t ? (uint32_t)t->id : 0u; };
+		switch (r.id) {
+		case r_deaths: return (uint32_t)st.unit_deaths[i % 12][(UnitTypes)(i / 12)];
+		case r_kills: return (uint32_t)st.unit_kills[i % 12][(UnitTypes)(i / 12)];
+		case r_unit_counts: return (uint32_t)st.unit_counts[i % 12][(UnitTypes)(i / 12)];
+		case r_completed_counts: return (uint32_t)st.completed_unit_counts[i % 12][(UnitTypes)(i / 12)];
+		case r_minerals: return (uint32_t)st.current_minerals[i];
+		case r_gas: return (uint32_t)st.current_gas[i];
+		case r_total_gas: return (uint32_t)st.total_gas_gathered[i];
+		case r_total_minerals: return (uint32_t)st.total_minerals_gathered[i];
+		case r_custom_score: return (uint32_t)st.custom_score[i];
+		case r_unit_score_total: return (uint32_t)st.unit_score[i];
+		case r_kill_score_total: return (uint32_t)st.kills_score[i];
+		case r_building_score: return (uint32_t)st.building_score[i];
+		case r_razings_score: return (uint32_t)st.razings_score[i];
+		case r_supply_avail_z: return (uint32_t)st.supply_available[i][0].raw_value;
+		case r_supply_used_z: return (uint32_t)st.supply_used[i][0].raw_value;
+		case r_supply_avail_t: return (uint32_t)st.supply_available[i][1].raw_value;
+		case r_supply_used_t: return (uint32_t)st.supply_used[i][1].raw_value;
+		case r_supply_avail_p: return (uint32_t)st.supply_available[i][2].raw_value;
+		case r_supply_used_p: return (uint32_t)st.supply_used[i][2].raw_value;
+		case r_supply_max_z: case r_supply_max_t: case r_supply_max_p: return 400;
+		case r_sc_tech_avail: return game_st.tech_available[i / 24][(TechTypes)(i % 24)];
+		case r_sc_tech_researched: return st.tech_researched[i / 24][(TechTypes)(i % 24)];
+		case r_bw_tech_avail: return game_st.tech_available[i / 20][(TechTypes)(24 + i % 20)];
+		case r_bw_tech_researched: return st.tech_researched[i / 20][(TechTypes)(24 + i % 20)];
+		case r_sc_upgrade_max: return (uint32_t)game_st.max_upgrade_levels[i / 46][(UpgradeTypes)(i % 46)];
+		case r_sc_upgrade_level: return (uint32_t)st.upgrade_levels[i / 46][(UpgradeTypes)(i % 46)];
+		case r_bw_upgrade_max: return (uint32_t)game_st.max_upgrade_levels[i / 15][(UpgradeTypes)(46 + i % 15)];
+		case r_bw_upgrade_level: return (uint32_t)st.upgrade_levels[i / 15][(UpgradeTypes)(46 + i % 15)];
+		case r_alliances: return (uint32_t)st.alliances[i / 12][i % 12];
+		case r_objectives: return (uint32_t)(i < 8 ? st.mission_objectives_string[i] : 0);
+		case r_cp: return (uint32_t)st.trigger_cp;
+		case r_str_ptr: return (game_st.str_section.empty() ? 0u : eud::str_base) + st.eud_str_delta;
+		case r_trigger_timer: return (uint32_t)st.trigger_timer;
+		case r_player_struct:
+			// +8 type (in-game controller), +9 race; ids, storm ids and names are not modelled
+			if (i % 36 == 8) return (uint32_t)st.players[i / 36].controller & 0xff;
+			if (i % 36 == 9) return (uint32_t)st.players[i / 36].race & 0xff;
+			*mapped = 0;
+			return 0;
+		case r_countdown: return (uint32_t)(st.countdown_timer_ms / 1000);
+		case r_elapsed_seconds: return (uint32_t)trigger_elapsed_seconds();
+		case r_frame: return (uint32_t)st.current_frame;
+		case r_switches: {
+			uint32_t v = 0;
+			for (int b = 0; b != 32; ++b) if (st.trigger_switches[i * 32 + b]) v |= 1u << b;
+			return v;
+		}
+		case r_locations: {
+			if (i / 5 >= st.locations.size()) { *mapped = 0; return 0; }
+			auto& l = st.locations[i / 5];
+			switch (i % 5) {
+			case 0: return (uint32_t)l.area.from.x;
+			case 1: return (uint32_t)l.area.from.y;
+			case 2: return (uint32_t)l.area.to.x;
+			case 3: return (uint32_t)l.area.to.y;
+			default: *mapped = 0xffff0000u; return (uint32_t)(uint16_t)l.elevation_flags << 16;
+			}
+		}
+		case r_keys: case r_input_ignored: return 0;
+		case r_first_empty_unit: {
+			// Head of the free list, or the slot the pool would grow into next (computed: growing here would reorder frees).
+			auto& c = st.units_container;
+			size_t slot;
+			if (!c.free_list.empty()) slot = c.free_list.front().index;
+			else if (c.size == c.capacity) return 0;
+			else slot = c.size == 0 ? 0 : c.capacity - c.size;
+			return eud::cunit_base + 336u * (uint32_t)slot;
+		}
+		case r_cunit: {
+			unit_t* u = eud_cunit(i / 84);
+			*mapped = 0;
+			if (!u) return 0;
+			switch (i % 84 * 4) {
+			case 0x08: *mapped = ~0u; return (uint32_t)u->hp.raw_value;
+			case 0x28: *mapped = ~0u; return eud_u16pair(u->sprite->position.x, u->sprite->position.y);
+			case 0x34: *mapped = ~0u; return (uint32_t)u->flingy_top_speed.raw_value;
+			case 0x4c: *mapped = ~0u; return (uint32_t)(u->owner & 0xff) | (oid(u->order_type) << 8) | ((uint32_t)(u->order_state & 0xff) << 16) | ((uint32_t)(u->order_signal & 0xff) << 24);
+			case 0x60: *mapped = ~0u; return (uint32_t)u->shield_points.raw_value;
+			case 0x64: *mapped = 0xffff; return (uint32_t)u->unit_type->id;
+			case 0x8c: *mapped = 0xff000000u; return (uint32_t)(u->kill_count & 0xff) << 24;
+			case 0x98: *mapped = ~0u; return eud_u16pair(eud_queue_entry(u, 0), eud_queue_entry(u, 1));
+			case 0x9c: *mapped = ~0u; return eud_u16pair(eud_queue_entry(u, 2), eud_queue_entry(u, 3));
+			case 0xa0: *mapped = ~0u; return eud_u16pair(eud_queue_entry(u, 4), (uint16_t)u->energy.raw_value);
+			case 0xa4:
+				*mapped = 0x00ffffffu;
+				return (uint32_t)u->build_queue_slot | (u->unit_id_generation % 32) << 8 | oid(u->secondary_order_type) << 16;
+			case 0xdc: *mapped = ~0u; return (uint32_t)u->status_flags;
+			default: return 0;
+			}
+		}
+		// units.dat
+		case r_u_flingy: return (uint32_t)ut().flingy->id;
+		case r_u_subunit1: return uid(ut().turret_unit_type);
+		case r_u_subunit2: return uid(ut().subunit2);
+		case r_u_infestation: return uid(ut().infestation_unit);
+		case r_u_construction_image: return ut().construction_animation ? (uint32_t)ut().construction_animation->id : 0u;
+		case r_u_direction: return (uint32_t)ut().unit_direction;
+		case r_u_has_shields: return ut().has_shield ? 1u : 0u;
+		case r_u_shields: return (uint32_t)ut().shield_points;
+		case r_u_hp: return (uint32_t)ut().hitpoints.raw_value;
+		case r_u_elevation: return (uint32_t)ut().elevation_level;
+		case r_u_movement_flags: return (uint32_t)ut().unknown1;
+		case r_u_rank: return (uint32_t)ut().sublabel;
+		case r_u_computer_idle: return oid(ut().computer_ai_idle);
+		case r_u_human_idle: return oid(ut().human_ai_idle);
+		case r_u_return_idle: return oid(ut().return_to_idle);
+		case r_u_attack_unit: return oid(ut().attack_unit);
+		case r_u_attack_move: return oid(ut().attack_move);
+		case r_u_ground_weapon: return wid(ut().ground_weapon);
+		case r_u_max_ground_hits: return (uint32_t)ut().max_ground_hits;
+		case r_u_air_weapon: return wid(ut().air_weapon);
+		case r_u_max_air_hits: return (uint32_t)ut().max_air_hits;
+		case r_u_ai_internal: return (uint32_t)ut().ai_internal;
+		case r_u_flags: return (uint32_t)ut().flags;
+		case r_u_seek_range: return (uint32_t)ut().target_acquisition_range;
+		case r_u_sight_range: return (uint32_t)ut().sight_range;
+		case r_u_armor_upgrade: return upid(ut().armor_upgrade);
+		case r_u_size: return (uint32_t)ut().unit_size;
+		case r_u_armor: return (uint32_t)ut().armor;
+		case r_u_right_click: return (uint32_t)ut().right_click_action;
+		case r_u_ready_sound: return (uint32_t)ut().ready_sound;
+		case r_u_what_start: return (uint32_t)ut().first_what_sound;
+		case r_u_what_end: return (uint32_t)ut().last_what_sound;
+		case r_u_pissed_start: return (uint32_t)ut().first_pissed_sound;
+		case r_u_pissed_end: return (uint32_t)ut().last_pissed_sound;
+		case r_u_yes_start: return (uint32_t)ut().first_yes_sound;
+		case r_u_yes_end: return (uint32_t)ut().last_yes_sound;
+		case r_u_placement: return eud_u16pair(ut().placement_size.x, ut().placement_size.y);
+		case r_u_addon_pos: return eud_u16pair(ut().addon_position.x, ut().addon_position.y);
+		case r_u_dimensions: return 0;   // 8-byte elements: handled byte-wise in eud_byte_get
+		case r_u_portrait: return (uint32_t)ut().portrait;
+		case r_u_mineral_cost: return (uint32_t)ut().mineral_cost;
+		case r_u_gas_cost: return (uint32_t)ut().gas_cost;
+		case r_u_build_time: return (uint32_t)ut().build_time;
+		case r_u_requirements: return (uint32_t)ut().unknown2;
+		case r_u_group_flags: return (uint32_t)ut().group_flags;
+		case r_u_supply_provided: return (uint32_t)ut().supply_provided.raw_value;
+		case r_u_supply_required: return (uint32_t)ut().supply_required.raw_value;
+		case r_u_space_required: return (uint32_t)ut().space_required;
+		case r_u_space_provided: return (uint32_t)ut().space_provided;
+		case r_u_build_score: return (uint32_t)ut().build_score;
+		case r_u_kill_score: return (uint32_t)ut().destroy_score;
+		case r_u_map_string: return (uint32_t)ut().unit_map_string_index;
+		case r_u_broodwar: return ut().is_broodwar ? 1u : 0u;
+		case r_u_staredit_flags: return (uint32_t)ut().staredit_availability_flags;
+		// weapons.dat
+		case r_w_label: return (uint32_t)wt().label;
+		case r_w_flingy: return (uint32_t)wt().flingy->id;
+		case r_w_special: return (uint32_t)wt().unused;
+		case r_w_target_flags: return (uint32_t)wt().target_flags;
+		case r_w_min_range: return (uint32_t)wt().min_range;
+		case r_w_max_range: return (uint32_t)wt().max_range;
+		case r_w_upgrade: return upid(wt().damage_upgrade);
+		case r_w_damage_type: return (uint32_t)wt().damage_type;
+		case r_w_behavior: return (uint32_t)wt().bullet_type;
+		case r_w_remove_after: return (uint32_t)wt().lifetime;
+		case r_w_effect: return (uint32_t)wt().hit_type;
+		case r_w_inner_splash: return (uint32_t)wt().inner_splash_radius;
+		case r_w_medium_splash: return (uint32_t)wt().medium_splash_radius;
+		case r_w_outer_splash: return (uint32_t)wt().outer_splash_radius;
+		case r_w_damage: return (uint32_t)wt().damage_amount;
+		case r_w_bonus: return (uint32_t)wt().damage_bonus;
+		case r_w_cooldown: return (uint32_t)wt().cooldown;
+		case r_w_factor: return (uint32_t)wt().bullet_count;
+		case r_w_attack_angle: return (uint32_t)wt().attack_angle.raw_value;
+		case r_w_launch_spin: return (uint32_t)(uint8_t)wt().bullet_heading_offset.raw_value;
+		case r_w_x_offset: return (uint32_t)wt().forward_offset;
+		case r_w_y_offset: return (uint32_t)wt().upward_offset;
+		case r_w_error_message: return (uint32_t)wt().target_error_message;
+		case r_w_icon: return (uint32_t)wt().icon;
+		// flingy.dat
+		case r_f_sprite: return (uint32_t)ft().sprite->id;
+		case r_f_top_speed: return (uint32_t)ft().top_speed.raw_value;
+		case r_f_acceleration: return (uint32_t)ft().acceleration.raw_value;
+		case r_f_halt_distance: return (uint32_t)ft().halt_distance.raw_value;
+		case r_f_turn_rate: return (uint32_t)ft().turn_rate.raw_value;
+		case r_f_unused: return (uint32_t)ft().unused;
+		case r_f_movement: return (uint32_t)ft().movement_type;
+		// upgrades.dat / techdata.dat
+		case r_up_mineral_base: return (uint32_t)upt().mineral_cost_base;
+		case r_up_mineral_factor: return (uint32_t)upt().mineral_cost_factor;
+		case r_up_gas_base: return (uint32_t)upt().gas_cost_base;
+		case r_up_gas_factor: return (uint32_t)upt().gas_cost_factor;
+		case r_up_time_base: return (uint32_t)upt().time_cost_base;
+		case r_up_time_factor: return (uint32_t)upt().time_cost_factor;
+		case r_up_max_level: return (uint32_t)upt().max_level;
+		case r_t_mineral: return (uint32_t)tt().mineral_cost;
+		case r_t_gas: return (uint32_t)tt().gas_cost;
+		case r_t_time: return (uint32_t)tt().research_time;
+		case r_t_energy: return (uint32_t)tt().energy_cost;
+		default: *mapped = 0; return 0;
+		}
+	}
+
+	// Writes element value v (only the bytes in `mapped` reach the engine).
+	void eud_elem_set(const eud::region& r, uint32_t i, uint32_t v) {
+		using namespace eud;
+		uint32_t id = i + r.first_id;
+		auto ut = [&]() -> unit_type_t& { return st.game->unit_types.vec[id]; };
+		auto wt = [&]() -> weapon_type_t& { return st.game->weapon_types.vec[id]; };
+		auto upt = [&]() -> upgrade_type_t& { return st.game->upgrade_types.vec[id]; };
+		auto tt = [&]() -> tech_type_t& { return st.game->tech_types.vec[id]; };
+		auto ft = [&]() -> flingy_type_t& {
+			if (st.game->eud_flingy_types.empty()) eud_copy_flingy_types();
+			return st.game->eud_flingy_types[id];
+		};
+		auto as_unit = [&](uint32_t x) -> unit_type_t* { return x < 228 ? &st.game->unit_types.vec[x] : nullptr; };
+		auto as_weapon = [&](uint32_t x) -> const weapon_type_t* { return x < 130 ? get_weapon_type((WeaponTypes)x) : nullptr; };
+		auto as_upgrade = [&](uint32_t x) -> upgrade_type_t* { return x < 61 ? &st.game->upgrade_types.vec[x] : nullptr; };
+		auto set_order = [&](type_id<const order_type_t>& o, uint32_t x) { if (x < 189) o = get_order_type((Orders)x); };
+		int s16 = (int16_t)(uint16_t)v, u16 = (uint16_t)v, u8 = (uint8_t)v;
+		switch (r.id) {
+		case r_deaths: st.unit_deaths[i % 12][(UnitTypes)(i / 12)] = (int32_t)v; break;
+		case r_kills: st.unit_kills[i % 12][(UnitTypes)(i / 12)] = (int32_t)v; break;
+		case r_minerals: st.current_minerals[i] = (int)v; break;
+		case r_gas: st.current_gas[i] = (int)v; break;
+		case r_total_gas: st.total_gas_gathered[i] = (int)v; break;
+		case r_total_minerals: st.total_minerals_gathered[i] = (int)v; break;
+		case r_custom_score: st.custom_score[i] = (int32_t)v; break;
+		case r_unit_score_total: st.unit_score[i] = (int)v; break;
+		case r_kill_score_total: st.kills_score[i] = (int32_t)v; break;
+		case r_building_score: st.building_score[i] = (int)v; break;
+		case r_razings_score: st.razings_score[i] = (int32_t)v; break;
+		case r_supply_avail_z: st.supply_available[i][0] = fp1::from_raw((int)v); break;
+		case r_supply_avail_t: st.supply_available[i][1] = fp1::from_raw((int)v); break;
+		case r_supply_avail_p: st.supply_available[i][2] = fp1::from_raw((int)v); break;
+		case r_supply_used_z: st.supply_used[i][0] = fp1::from_raw((int)v); break;
+		case r_supply_used_t: st.supply_used[i][1] = fp1::from_raw((int)v); break;
+		case r_supply_used_p: st.supply_used[i][2] = fp1::from_raw((int)v); break;
+		case r_sc_tech_avail: st.game->tech_available[i / 24][(TechTypes)(i % 24)] = u8 != 0; break;
+		case r_sc_tech_researched: st.tech_researched[i / 24][(TechTypes)(i % 24)] = u8 != 0; break;
+		case r_bw_tech_avail: st.game->tech_available[i / 20][(TechTypes)(24 + i % 20)] = u8 != 0; break;
+		case r_bw_tech_researched: st.tech_researched[i / 20][(TechTypes)(24 + i % 20)] = u8 != 0; break;
+		case r_sc_upgrade_max: st.game->max_upgrade_levels[i / 46][(UpgradeTypes)(i % 46)] = u8; break;
+		case r_sc_upgrade_level: st.upgrade_levels[i / 46][(UpgradeTypes)(i % 46)] = u8; break;
+		case r_bw_upgrade_max: st.game->max_upgrade_levels[i / 15][(UpgradeTypes)(46 + i % 15)] = u8; break;
+		case r_bw_upgrade_level: st.upgrade_levels[i / 15][(UpgradeTypes)(46 + i % 15)] = u8; break;
+		case r_alliances: if (i / 12 != i % 12) st.alliances[i / 12][i % 12] = u8; break;
+		case r_objectives: if (i < 8) st.mission_objectives_string[i] = (int)v; break;
+		case r_cp: st.trigger_cp = (int)v; break;
+		case r_str_ptr: st.eud_str_delta = v - (game_st.str_section.empty() ? 0u : eud::str_base); break;
+		case r_trigger_timer: st.trigger_timer = (int)v; break;
+		case r_player_struct: break;
+		case r_countdown: st.countdown_timer_ms = (int)v * 1000; break;
+		case r_switches:
+			for (int b = 0; b != 32; ++b) st.trigger_switches[i * 32 + b] = ((v >> b) & 1) != 0;
+			break;
+		case r_locations: {
+			if (i / 5 >= st.locations.size()) break;
+			auto& l = st.locations[i / 5];
+			switch (i % 5) {
+			case 0: l.area.from.x = (int)v; break;
+			case 1: l.area.from.y = (int)v; break;
+			case 2: l.area.to.x = (int)v; break;
+			case 3: l.area.to.y = (int)v; break;
+			default: l.elevation_flags = (int)(v >> 16); break;
+			}
+			break;
+		}
+		case r_cunit: {
+			unit_t* u = eud_cunit(i / 84);
+			if (!u) break;
+			switch (i % 84 * 4) {
+			case 0x08:
+				if ((int32_t)v <= 0) { if (!unit_dying(u) && !u_invincible(u)) kill_unit(u); }
+				else u->hp = fp8::from_raw((int32_t)v);
+				break;
+			case 0x28: if (!u_grounded_building(u) && !unit_dying(u)) move_unit(u, xy(u16, (int)(v >> 16))); break;
+			case 0x34: u->flingy_top_speed = fp8::from_raw((int32_t)v); break;
+			case 0x60: u->shield_points = fp8::from_raw((int32_t)v); break;
+			case 0x8c: u->kill_count = (int)(v >> 24); break;
+			case 0x98: eud_queue_set(u, 0, v); break;
+			case 0x9c: eud_queue_set(u, 2, v); break;
+			case 0xa0:
+				eud_queue_set(u, 4, v);
+				u->energy = fp8::from_raw((int)(v >> 16));
+				break;
+			case 0xa4: {
+				if ((uint8_t)v != u->build_queue_slot) {
+					std::array<uint16_t, 5> q;
+					for (uint32_t k = 0; k != 5; ++k) q[k] = eud_queue_entry(u, k);
+					u->build_queue_slot = (uint8_t)v;
+					eud_queue_assign(u, q);
+				}
+				u->unit_id_generation = (u->unit_id_generation & ~31u) | ((v >> 8) & 31u);
+				if (((v >> 16) & 0xff) < 189) u->secondary_order_type = get_order_type((Orders)((v >> 16) & 0xff));
+				break;
+			}
+			default: break;
+			}
+			break;
+		}
+		case r_u_subunit1: ut().turret_unit_type = as_unit(u16); break;
+		case r_u_subunit2: ut().subunit2 = as_unit(u16); break;
+		case r_u_infestation: ut().infestation_unit = as_unit(u16); break;
+		case r_u_direction: ut().unit_direction = u8; break;
+		case r_u_has_shields: ut().has_shield = u8 != 0; break;
+		case r_u_shields: ut().shield_points = u16; break;
+		case r_u_hp: ut().hitpoints = fp8::from_raw((int32_t)v); break;
+		case r_u_elevation: ut().elevation_level = u8; break;
+		case r_u_movement_flags: ut().unknown1 = u8; break;
+		case r_u_rank: ut().sublabel = u8; break;
+		case r_u_computer_idle: set_order(ut().computer_ai_idle, u8); break;
+		case r_u_human_idle: set_order(ut().human_ai_idle, u8); break;
+		case r_u_return_idle: set_order(ut().return_to_idle, u8); break;
+		case r_u_attack_unit: set_order(ut().attack_unit, u8); break;
+		case r_u_attack_move: set_order(ut().attack_move, u8); break;
+		case r_u_ground_weapon: ut().ground_weapon = as_weapon(u8); break;
+		case r_u_max_ground_hits: ut().max_ground_hits = u8; break;
+		case r_u_air_weapon: ut().air_weapon = as_weapon(u8); break;
+		case r_u_max_air_hits: ut().max_air_hits = u8; break;
+		case r_u_ai_internal: ut().ai_internal = u8; break;
+		case r_u_flags: ut().flags = (unit_type_t::flags_t)v; break;
+		case r_u_seek_range: ut().target_acquisition_range = u8; break;
+		case r_u_sight_range: ut().sight_range = u8; break;
+		case r_u_armor_upgrade: ut().armor_upgrade = as_upgrade(u8); break;
+		case r_u_size: ut().unit_size = u8; break;
+		case r_u_armor: ut().armor = u8; break;
+		case r_u_right_click: ut().right_click_action = u8; break;
+		case r_u_ready_sound: ut().ready_sound = u16; break;
+		case r_u_what_start: ut().first_what_sound = u16; break;
+		case r_u_what_end: ut().last_what_sound = u16; break;
+		case r_u_pissed_start: ut().first_pissed_sound = u16; break;
+		case r_u_pissed_end: ut().last_pissed_sound = u16; break;
+		case r_u_yes_start: ut().first_yes_sound = u16; break;
+		case r_u_yes_end: ut().last_yes_sound = u16; break;
+		case r_u_placement: ut().placement_size = xy((int16_t)u16, (int16_t)(v >> 16)); break;
+		case r_u_addon_pos: ut().addon_position = xy((int16_t)u16, (int16_t)(v >> 16)); break;
+		case r_u_portrait: ut().portrait = u16; break;
+		case r_u_mineral_cost: ut().mineral_cost = u16; break;
+		case r_u_gas_cost: ut().gas_cost = u16; break;
+		case r_u_build_time: ut().build_time = u16; break;
+		case r_u_requirements: ut().unknown2 = u16; break;
+		case r_u_group_flags: ut().group_flags = u8; break;
+		case r_u_supply_provided: ut().supply_provided = fp1::from_raw(u8); break;
+		case r_u_supply_required: ut().supply_required = fp1::from_raw(u8); break;
+		case r_u_space_required: ut().space_required = u8; break;
+		case r_u_space_provided: ut().space_provided = u8; break;
+		case r_u_build_score: ut().build_score = u16; break;
+		case r_u_kill_score: ut().destroy_score = u16; break;
+		case r_u_map_string: ut().unit_map_string_index = u16; break;
+		case r_u_broodwar: ut().is_broodwar = u8 != 0; break;
+		case r_u_staredit_flags: ut().staredit_availability_flags = u16; break;
+		case r_w_label: wt().label = u16; break;
+		case r_w_special: wt().unused = u8; break;
+		case r_w_target_flags: wt().target_flags = u16; break;
+		case r_w_min_range: wt().min_range = (int)v; break;
+		case r_w_max_range: wt().max_range = (int)v; break;
+		case r_w_upgrade: wt().damage_upgrade = as_upgrade(u8); break;
+		case r_w_damage_type: wt().damage_type = u8; break;
+		case r_w_behavior: wt().bullet_type = u8; break;
+		case r_w_remove_after: wt().lifetime = u8; break;
+		case r_w_effect: wt().hit_type = u8; break;
+		case r_w_inner_splash: wt().inner_splash_radius = u16; break;
+		case r_w_medium_splash: wt().medium_splash_radius = u16; break;
+		case r_w_outer_splash: wt().outer_splash_radius = u16; break;
+		case r_w_damage: wt().damage_amount = u16; break;
+		case r_w_bonus: wt().damage_bonus = u16; break;
+		case r_w_cooldown: wt().cooldown = u8; break;
+		case r_w_factor: wt().bullet_count = u8; break;
+		case r_w_attack_angle: wt().attack_angle = fp8::from_raw(u8); break;
+		case r_w_launch_spin: wt().bullet_heading_offset = direction_t::from_raw((int8_t)u8); break;
+		case r_w_x_offset: wt().forward_offset = u8; break;
+		case r_w_y_offset: wt().upward_offset = u8; break;
+		case r_w_error_message: wt().target_error_message = u16; break;
+		case r_w_icon: wt().icon = u16; break;
+		case r_w_flingy: if (v < 209) wt().flingy = get_flingy_type((FlingyTypes)v); break;
+		case r_u_flingy: if (u8 < 209) ut().flingy = get_flingy_type((FlingyTypes)u8); break;
+		case r_f_top_speed: ft().top_speed = fp8::from_raw((int32_t)v); break;
+		case r_f_acceleration: ft().acceleration = fp8::from_raw(s16); break;
+		case r_f_halt_distance: ft().halt_distance = fp8::from_raw((int32_t)v); break;
+		case r_f_turn_rate: ft().turn_rate = fp8::from_raw(u8); break;
+		case r_f_unused: ft().unused = u8; break;
+		case r_f_movement: ft().movement_type = u8; break;
+		case r_up_mineral_base: upt().mineral_cost_base = u16; break;
+		case r_up_mineral_factor: upt().mineral_cost_factor = u16; break;
+		case r_up_gas_base: upt().gas_cost_base = u16; break;
+		case r_up_gas_factor: upt().gas_cost_factor = u16; break;
+		case r_up_time_base: upt().time_cost_base = u16; break;
+		case r_up_time_factor: upt().time_cost_factor = u16; break;
+		case r_up_max_level: upt().max_level = u8; break;
+		case r_t_mineral: tt().mineral_cost = u16; break;
+		case r_t_gas: tt().gas_cost = u16; break;
+		case r_t_time: tt().research_time = u16; break;
+		case r_t_energy: tt().energy_cost = u16; break;
+		default: break;   // read-only or not modelled (unit counts, max supply, input, sprite ids)
+		}
+	}
+
+	// A map writing flingy.dat gets a per-game copy; unit and weapon types are repointed to it.
+	void eud_copy_flingy_types() {
+		st.game->eud_flingy_types = global_st.flingy_types.vec;
+		for (auto& t : st.game->unit_types.vec) if (t.flingy) t.flingy = &st.game->eud_flingy_types[(size_t)t.flingy->id];
+		for (auto& t : st.game->weapon_types.vec) if (t.flingy) t.flingy = &st.game->eud_flingy_types[(size_t)t.flingy->id];
+	}
+
+	// Requirement tables and offset indexes, only when the user's exe supplied the tables.
+	bool eud_req_byte(uint32_t a, uint8_t* v) const {
+		if (global_st.req_tables.empty() || !st.game->qol.eud_requirements) return false;
+		if (a - eud::req_base < eud::req_end - eud::req_base) {
+			*v = (st.eud_req.empty() ? global_st.req_tables : st.eud_req)[a - eud::req_base];
+			return true;
+		}
+		for (auto& rt : eud::req_tables) {
+			uint32_t o = a - rt.index;
+			if (o >= rt.count * 2) continue;
+			uint16_t x = st.eud_req_idx.empty() ? 0xffff : st.eud_req_idx[rt.first + o / 2];
+			*v = (uint8_t)(x >> (8 * (o & 1)));
+			return true;
+		}
+		return false;
+	}
+	bool eud_req_set_byte(uint32_t a, uint8_t v) {
+		uint8_t old;
+		if (!eud_req_byte(a, &old)) return false;
+		if (st.eud_req_idx.empty()) {
+			st.eud_req = global_st.req_tables;
+			st.eud_req_idx.assign(eud::req_index_total, 0xffff);
+		}
+		if (a - eud::req_base < eud::req_end - eud::req_base) {
+			st.eud_req[a - eud::req_base] = v;
+			return true;
+		}
+		for (auto& rt : eud::req_tables) {
+			uint32_t o = a - rt.index;
+			if (o >= rt.count * 2) continue;
+			uint16_t& x = st.eud_req_idx[rt.first + o / 2];
+			x = (o & 1) ? (uint16_t)((x & 0xff) | v << 8) : (uint16_t)((x & 0xff00) | v);
+			return true;
+		}
+		return true;
+	}
+
+	// One byte of emulated memory. *engine = whether the engine owns it (else the plain store).
+	uint8_t eud_byte_get(uint32_t a, bool* engine) const {
+		const a_vector<uint8_t>& str = st.eud_str.empty() ? game_st.str_section : st.eud_str;
+		if (a - eud::str_base < str.size()) {
+			*engine = true;
+			return str[a - eud::str_base];
+		}
+		uint8_t rv;
+		if (eud_req_byte(a, &rv)) {
+			*engine = true;
+			return rv;
+		}
+		const eud::region* r = eud::find_region(a);
+		if (r) {
+			uint32_t off = a - r->base, i = off / r->elem_size, b = off % r->elem_size;
+			uint32_t mapped = 0, v;
+			if (r->id == eud::r_u_dimensions) {
+				auto& d = game_st.unit_types.vec[i].dimensions;
+				uint32_t w = b < 4 ? eud_u16pair(d.from.x, d.from.y) : eud_u16pair(d.to.x, d.to.y);
+				*engine = true;
+				return (uint8_t)(w >> (8 * (b & 3)));
+			}
+			v = eud_elem_get(*r, i, &mapped);
+			if (b < 4 && (mapped >> (8 * b)) & 0xff) { *engine = true; return (uint8_t)(v >> (8 * b)); }
+		}
+		*engine = false;
+		return (uint8_t)(eud_store_get(a & ~3u) >> (8 * (a & 3)));
+	}
+
+	uint32_t eud_read(uint32_t addr) const {
+		const eud::region* r = eud::find_region(addr);
+		if (r && r->elem_size == 4 && (addr - r->base) % 4 == 0) {
+			uint32_t mapped = 0;
+			uint32_t v = eud_elem_get(*r, (addr - r->base) / 4, &mapped);
+			if (mapped == ~0u) return v;
+		}
+		uint32_t v = 0;
+		bool engine;
+		for (uint32_t k = 0; k != 4; ++k) v |= (uint32_t)eud_byte_get(addr + k, &engine) << (8 * k);
+		return v;
+	}
+
+	// Writes the bits of `mask` (SC:R masked Set Deaths; 0xffffffff otherwise).
+	void eud_write(uint32_t addr, uint32_t value, uint32_t mask = ~0u) {
+		uint32_t old = eud_read(addr);
+		uint32_t nv = (old & ~mask) | (value & mask);
+		if (nv == old) return;
+		for (uint32_t k = 0; k != 4;) {
+			uint32_t a = addr + k;
+			if (a - eud::str_base < game_st.str_section.size()) {
+				if (st.eud_str.empty()) st.eud_str = game_st.str_section;
+				st.eud_str[a - eud::str_base] = (uint8_t)(nv >> (8 * k));
+				++k;
+				continue;
+			}
+			if (eud_req_set_byte(a, (uint8_t)(nv >> (8 * k)))) {
+				++k;
+				continue;
+			}
+			const eud::region* r = eud::find_region(a);
+			if (r && r->id != eud::r_u_dimensions) {
+				uint32_t off = a - r->base, i = off / r->elem_size, b = off % r->elem_size;
+				uint32_t mapped = 0;
+				uint32_t ev = eud_elem_get(*r, i, &mapped);
+				uint32_t nev = ev;
+				uint32_t take = std::min<uint32_t>(r->elem_size - b, 4 - k);
+				bool engine = false;
+				for (uint32_t j = 0; j != take; ++j) {
+					if (b + j >= 4) break;
+					uint8_t byte = (uint8_t)(nv >> (8 * (k + j)));
+					if ((mapped >> (8 * (b + j))) & 0xff) {
+						nev = (nev & ~(0xffu << (8 * (b + j)))) | ((uint32_t)byte << (8 * (b + j)));
+						engine = true;
+					} else {
+						uint32_t sa = (a + j) & ~3u, sv = eud_store_get(sa), sh = 8 * ((a + j) & 3);
+						eud_store_set(sa, (sv & ~(0xffu << sh)) | ((uint32_t)byte << sh));
+					}
+				}
+				if (engine && nev != ev) {
+					if (r->dat) {
+						uint32_t key = r->base + i * r->elem_size;
+						st.game->eud_dat_orig.emplace(key, ev);
+						st.eud_dat_journal[key] = nev;
+					}
+					eud_elem_set(*r, i, nev);
+				}
+				k += take ? take : 1;
+			} else if (r) {
+				// units.dat dimensions: 4 x int16 per unit
+				st.game->eud_dat_orig.emplace(a, eud_dat_value(a));
+				eud_dat_apply(a, 0x80000000u | (uint8_t)(nv >> (8 * k)));
+				st.eud_dat_journal[a] = 0x80000000u | (uint8_t)(nv >> (8 * k));
+				++k;
+			} else {
+				uint32_t sa = a & ~3u, sv = eud_store_get(sa), sh = 8 * (a & 3);
+				eud_store_set(sa, (sv & ~(0xffu << sh)) | (((nv >> (8 * k)) & 0xff) << sh));
+				++k;
+			}
+		}
+	}
+
+	// Journal entry for one .dat element (or one units.dat dimensions byte, 0x80000000 | byte).
+	uint32_t eud_dat_value(uint32_t key) const {
+		const eud::region* r = eud::find_region(key);
+		if (!r) return 0;
+		if (r->id == eud::r_u_dimensions) {
+			bool engine;
+			return 0x80000000u | eud_byte_get(key, &engine);
+		}
+		uint32_t mapped = 0;
+		return eud_elem_get(*r, (key - r->base) / r->elem_size, &mapped);
+	}
+	void eud_dat_apply(uint32_t key, uint32_t v) {
+		const eud::region* r = eud::find_region(key);
+		if (!r) return;
+		if (r->id == eud::r_u_dimensions) {
+			uint32_t off = key - r->base, i = off / 8, b = off % 8;
+			auto& d = st.game->unit_types.vec[i].dimensions;
+			int* f = b < 2 ? &d.from.x : b < 4 ? &d.from.y : b < 6 ? &d.to.x : &d.to.y;
+			uint16_t w = (uint16_t)*f;
+			uint8_t byte = (uint8_t)v;
+			w = (b & 1) ? (uint16_t)((w & 0xff) | (byte << 8)) : (uint16_t)((w & 0xff00) | byte);
+			*f = (int16_t)w;
+			return;
+		}
+		eud_elem_set(*r, (key - r->base) / r->elem_size, v);
+	}
+
+	// The .dat tables live in game_state, shared by every copy of state: after a savegame load
+	// (or any state swap) this puts them back to the map's values plus st.eud_dat_journal.
+	void eud_sync_dat_tables() {
+		auto orig = st.game->eud_dat_orig;
+		for (auto& kv : orig) eud_dat_apply(kv.first, kv.second);
+		st.game->eud_dat_orig.clear();
+		for (auto& kv : st.eud_dat_journal) {
+			st.game->eud_dat_orig.emplace(kv.first, eud_dat_value(kv.first));
+			eud_dat_apply(kv.first, kv.second);
+		}
+	}
+
+	// Raw players a Deaths / Set Deaths player field addresses: groups resolve as usual, the
+	// current player is the (possibly overridden) trigger player, other ids are raw (EPD).
+	template<typename F>
+	void eud_for_death_players(int owner, uint32_t player, F&& f) const {
+		if (player == 13) { f((uint32_t)(st.trigger_cp >= 0 ? st.trigger_cp : owner)); return; }
+		if (player < 12 || player >= 27) { f(player); return; }
+		for (int p : trigger_players(owner, (int)player)) f((uint32_t)p);
+	}
+
+	// Whether a Deaths / Set Deaths needs the memory path (the classic per-player table
+	// handles the rest exactly as before).
+	bool eud_death_access(int owner, uint32_t player, uint32_t unit, bool masked) const {
+		if (masked || player >= 27) return true;
+		if (player == 13 && st.trigger_cp >= 0 && st.trigger_cp != owner) return true;
+		return unit >= 228 && (unit < 229 || unit > 232) && !is_ext_unit_type((UnitTypes)unit);
 	}
 
 	int trigger_player_resources(int p, int type) const {
@@ -19698,11 +21752,11 @@ struct state_functions {
 		return r;
 	}
 
-	// Elapsed game time in seconds. The sim runs one frame per 42 ms of game
-	// time (the same base used by trigger Wait timers), so a trigger "second"
-	// is 1000 ms of accumulated 42 ms frames.
+	// Elapsed time and the countdown run in game seconds of 16 frames (SC:R measured:
+	// Elapsed >= 30 and a 30 s countdown each take 480 frames); Wait stays 42 ms/frame.
 	int trigger_elapsed_seconds() const {
-		return (int)((int64_t)st.current_frame * 42 / 1000);
+		if (st.game->qol.legacy_trigger_seconds) return (int)((int64_t)st.current_frame * 42 / 1000);
+		return (int)(st.current_frame / 16);
 	}
 
 	// "Command the Most/Least"-family evaluator: whether the trigger owner's
@@ -19726,6 +21780,7 @@ struct state_functions {
 		case 2: // command
 			return trigger_count_comparison(c, trigger_command_count(st, owner, c.group, c.unit_id, c.num_n != 1));
 		case 3: // bring
+			if (!trigger_loc_ok(c.location)) return false;
 			return trigger_count_comparison(c, trigger_command_count(trigger_bring_count(st.locations.at(c.location - 1)), owner, c.group, c.unit_id, c.num_n != 1));
 		case 4: // accumulate
 			return trigger_count_comparison(c, trigger_group_resources(owner, c.group, c.extra_n));
@@ -19734,6 +21789,7 @@ struct state_functions {
 		case 6: // command the most
 			return trigger_owner_extreme(owner, true, [&](int p) { return trigger_command_count(st, p, 13, c.unit_id, true); });
 		case 7: // command the most at
+			if (!trigger_loc_ok(c.location)) return false;
 			return trigger_owner_extreme(owner, true, [&](int p) { return trigger_command_count(trigger_bring_count(st.locations.at(c.location - 1)), p, 13, c.unit_id, true); });
 		case 8: // most kills
 			return trigger_owner_extreme(owner, true, [&](int p) { return trigger_table_count(st.unit_kills, p, 13, c.unit_id); });
@@ -19750,10 +21806,29 @@ struct state_functions {
 		case 14: // opponents
 			return trigger_count_comparison(c, trigger_opponent_count(owner, c.group));
 		case 15: // deaths
+			if (eud_death_access(owner, (uint32_t)c.group, (uint32_t)c.unit_id, c.unk == 0x4353)) {
+				// EUD / EPD: unsigned dword compare; SC:R masked form keeps its mask in the location field.
+				uint32_t mask = c.unk == 0x4353 ? (uint32_t)c.location : ~0u;
+				uint32_t v = 0;
+				eud_for_death_players(owner, (uint32_t)c.group, [&](uint32_t p) {
+					if (c.unk != 0x4353 && p < 12 && (uint32_t)c.unit_id < 228) v += (uint32_t)st.unit_deaths[p][(UnitTypes)c.unit_id];
+					else {
+						uint32_t addr = eud_index_addr((uint32_t)c.unit_id * 12u + p);
+						uint32_t rv = eud_read(addr);
+						if (eud::access_hook()) eud::access_hook()(addr, false, eud::find_region(addr), rv);
+						v += rv & mask;
+					}
+				});
+				uint32_t n = (uint32_t)c.count_n;
+				if (c.num_n == 0) return v >= n;
+				if (c.num_n == 1) return v <= n;
+				return v == n;
+			}
 			return trigger_count_comparison(c, trigger_table_count(st.unit_deaths, owner, c.group, c.unit_id, true));
 		case 16: // command the least
 			return trigger_owner_extreme(owner, false, [&](int p) { return trigger_command_count(st, p, 13, c.unit_id, true); });
 		case 17: // command the least at
+			if (!trigger_loc_ok(c.location)) return false;
 			return trigger_owner_extreme(owner, false, [&](int p) { return trigger_command_count(trigger_bring_count(st.locations.at(c.location - 1)), p, 13, c.unit_id, true); });
 		case 18: // least kills
 			return trigger_owner_extreme(owner, false, [&](int p) { return trigger_table_count(st.unit_kills, p, 13, c.unit_id); });
@@ -19773,13 +21848,69 @@ struct state_functions {
 		}
 	}
 
+	// 1.16.1 0x4741A0 (trigger Create Unit): no explored/psi/creep requirement; terrain always checked,
+	// unit overlap skipped on tiles a human owner cannot see.
+	bool trigger_can_place_building(int owner, const unit_type_t* unit_type, xy pos) const {
+		xy_t<size_t> tile_pos;
+		tile_pos.x = (pos.x - unit_type->placement_size.x / 2) / 32u;
+		tile_pos.y = (pos.y - unit_type->placement_size.y / 2) / 32u;
+		xy_t<size_t> tile_size;
+		tile_size.x = unit_type->placement_size.x / 32u;
+		tile_size.y = unit_type->placement_size.y / 32u;
+		if (tile_pos.x >= game_st.map_tile_width) return false;
+		if (tile_pos.y >= game_st.map_tile_height) return false;
+		if (tile_pos.x + tile_size.x > game_st.map_tile_width) return false;
+		if (tile_pos.y + tile_size.y > game_st.map_tile_height) return false;
+
+		bool is_beacon = unit_type->id >= UnitTypes::Special_Zerg_Beacon && unit_type->id <= UnitTypes::Special_Protoss_Flag_Beacon;
+		bool is_resource_depot = ut_resource_depot(unit_type);
+		int flags_mask = tile_t::flag_partially_walkable | tile_t::flag_occupied | tile_t::flag_unbuildable;
+		if (unit_race(unit_type) != race_t::zerg) flags_mask |= tile_t::flag_has_creep;
+		for (size_t y = tile_pos.y; y != tile_pos.y + tile_size.y; ++y) {
+			for (size_t x = tile_pos.x; x != tile_pos.x + tile_size.x; ++x) {
+				auto& tile = st.tiles[y * game_st.map_tile_width + x];
+				if (tile.flags & flags_mask) {
+					if (!is_beacon || (~tile.flags & tile_t::flag_unk4)) return false;
+				} else if (is_resource_depot) {
+					rect bb{xy(32 * ((int)x - 3), 32 * ((int)y - 3)), xy(32 * ((int)x + 4), 32 * ((int)y + 4))};
+					for (unit_t* n : find_units_noexpand(bb)) {
+						if (ut_resource(n)) return false;
+					}
+				}
+			}
+		}
+
+		int visibility_mask = st.players[owner].controller == player_t::controller_occupied ? 1 << owner : 0;
+		bool is_addon = ut_addon(unit_type);
+		rect search_bb = unit_type_inner_bounding_box(unit_type, xy(int(tile_pos.x * 32), int(tile_pos.y * 32)) + unit_type->placement_size / 2);
+		for (size_t y = tile_pos.y; y != tile_pos.y + tile_size.y; ++y) {
+			for (size_t x = tile_pos.x; x != tile_pos.x + tile_size.x; ++x) {
+				auto& tile = st.tiles[y * game_st.map_tile_width + x];
+				if (tile.visible & visibility_mask) continue;
+				if (tile.flags & tile_t::flag_occupied) return false;
+				for (const unit_t* n : find_units_noexpand(search_bb)) {
+					if (is_addon && u_can_move(n)) continue;
+					if (u_grounded_building(n) || u_flying(n)) continue;
+					if (unit_is(n, UnitTypes::Spell_Dark_Swarm) || unit_is(n, UnitTypes::Spell_Disruption_Web)) continue;
+					if (s_hidden(n->sprite)) continue;
+					if (n->unit_finder_bounding_box.from.x >= int(x * 32 + 32)) continue;
+					if (n->unit_finder_bounding_box.to.x <= int(x * 32)) continue;
+					if (n->unit_finder_bounding_box.from.y >= int(y * 32 + 32)) continue;
+					if (n->unit_finder_bounding_box.to.y <= int(y * 32)) continue;
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
 	unit_t* trigger_create_unit(const unit_type_t* unit_type, xy pos, int owner) {
 		if (~unit_type->staredit_availability_flags & 2) return nullptr;
 		pos = restrict_unit_pos_to_bounds(pos, unit_type, map_bounds());
 		if (ut_building(unit_type)) {
 			xy top_left = restrict_pos_to_map_bounds(pos - unit_type->placement_size / 2);
 			pos = top_left / 32 * 32 + unit_type->placement_size / 2;
-			if (!can_place_building(nullptr, owner, unit_type, pos, true, false)) {
+			if (!trigger_can_place_building(owner, unit_type, pos)) {
 				// todo: show error?
 				return nullptr;
 			}
@@ -19839,6 +21970,8 @@ struct state_functions {
 	}
 
 	bool trigger_players_pred(int owner, int player, int n) const {
+		// Player 9-12 named directly ("Player 12 brings ...") are real unit owners in BW.
+		if (player >= 8 && player < 12) return n == player;
 		if (!player_slot_active(n)) return false;
 		if (player < 12) return n == player; // player index
 		switch (player) {
@@ -19871,6 +22004,7 @@ struct state_functions {
 		// all air, keep ground): an SCV carries the emitter there on foot, but the
 		// swapped logic excluded the ground SCV (only air counted) so the victory
 		// trigger never fired. Fixed to the documented layout.
+		if (elevation_flags == 0) return true;
 		int ground_height = get_ground_height_at(u->sprite->position);
 		if (u_flying(u)) {
 			if (ground_height == 0) return (elevation_flags & 8) == 0;
@@ -19909,7 +22043,7 @@ struct state_functions {
 		} else if (uid == 232) {
 			if (u->unit_type->group_flags & GroupFlags::Factory) return true;
 		} else {
-			if (unit_is(u, (UnitTypes)uid)) return true;
+			if (unit_is_type(u, (UnitTypes)uid)) return true;
 		}
 		return false;
 	}
@@ -19930,8 +22064,27 @@ struct state_functions {
 	a_string trigger_string(size_t index) const {
 		if (index == 0) return a_string();
 		--index;
+		if (!st.eud_str.empty() || st.eud_str_delta) {
+			// EUD-edited or moved STR section: the table at the pointer, offsets relative to it.
+			auto& s = st.eud_str.empty() ? game_st.str_section : st.eud_str;
+			size_t rel = st.eud_str_delta;
+			size_t w = game_st.str_ext ? 4 : 2, at = rel + w + index * w;
+			if (rel >= s.size() || at >= s.size() || at + w > s.size()) return a_string();
+			size_t off = s[at] | (size_t)s[at + 1] << 8;
+			if (w == 4) off |= (size_t)s[at + 2] << 16 | (size_t)s[at + 3] << 24;
+			off = (uint32_t)(off + rel);
+			if (off >= s.size()) return a_string();
+			size_t end = off;
+			while (end < s.size() && s[end]) ++end;
+			return a_string((const char*)s.data() + off, end - off);
+		}
 		if (index >= game_st.map_strings.size()) return a_string();
 		return game_st.map_strings[index];
+	}
+
+	// U9: a broken map can name location 0 or one past the table; BW treats it as no location.
+	bool trigger_loc_ok(int location) const {
+		return location >= 1 && (size_t)location <= st.locations.size();
 	}
 
 	xy trigger_location_center(int location) const {
@@ -19955,12 +22108,13 @@ struct state_functions {
 			else if (unit_id == 230) ok = (u->unit_type->group_flags & GroupFlags::Men) != 0;
 			else if (unit_id == 231) ok = (u->unit_type->group_flags & GroupFlags::Building) != 0;
 			else if (unit_id == 232) ok = (u->unit_type->group_flags & GroupFlags::Factory) != 0;
-			else ok = unit_is(u, (UnitTypes)unit_id);
+			else ok = unit_is_type(u, (UnitTypes)unit_id);
 			if (!ok) return;
 			if (n > 0) --n;
 			f(u);
 		};
 		if (location) {
+			if (!trigger_loc_ok(location)) return;
 			// v0.83.002: COLLECT, then act. This used to call handle() -- and so
 			// the trigger's own action -- from inside the find_units() walk,
 			// while the unit finder is locked against modification. Any action
@@ -19997,8 +22151,9 @@ struct state_functions {
 	// 7 = set to, 8 = add, 9 = subtract.
 	static int32_t trigger_apply_modifier(int modifier, int32_t current, int32_t amount) {
 		if (modifier == 7) return amount;
-		if (modifier == 8) return current + amount;
-		if (modifier == 9) return current < amount ? 0 : current - amount;
+		// unsigned dwords as in BW: add wraps, subtract stops at 0
+		if (modifier == 8) return (int32_t)((uint32_t)current + (uint32_t)amount);
+		if (modifier == 9) return (uint32_t)current < (uint32_t)amount ? 0 : (int32_t)((uint32_t)current - (uint32_t)amount);
 		return current;
 	}
 
@@ -20029,9 +22184,14 @@ struct state_functions {
 			ra.flags |= 1;
 			return false;
 		case 5: // pause game
+			if (st.game->qol.trigger_pause && !st.trigger_paused) {
+				st.trigger_paused = true;
+				st.trigger_pause_ticks = 0;
+			}
 			on_trigger_pause(owner, true);
 			return true;
 		case 6: // unpause game
+			st.trigger_paused = false;
 			on_trigger_pause(owner, false);
 			return true;
 		case 7: { // transmission (ping + portrait + wav + text)
@@ -20046,7 +22206,7 @@ struct state_functions {
 				ra.flags &= ~1;
 				return true;
 			}
-			if (a.location) on_trigger_minimap_ping(owner, trigger_location_center(a.location));
+			if (trigger_loc_ok(a.location)) on_trigger_minimap_ping(owner, trigger_location_center(a.location));
 			// v0.83.007: the duration is time_n, and it is measured, not chosen.
 			// `aidump trig campaign/terran/tutorial` prints every transmission's
 			// fields beside the true length of the WAV it plays:
@@ -20087,9 +22247,10 @@ struct state_functions {
 			if (a.string_index) on_trigger_display_text(owner, trigger_string(a.string_index));
 			return true;
 		case 10: // center view
-			if (a.location) on_trigger_center_view(owner, trigger_location_center(a.location));
+			if (trigger_loc_ok(a.location)) on_trigger_center_view(owner, trigger_location_center(a.location));
 			return true;
 		case 11: // create unit with properties
+			if (!trigger_loc_ok(a.location)) return true;
 			for (int p : trigger_players(owner, a.group_n)) {
 				const unit_type_t* ut = get_unit_type((UnitTypes)a.extra_n);
 				if (unit_is_mineral_field(ut) || unit_is(ut, UnitTypes::Resource_Vespene_Geyser)) p = 11;
@@ -20104,10 +22265,11 @@ struct state_functions {
 					unit_t* u = trigger_create_unit(ut, pos, p);
 					if (u && a.group2_n >= 1 && a.group2_n <= 64) {
 						auto& prop = game_st.uprp.at(a.group2_n - 1);
-						if (prop.valid_properties & 0x2) set_unit_hp(u, u->unit_type->hitpoints * (int)prop.hp_percent / 100);
+						if (prop.valid_properties & 0x2) set_unit_hp(u, unit_max_hp(u) * (int)prop.hp_percent / 100);
 						if ((prop.valid_properties & 0x4) && u->unit_type->has_shield) u->shield_points = fp8::integer(u->unit_type->shield_points) * (int)prop.shield_percent / 100;
 						if (prop.valid_properties & 0x8) u->energy = unit_max_energy(u) * (int)prop.energy_percent / 100;
 						if ((prop.valid_properties & 0x10) && ut_resource(u)) set_unit_resources(u, (int)prop.resources);
+						if ((prop.valid_properties & 0x20) && prop.units_in_hangar) fill_initial_hangar(u, prop.units_in_hangar);
 						if ((prop.valid_flags & 0x10) && (prop.unit_flags & 0x10)) {
 							if (!u_invincible(u)) u_set_status_flag(u, unit_t::status_flag_invincible);
 						}
@@ -20125,6 +22287,7 @@ struct state_functions {
 				else if (a.num_n == 5) sw = false;
 				else if (a.num_n == 6) sw = !sw;
 				else if (a.num_n == 11) sw = (lcg_rand(51) & 1) != 0;
+				if (trigger_tracing()) trigger_trace_sink()(format("trace f%d p%d switch %d = %d\n", (int)st.current_frame, owner, (int)a.group2_n, sw ? 1 : 0));
 			}
 			return true;
 		case 14: // set countdown timer (time_n seconds)
@@ -20162,7 +22325,7 @@ struct state_functions {
 				// so this town's attack waves aim at its own region rather than
 				// the global-nearest enemy. action 15 (RunAIScript) has location 0.
 				ai_start_script(owner, (uint32_t)a.group2_n,
-				    a.location ? trigger_location_center(a.location) : xy());
+				    trigger_loc_ok(a.location) ? trigger_location_center(a.location) : xy());
 				break;
 			}
 			return true;
@@ -20225,7 +22388,7 @@ struct state_functions {
 					} else if (uid == 232) {
 						if (u->unit_type->group_flags & GroupFlags::Factory) kill_unit(u);
 					} else {
-						if (unit_is(u, (UnitTypes)uid)) kill_unit(u);
+						if (unit_is_type(u, (UnitTypes)uid)) kill_unit(u);
 					}
 				}
 			}
@@ -20249,7 +22412,7 @@ struct state_functions {
 					} else if (uid == 232) {
 						if (u->unit_type->group_flags & GroupFlags::Factory) ok = true;
 					} else {
-						if (unit_is(u, (UnitTypes)uid)) ok = true;
+						if (unit_is_type(u, (UnitTypes)uid)) ok = true;
 					}
 					if (!ok) continue;
 					hide_unit(u);
@@ -20259,7 +22422,7 @@ struct state_functions {
 			return true;
 		case 25: // remove unit at location
 			//for (int p : trigger_players(owner, a.group_n)) {
-			if (true) {
+			if (trigger_loc_ok(a.location)) {
 				int uid = a.extra_n;
 				// "Remove N units at location": the @27 count is honoured. 0 = all
 				// (BW's "All"), N = up to N matching units (measured: campaigns use
@@ -20292,7 +22455,7 @@ struct state_functions {
 					} else if (uid == 232) {
 						if (u->unit_type->group_flags & GroupFlags::Factory) ok = true;
 					} else {
-						if (unit_is(u, (UnitTypes)uid)) ok = true;
+						if (unit_is_type(u, (UnitTypes)uid)) ok = true;
 					}
 					if (!ok) return;
 					hide_unit(u);
@@ -20349,7 +22512,7 @@ struct state_functions {
 			}
 			return true;
 		case 28: // minimap ping
-			if (a.location) on_trigger_minimap_ping(owner, trigger_location_center(a.location));
+			if (trigger_loc_ok(a.location)) on_trigger_minimap_ping(owner, trigger_location_center(a.location));
 			return true;
 		case 29: // talking portrait
 			if (a.extra_n < 228) on_trigger_portrait(owner, a.extra_n, a.time_n);
@@ -20402,7 +22565,7 @@ struct state_functions {
 			st.leaderboard.goal = a.group2_n;
 			return true;
 		case 39: // move unit
-			if (a.group2_n) {
+			if (trigger_loc_ok(a.group2_n)) {
 				xy dest = trigger_location_center(a.group2_n);
 				trigger_for_units(owner, a.group_n, a.location, a.extra_n, a.num_n, [&](unit_t* u) {
 					if (ut_building(u) && !u_flying(u)) {
@@ -20448,13 +22611,13 @@ struct state_functions {
 				auto* dt = get_unit_type((UnitTypes)a.extra_n);
 				doodad = unit_is_door(dt) || unit_is_trap(dt);
 			}
-			if (doodad && a.location) {
+			if (doodad && trigger_loc_ok(a.location)) {
 				// Collect ids first, then act: an action must never run inside the
 				// find_units() walk (it would throw "modify unit finder").
 				static_vector<::bwgame::unit_id, 256> matched;
 				auto& loc = st.locations.at(a.location - 1);
 				for (unit_t* u : find_units(loc.area)) {
-					if (!unit_is(u, (UnitTypes)a.extra_n)) continue;
+					if (!unit_is_type(u, (UnitTypes)a.extra_n)) continue;
 					if (unit_dying(u)) continue;
 					if (!unit_is_at_elevation_flags(u, loc.elevation_flags)) continue;
 					if (matched.size() == matched.capacity()) break;
@@ -20478,9 +22641,23 @@ struct state_functions {
 			});
 			return true;
 		case 45: // set deaths (extra_n: unit; num_n: 7/8/9; group2_n: amount)
+			if (eud_death_access(owner, (uint32_t)a.group_n, (uint32_t)a.extra_n, a.maskflag == 0x4353)) {
+				uint32_t mask = a.maskflag == 0x4353 ? (uint32_t)a.location : ~0u;
+				uint32_t amount = (uint32_t)a.group2_n;
+				eud_for_death_players(owner, (uint32_t)a.group_n, [&](uint32_t p) {
+					uint32_t addr = eud_index_addr((uint32_t)a.extra_n * 12u + p);
+					uint32_t old = eud_read(addr), nv = old;
+					if (a.num_n == 7) nv = amount;
+					else if (a.num_n == 8) nv = old + amount;
+					else if (a.num_n == 9) nv = old < amount ? 0u : old - amount;
+					if (eud::access_hook()) eud::access_hook()(addr, true, eud::find_region(addr), nv);
+					eud_write(addr, nv, mask);
+				});
+				return true;
+			}
 			for (int p : trigger_players(owner, a.group_n)) {
 				if (p >= 12) continue;
-				if (a.extra_n < 228) {
+				if (a.extra_n < 228 || is_ext_unit_type((UnitTypes)a.extra_n)) {
 					auto& v = st.unit_deaths[p][(UnitTypes)a.extra_n];
 					v = trigger_apply_modifier(a.num_n, v, a.group2_n);
 				} else {
@@ -20505,7 +22682,7 @@ struct state_functions {
 			return true;
 		case 49: // modify unit hit points (group2_n: percent)
 			trigger_for_units(owner, a.group_n, a.location, a.extra_n, a.num_n, [&](unit_t* u) {
-				set_unit_hp(u, u->unit_type->hitpoints * (int)a.group2_n / 100);
+				set_unit_hp(u, unit_max_hp(u) * (int)a.group2_n / 100);
 			});
 			return true;
 		case 50: // modify unit energy (group2_n: percent)
@@ -20518,7 +22695,10 @@ struct state_functions {
 				if (u->unit_type->has_shield) u->shield_points = fp8::integer(u->unit_type->shield_points) * (int)a.group2_n / 100;
 			});
 			return true;
-		case 53: // modify unit hanger count — not supported yet
+		case 53: // modify unit hangar count (group2_n: units to add, capped at the hangar size)
+			trigger_for_units(owner, a.group_n, a.location, a.extra_n, a.num_n, [&](unit_t* u) {
+				if (u_completed(u) && (unit_is_carrier(u) || unit_is_reaver(u))) fill_initial_hangar(u, (int)a.group2_n);
+			});
 			return true;
 		case 54: // pause countdown timer
 			st.countdown_paused = true;
@@ -20540,7 +22720,7 @@ struct state_functions {
 			}
 			return true;
 		case 38: // move location
-			if (true) {
+			if (trigger_loc_ok(a.location) && trigger_loc_ok(a.group2_n)) {
 				auto& loc = st.locations.at(a.location - 1);
 				xy pos = (loc.area.from + loc.area.to) / 2;
 				unit_t* u = trigger_find_unit(owner, loc, a.group_n, a.extra_n);
@@ -20570,6 +22750,7 @@ struct state_functions {
 			}
 			return true;
 		case 44: // create unit
+			if (!trigger_loc_ok(a.location)) return true;
 			for (int p : trigger_players(owner, a.group_n)) {
 				const unit_type_t* ut = get_unit_type((UnitTypes)a.extra_n);
 				if (unit_is_mineral_field(ut) || unit_is(ut, UnitTypes::Resource_Vespene_Geyser)) p = 11;
@@ -20583,6 +22764,7 @@ struct state_functions {
 			}
 			return true;
 		case 46: // order
+			if (!trigger_loc_ok(a.location) || !trigger_loc_ok(a.group2_n)) return true;
 			for (unit_t* u : find_units(st.locations.at(a.location - 1).area)) {
 				if (!trigger_players_pred(owner, a.group_n, u->owner)) continue;
 				if (!unit_is_at_elevation_flags(u, st.locations[a.location - 1].elevation_flags)) continue;
@@ -20617,6 +22799,7 @@ struct state_functions {
 			}
 			return true;
 		case 52: // set unit resources
+			if (!trigger_loc_ok(a.location)) return true;
 			for (unit_t* u : find_units(st.locations.at(a.location - 1).area)) {
 				if (!trigger_players_pred(owner, a.group_n, u->owner)) continue;
 				if (!unit_is_at_elevation_flags(u, st.locations[a.location - 1].elevation_flags)) continue;
@@ -21096,7 +23279,7 @@ struct state_functions {
 			if (n > force_budget) n = force_budget;
 			for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end() && n; ++i) {
 				unit_t* u = &*i;
-				if (!unit_is(u, (UnitTypes)g.unit_id)) continue;
+				if (!unit_is_type(u, (UnitTypes)g.unit_id)) continue;
 				if (!u_completed(u) || unit_dying(u)) continue;
 				if (ut_worker(u) || ut_building(u)) continue;
 				auto oid = u->order_type->id;
@@ -21193,7 +23376,7 @@ struct state_functions {
 		for (auto& g : ai.attack_group) {
 			int free_units = 0;
 			for (unit_t* u : ptr(st.player_units[owner])) {
-				if (!unit_is(u, (UnitTypes)g.unit_id) || unit_dying(u)) continue;
+				if (!unit_is_type(u, (UnitTypes)g.unit_id) || unit_dying(u)) continue;
 				if (u->index < 1700 && ai.garrison.test(u->index)) continue;
 				auto oid = u->order_type->id;
 				if (u_completed(u) && oid != Orders::Guard && oid != Orders::PlayerGuard && oid != Orders::Nothing) continue; // already out on a wave
@@ -21231,7 +23414,7 @@ struct state_functions {
 				for (unit_t* u : ptr(st.player_units[owner])) {
 					if (unit_dying(u)) continue;
 					if (!u->build_queue.empty() && u->build_queue.front() == ut) pending = true; // egg, larva or a building training it
-					if (!unit_is(u, (UnitTypes)g.unit_id)) continue;
+					if (!unit_is_type(u, (UnitTypes)g.unit_id)) continue;
 					if (u->index < 1700 && ai.garrison.test(u->index)) continue;
 					if (!u_completed(u)) { pending = true; continue; }
 					auto oid = u->order_type->id;
@@ -21268,7 +23451,7 @@ struct state_functions {
 				if (pass == 1 && (n < std::min(g.count, force_budget) || in_training)) break;
 				for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end() && n > 0; ++i) {
 					unit_t* u = &*i;
-					if (!unit_is(u, (UnitTypes)g.unit_id) || unit_dying(u)) continue;
+					if (!unit_is_type(u, (UnitTypes)g.unit_id) || unit_dying(u)) continue;
 					if (ut_worker(u) || ut_building(u)) continue;
 					bool garrison = u->index < 1700 && ai.garrison.test(u->index);
 					if (garrison != (pass == 1)) continue;
@@ -22256,8 +24439,8 @@ struct state_functions {
 				if (a.type == 0) break;
 				types += format("%d ", a.type);
 			}
-			trigger_trace_sink()(format("trace f%d p%d TRIGGER FIRES, actions: %s\n",
-			    (int)st.current_frame, owner, types));
+			trigger_trace_sink()(format("trace f%d p%d TRIGGER FIRES trig#%d, actions: %s\n",
+			    (int)st.current_frame, owner, t.source_index, types));
 		}
 		rt.flags |= 1;
 		size_t index = rt.current_action_index;
@@ -22270,8 +24453,8 @@ struct state_functions {
 				// names the action type, which is the only cheap way to find
 				// which one did it from a headless sweep.
 				if (trigger_tracing()) {
-					trigger_trace_sink()(format("trace f%d p%d action type=%d loc=%d unit=%d grp=%d/%d\n",
-					    (int)st.current_frame, owner, a.type, a.location, a.extra_n, a.group_n, a.group2_n));
+					trigger_trace_sink()(format("trace f%d p%d action type=%d loc=%d unit=%d grp=%d/%d trig#%d act%d\n",
+					    (int)st.current_frame, owner, a.type, a.location, a.extra_n, a.group_n, a.group2_n, t.source_index, (int)index));
 				}
 				if (!execute_trigger_action(ets, owner, rt, rt.actions[index], a)) break;
 			}
@@ -22446,8 +24629,13 @@ struct state_functions {
 		unit_area.from.y = pos.y / 32u - unit_type->placement_size.y / 32u / 2;
 		unit_area.to.x = unit_area.from.x + unit_type->placement_size.x / 32u;
 		unit_area.to.y = unit_area.from.y + unit_type->placement_size.y / 32u;
-		st.tiles.at(unit_area.from.y * game_st.map_tile_width + unit_area.from.x);
-		if (unit_area.from != unit_area.to) st.tiles.at((unit_area.to.y - 1) * game_st.map_tile_width + unit_area.to.x - 1);
+		// Map-edge start units in UMS maps: clip the footprint (in-bounds footprints are unchanged).
+		if (unit_area.from.x > game_st.map_tile_width) unit_area.from.x = 0;
+		if (unit_area.from.y > game_st.map_tile_height) unit_area.from.y = 0;
+		if (unit_area.to.x > game_st.map_tile_width) unit_area.to.x = game_st.map_tile_width;
+		if (unit_area.to.y > game_st.map_tile_height) unit_area.to.y = game_st.map_tile_height;
+		if (unit_area.from.x > unit_area.to.x) unit_area.from.x = unit_area.to.x;
+		if (unit_area.from.y > unit_area.to.y) unit_area.from.y = unit_area.to.y;
 		for (size_t y = unit_area.from.y; y != unit_area.to.y; ++y) {
 			for (size_t x = unit_area.from.x; x != unit_area.to.x; ++x) {
 				if (!tile_can_have_creep({x, y})) continue;
@@ -22748,8 +24936,98 @@ struct game_load_functions : state_functions {
 	setup_info_t setup_info;
 
 	unit_type_t* get_unit_type(UnitTypes id) const {
-		if ((size_t)id >= 228) error("invalid unit id %d", (size_t)id);
+		if ((size_t)id >= 228) {
+			size_t k = (size_t)id - ext_unit_type_first;
+			if ((size_t)id >= ext_unit_type_first && k < game_st.ext_unit_types.size()) return &game_st.ext_unit_types[k];
+			error("invalid unit id %d", (size_t)id);
+		}
 		return &game_st.unit_types.vec[(size_t)id];
+	}
+
+	// Clones of their parent (still in id form: the fixup below resolves the pointers).
+	void install_ext_unit_types() {
+		const a_vector<ext_unit_def>& ext_install = global_st.ext_unit_defs;
+		game_st.ext_defs = ext_install;
+		game_st.ext_heroes = global_st.ext_hero_defs;
+		game_st.ext_abilities = global_st.ext_ability_defs;
+		game_st.oe_ext = !ext_install.empty() || !game_st.ext_heroes.empty() || !game_st.ext_abilities.empty();
+		for (auto& a : game_st.ext_abilities) {
+			if (a.target < 0 || a.target > 4 || a.effect < 0 || a.effect > 5 || a.ranks < 1) error("%s: invalid ability", a.id.c_str());
+			bool known = a.summon < 0 || a.summon < 228 || ((size_t)a.summon >= ext_unit_type_first && (size_t)a.summon - ext_unit_type_first < ext_install.size());
+			if (!known) error("%s: invalid summon unit %d", a.id.c_str(), a.summon);
+		}
+		auto ability_ok = [&](const a_vector<int>& v, const a_string& id) {
+			for (int a : v) if (a < 0 || (size_t)a >= game_st.ext_abilities.size()) error("%s: invalid ability %d", id.c_str(), a);
+		};
+		for (auto& d : ext_install) ability_ok(d.abilities, d.id);
+		for (auto& h : game_st.ext_heroes) ability_ok(h.abilities, h.id);
+		for (auto& h : game_st.ext_heroes) {
+			bool known = h.unit >= 0 && (h.unit < 228 || ((size_t)h.unit >= ext_unit_type_first && (size_t)h.unit - ext_unit_type_first < ext_install.size()));
+			if (!known) error("%s: invalid hero unit %d", h.id.c_str(), h.unit);
+			if (h.max_level < 1) error("%s: invalid max level %d", h.id.c_str(), h.max_level);
+		}
+		game_st.ext_unit_types.clear();
+		game_st.ext_flingy_types.clear();
+		game_st.ext_walk_scale.assign(ext_install.size(), 0);
+		if (ext_install.size() > ext_unit_type_max) error("too many Extended mod types (%d, at most %d)", (int)ext_install.size(), (int)ext_unit_type_max);
+		game_st.ext_unit_types.reserve(ext_install.size());
+		game_st.ext_flingy_types.reserve(ext_install.size());
+		for (size_t k = 0; k != ext_install.size(); ++k) {
+			const ext_unit_def& d = ext_install[k];
+			if (d.parent < 0 || d.parent >= 228) error("%s: invalid parent %d", d.id.c_str(), d.parent);
+			unit_type_t t = game_st.unit_types.vec[(size_t)d.parent];
+			bool parent_building = (t.flags & unit_type_t::flag_building) != 0;
+			if (parent_building != d.building) error("%s: a %s cannot be based on unit %d", d.id.c_str(), d.building ? "building" : "unit", d.parent);
+			t.id = (UnitTypes)(ext_unit_type_first + k);
+			t.behaves_as = (UnitTypes)d.parent;
+			t.hitpoints = fp8::integer(d.hp);
+			t.shield_points = d.shields;
+			t.has_shield = d.shields > 0;
+			t.armor = d.armor;
+			if (d.energy > 0) t.flags = (unit_type_t::flags_t)(t.flags | unit_type_t::flag_has_energy);
+			t.sight_range = d.sight;
+			if (d.building) t.supply_provided = fp1::integer(d.supply);
+			else t.supply_required = fp1::integer(d.supply);
+			if (d.weapon >= 0 && d.weapon < 130) {
+				int tf = game_st.weapon_types.vec[(size_t)d.weapon].target_flags;
+				t.ground_weapon = (tf & 2) ? (WeaponTypes)d.weapon : WeaponTypes::None;
+				t.air_weapon = (tf & 1) ? (WeaponTypes)d.weapon : WeaponTypes::None;
+			}
+			t.mineral_cost = d.minerals;
+			t.gas_cost = d.gas;
+			t.build_time = d.time * 16;   // game seconds (1000 ms per 16 frames)
+			if (d.building) {
+				xy old = t.placement_size;
+				t.placement_size = {d.width * 32, d.height * 32};
+				if (old.x > 0 && old.y > 0 && (old.x != t.placement_size.x || old.y != t.placement_size.y)) {
+					t.dimensions.from.x = t.dimensions.from.x * t.placement_size.x / old.x;
+					t.dimensions.to.x = t.dimensions.to.x * t.placement_size.x / old.x;
+					t.dimensions.from.y = t.dimensions.from.y * t.placement_size.y / old.y;
+					t.dimensions.to.y = t.dimensions.to.y * t.placement_size.y / old.y;
+				}
+			}
+			game_st.ext_unit_types.push_back(t);
+		}
+	}
+	// After the pointer fixup: a type whose speed differs from its parent's gets its own flingy.
+	void install_ext_unit_speeds() {
+		for (size_t k = 0; k != game_st.ext_unit_types.size(); ++k) {
+			const ext_unit_def& d = game_st.ext_defs[k];
+			unit_type_t& t = game_st.ext_unit_types[k];
+			if (d.building || d.speed < 0 || !t.flingy || t.flingy->movement_type == 2) continue;
+			fp8 speed = fp8::integer(d.speed);
+			if (speed == t.flingy->top_speed) continue;
+			flingy_type_t f = *t.flingy;
+			int64_t old = f.top_speed.raw_value;
+			f.top_speed = speed;
+			// acceleration scales too (same time to top speed), so the halt distance scales linearly
+			if (old > 0) {
+				f.acceleration = fp8::from_raw((fp8::raw_type)std::max<int64_t>(1, (int64_t)f.acceleration.raw_value * speed.raw_value / old));
+				f.halt_distance = fp8::from_raw((fp8::raw_type)((int64_t)f.halt_distance.raw_value * speed.raw_value / old));
+			}
+			game_st.ext_flingy_types.push_back(f);
+			t.flingy = &game_st.ext_flingy_types.back();
+		}
 	}
 	const weapon_type_t* get_weapon_type(WeaponTypes id) const {
 		if ((size_t)id >= 130) error("invalid weapon id %d", (size_t)id);
@@ -22765,6 +25043,7 @@ struct game_load_functions : state_functions {
 	}
 	const flingy_type_t* get_flingy_type(FlingyTypes id) const {
 		if ((size_t)id >= 209) error("invalid flingy id %d", (size_t)id);
+		if (!game_st.eud_flingy_types.empty()) return &game_st.eud_flingy_types[(size_t)id];
 		return &global_st.flingy_types.vec[(size_t)id];
 	}
 
@@ -22774,6 +25053,7 @@ struct game_load_functions : state_functions {
 		game_st.weapon_types = data_loading::load_weapons_dat(global_st.weapons_dat);
 		game_st.upgrade_types = data_loading::load_upgrades_dat(global_st.upgrades_dat);
 		game_st.tech_types = data_loading::load_techdata_dat(global_st.techdata_dat);
+		install_ext_unit_types();
 
 		auto fixup_unit_type = [&](auto& ptr) {
 			UnitTypes index{ptr};
@@ -22809,7 +25089,8 @@ struct game_load_functions : state_functions {
 			if (v >= 256 * 32) v = 256 * 32 - 1;
 		};
 
-		for (auto& v : game_st.unit_types.vec) {
+		auto fixup_types = [&](a_vector<unit_type_t>& vec) {
+		for (auto& v : vec) {
 			fixup_flingy_type(v.flingy);
 			fixup_unit_type(v.turret_unit_type);
 			fixup_unit_type(v.subunit2);
@@ -22831,6 +25112,10 @@ struct game_load_functions : state_functions {
 			pos_coord(v.dimensions.to.x);
 			pos_coord(v.dimensions.to.y);
 		}
+		};
+		fixup_types(game_st.unit_types.vec);
+		fixup_types(game_st.ext_unit_types);
+		install_ext_unit_speeds();
 		for (auto& v : game_st.weapon_types.vec) {
 			fixup_flingy_type(v.flingy);
 			fixup_upgrade_type(v.damage_upgrade);
@@ -22880,8 +25165,19 @@ struct game_load_functions : state_functions {
 		st.unit_deaths = {};
 		st.unit_kills = {};
 		st.eud_deaths.clear();
+		st.eud_dat_journal.clear();
+		st.trigger_cp = -1;
+		st.eud_str.clear();
+		st.eud_str_delta = 0;
+		st.eud_req.clear();
+		st.eud_req_idx.clear();
+		game_st.eud_flingy_types.clear();
+		game_st.eud_dat_orig.clear();
 		st.countdown_timer_ms = 0;
 		st.countdown_paused = false;
+		st.trigger_paused = false;
+		st.trigger_pause_ticks = 0;
+		st.trigger_ticks = 0;
 		st.custom_score = {};
 		st.kills_score = {};
 		st.razings_score = {};
@@ -22895,8 +25191,8 @@ struct game_load_functions : state_functions {
 		st.supply_available = {};
 
 		auto set_acquisition_ranges = [&]() {
-			for (size_t i = 0; i != 228; ++i) {
-				unit_type_t* unit_type = get_unit_type((UnitTypes)i);
+			for_each_unit_type_id([&](UnitTypes i) {
+				unit_type_t* unit_type = get_unit_type(i);
 				const unit_type_t* attacking_type = unit_type;
 				if (unit_type->turret_unit_type) attacking_type = unit_type->turret_unit_type;
 				const weapon_type_t* ground_weapon = attacking_type->ground_weapon;
@@ -22905,7 +25201,7 @@ struct game_load_functions : state_functions {
 				if (ground_weapon) acq_range = std::max(acq_range, ground_weapon->max_range / 32);
 				if (air_weapon) acq_range = std::max(acq_range, air_weapon->max_range / 32);
 				unit_type->target_acquisition_range = acq_range;
-			}
+			});
 		};
 		set_acquisition_ranges();
 
@@ -22971,7 +25267,7 @@ struct game_load_functions : state_functions {
 
 		int max_unit_width = 0;
 		int max_unit_height = 0;
-		for (auto& v : game_st.unit_types.vec) {
+		for (auto* vec : {&game_st.unit_types.vec, &game_st.ext_unit_types}) for (auto& v : *vec) {
 			int width = v.dimensions.from.x + 1 + v.dimensions.to.x;
 			int height = v.dimensions.from.y + 1 + v.dimensions.to.y;
 			if (width > max_unit_width) max_unit_width = width;
@@ -22989,6 +25285,7 @@ struct game_load_functions : state_functions {
 		st.repulse_field.resize(game_st.repulse_field_width * game_st.repulse_field_height);
 
 		game_st.triggers.clear();
+		game_st.eud_triggers = false;
 
 		st.prev_bullet_source_unit = nullptr;
 		st.consider_collision_with_unit_bug = nullptr;
@@ -23810,7 +26107,7 @@ struct game_load_functions : state_functions {
 	}
 
 	int get_unit_strength(const unit_type_t* unit_type, const weapon_type_t* weapon_type) {
-		switch (unit_type->id) {
+		switch (unit_type->behaves_as) {
 		case UnitTypes::Terran_Vulture_Spider_Mine:
 		case UnitTypes::Protoss_Interceptor:
 		case UnitTypes::Protoss_Scarab:
@@ -23843,7 +26140,7 @@ struct game_load_functions : state_functions {
 			return value;
 		};
 		int score = sqrt_x_times_7_58(a + b);
-		switch (unit_type->id) {
+		switch (unit_type->behaves_as) {
 		case UnitTypes::Terran_SCV:
 		case UnitTypes::Zerg_Drone:
 		case UnitTypes::Protoss_Probe:
@@ -23864,13 +26161,13 @@ struct game_load_functions : state_functions {
 
 	void calculate_unit_strengths() {
 
-		for (int idx = 0; idx < 228; ++idx) {
+		for_each_unit_type_id([&](UnitTypes idx) {
 
-			const unit_type_t* unit_type = get_unit_type((UnitTypes)idx);
+			const unit_type_t* unit_type = get_unit_type(idx);
 			const unit_type_t* attacking_type = unit_type;
 			int air_strength = 0;
 			int ground_strength = 0;
-			if (attacking_type->id != UnitTypes::Zerg_Larva && !unit_is_egg(attacking_type)) {
+			if (attacking_type->behaves_as != UnitTypes::Zerg_Larva && !unit_is_egg(attacking_type)) {
 				if (unit_is_carrier(attacking_type)) attacking_type = get_unit_type(UnitTypes::Protoss_Interceptor);
 				else if (unit_is_reaver(attacking_type)) attacking_type = get_unit_type(UnitTypes::Protoss_Scarab);
 				else if (attacking_type->turret_unit_type) attacking_type = attacking_type->turret_unit_type;
@@ -23886,10 +26183,10 @@ struct game_load_functions : state_functions {
 			if (air_strength == 1 && ground_strength > air_strength) air_strength = 0;
 			if (ground_strength == 1 && air_strength > ground_strength) ground_strength = 0;
 
-			game_st.unit_air_strength[(UnitTypes)idx] = air_strength;
-			game_st.unit_ground_strength[(UnitTypes)idx] = ground_strength;
+			game_st.unit_air_strength[idx] = air_strength;
+			game_st.unit_ground_strength[idx] = ground_strength;
 
-		}
+		});
 
 	}
 
@@ -24225,9 +26522,20 @@ struct game_load_functions : state_functions {
 		auto read_chunks = [&](const tag_list_t&tags) {
 			data_reader_le r(data, data + data_size);
 			a_unordered_map<tag_t, a_vector<data_reader_le>, tag_t> chunks;
-			while (r.left()) {
+			a_vector<size_t> jumped_from;
+			while (r.left() >= 8) {   // a trailing partial chunk header is ignored
 				tag_t tag = r.get<std::array<char, 4>>();
-				uint32_t len = r.get<uint32_t>();
+				int32_t slen = r.get<int32_t>();
+				if (slen < 0) {
+					// Protected maps: a negative length moves the reader back (BW adds it signed).
+					size_t at = (size_t)(r.ptr - data);
+					if ((size_t)-(int64_t)slen > at) break;
+					if (std::find(jumped_from.begin(), jumped_from.end(), at) != jumped_from.end()) break;
+					jumped_from.push_back(at);
+					r.ptr = data + (at - (size_t)-(int64_t)slen);
+					continue;
+				}
+				uint32_t len = (uint32_t)slen;
 				if (len > r.left()) break;
 				const uint8_t* chunk_data = r.ptr;
 				r.skip(len);
@@ -24246,6 +26554,8 @@ struct game_load_functions : state_functions {
 					if (std::get<1>(v)) error("map is missing required chunk '%s'", tagstr(tag));
 				} else {
 					if (!tag_funcs[tag]) error("tag '%s' is missing a function", tagstr(tag));
+					// A repeated DIM: the last one is the map's (protectors put a 0x0 decoy first).
+					if (tagstr(tag) == "DIM ") { tag_funcs[tag](i->second.back()); continue; }
 					for (auto& v : i->second) {
 						tag_funcs[tag](v);
 					}
@@ -24285,17 +26595,24 @@ struct game_load_functions : state_functions {
 		tag_funcs["STR "] = [&](data_reader_le r) {
 			if (r.left() < 2) return;
 			auto start = r;
+			game_st.str_section.assign((const uint8_t*)r.ptr, (const uint8_t*)r.ptr + r.left());
+			game_st.str_ext = false;
 			size_t num = r.get<uint16_t>();
 			game_st.map_strings.clear();
 			game_st.map_strings.resize(num);
 			for (size_t i = 0; i != num; ++i) {
+				// UMS/EUD maps declare more strings than the section holds, or leave the last one
+				// unterminated: missing offsets read as empty, a string ends at the section end.
+				if (r.left() < 2) break;
 				size_t offset = r.get<uint16_t>();
 				auto t = start;
 				if (offset < t.left()) {
 					t.skip(offset);
 					char* b = (char*)t.ptr;
-					while (t.get<char>());
-					game_st.map_strings[i] = a_string(b, (char*)t.ptr - b - 1);
+					while (t.left() && t.get<char>());
+					size_t n = (char*)t.ptr - b;
+					if (n && b[n - 1] == 0) --n;
+					game_st.map_strings[i] = a_string(b, n);
 				} else {
 					game_st.map_strings[i] = "<invalid string offset>";
 				}
@@ -24310,7 +26627,9 @@ struct game_load_functions : state_functions {
 		tag_funcs["STRx"] = [&](data_reader_le r) {
 			if (r.left() < 4) return;
 			auto start = r;
-			size_t num = r.get<uint32_t>();
+			game_st.str_section.assign((const uint8_t*)r.ptr, (const uint8_t*)r.ptr + r.left());
+			game_st.str_ext = true;
+			size_t num = std::min<size_t>(r.get<uint32_t>(), r.left() / 4);
 			game_st.map_strings.clear();
 			game_st.map_strings.resize(num);
 			for (size_t i = 0; i != num; ++i) {
@@ -24319,8 +26638,10 @@ struct game_load_functions : state_functions {
 				if (offset < t.left()) {
 					t.skip(offset);
 					char* b = (char*)t.ptr;
-					while (t.get<char>());
-					game_st.map_strings[i] = a_string(b, (char*)t.ptr - b - 1);
+					while (t.left() && t.get<char>());
+					size_t n = (char*)t.ptr - b;
+					if (n && b[n - 1] == 0) --n;
+					game_st.map_strings[i] = a_string(b, n);
 				} else {
 					game_st.map_strings[i] = "<invalid string offset>";
 				}
@@ -24417,6 +26738,7 @@ struct game_load_functions : state_functions {
 					if (unit_type == UnitTypes::Special_Right_Upper_Level_Door) owner = 11;
 					if (unit_type == UnitTypes::Special_Pit_Door) owner = 11;
 					if (unit_type == UnitTypes::Special_Right_Pit_Door) owner = 11;
+					if (owner >= 12) continue;   // protected maps: no such player (would index past player_units)
 					if (use_map_settings || owner == 11) {
 						unit_t* tu = create_initial_unit(get_unit_type(unit_type), xy(x, y), owner);
 						// v0.83.002: flag 0x80 means "this unit starts disabled".
@@ -24425,7 +26747,7 @@ struct game_load_functions : state_functions {
 						// expterran07 all died right here, and all four are door
 						// maps. Starting disabled is the normal state for a door;
 						// trigger action 42 is what opens it.
-						if (flags & 0x80) set_unit_doodad_state(tu, false);
+						if (tu && (flags & 0x80)) set_unit_doodad_state(tu, false);
 					}
 				}
 			}
@@ -24593,6 +26915,12 @@ struct game_load_functions : state_functions {
 		};
 
 		tag_funcs["UNIT"] = [&](data_reader_le r) {
+			struct linked_unit_t {
+				uint32_t id, related;
+				int link;
+				unit_t* u;
+			};
+			a_vector<linked_unit_t> linked_units;
 			while (r.left()) {
 
 				int id = r.get<uint32_t>();
@@ -24617,10 +26945,17 @@ struct game_load_functions : state_functions {
 					owner = 8;
 				}
 
-				(void)id; (void)link; (void)valid_flags; (void)units_in_hangar; (void)flags; (void)related_unit_id;
-
 				if ((size_t)unit_type_id >= 228) error("UNIT: invalid unit type %d", (int)unit_type_id);
-				if ((size_t)owner >= 12) error("UNIT: invalid owner %d", owner);
+				if ((size_t)owner >= 12) {
+					// Protected maps place units for owners 12-255: only the passive subset
+					// loads, as neutral; everything else (and their start locations) is ignored.
+					int set_flags = valid_flags & flags;
+					bool passive = ((int)unit_type_id >= 215 && (int)unit_type_id <= 227)
+						|| ((unit_type_id == UnitTypes::Terran_Science_Facility || unit_type_id == UnitTypes::Terran_Bunker)
+						    && (set_flags & 0x10) && !(set_flags & 8));
+					if (!passive) continue;
+					owner = 11;
+				}
 
 				const unit_type_t* unit_type = get_unit_type(unit_type_id);
 
@@ -24663,6 +26998,9 @@ struct game_load_functions : state_functions {
 
 				if (!u) continue;
 
+				hp_percent = std::min(hp_percent, 100);
+				shield_percent = std::min(shield_percent, 100);
+				energy_percent = std::min(energy_percent, 100);
 				if (valid_properties & 0x2) {
 					using tmp_t = fixed_point<32, 8, true>;
 					tmp_t tmp = tmp_t::extend(u->unit_type->hitpoints);
@@ -24672,16 +27010,47 @@ struct game_load_functions : state_functions {
 				if (valid_properties & 0x4) set_unit_shield_points(u, fp8::integer(u->unit_type->shield_points * shield_percent / 100));
 				if (valid_properties & 0x8) set_unit_energy(u, unit_max_energy(u) * energy_percent / 100);
 				if (valid_properties & 0x10) set_unit_resources(u, resources);
-				// todo: more stuff...
 
 				if (valid_flags & 8 && flags & 8) {
 					make_unit_hallucination(u);
+				}
+
+				if (use_map_settings && st.game->qol.ums_unit_properties) {
+					int set_flags = valid_flags & flags;
+					// an unchecked box never removes innate invincibility (minerals, doors, ...)
+					if (set_flags & 0x10) u_set_status_flag(u, unit_t::status_flag_invincible);
+					if ((valid_properties & 0x20) && units_in_hangar) fill_initial_hangar(u, units_in_hangar);
+					if ((set_flags & 0x2) && initial_unit_may_burrow(u)) burrow_initial_unit(u);
+					else if ((set_flags & 0x1) && initial_unit_may_cloak(u)) cloak_initial_unit(u);
+					if (link & 0x600) linked_units.push_back({(uint32_t)id, (uint32_t)related_unit_id, link, u});
 				}
 
 				if (unit_is(u, UnitTypes::Zerg_Broodling)) {
 					set_remove_timer(u);
 				}
 
+			}
+			// addon / nydus pairs connect only when both records name each other
+			for (auto& a : linked_units) {
+				auto find = [&](uint32_t id) -> const linked_unit_t* {
+					const linked_unit_t* r = nullptr;
+					for (auto& b : linked_units) {
+						if (b.id != id) continue;
+						if (r) return nullptr;
+						r = &b;
+					}
+					return r;
+				};
+				const linked_unit_t* b = find(a.related);
+				if (!b || b == &a || b->related != a.id || find(a.id) != &a) continue;
+				if (a.u->owner != b->u->owner) continue;
+				if ((a.link & 0x400) && unit_is(a.u, UnitTypes::Zerg_Nydus_Canal) && unit_is(b->u, UnitTypes::Zerg_Nydus_Canal)) {
+					a.u->building.nydus.exit = b->u;
+				} else if ((a.link & 0x200) && ut_addon(b->u) && !ut_addon(a.u) && !a.u->building.addon && unit_can_attach_addon(a.u, b->u)) {
+					xy bpos = a.u->sprite->position - a.u->unit_type->placement_size / 2;
+					xy npos = b->u->sprite->position - b->u->unit_type->placement_size / 2 - b->u->unit_type->addon_position;
+					if (bpos / 32 == npos / 32) connect_addon(a.u, b->u);
+				}
 			}
 
 			for (unit_t* u : ptr(st.visible_units)) {
@@ -24714,7 +27083,7 @@ struct game_load_functions : state_functions {
 				int right = r.get<int32_t>();
 				int bottom = r.get<int32_t>();
 				a_string name = get_map_string(r.get<uint16_t>());
-				(void)name;
+				game_st.location_names.push_back(name);
 				int elevation_flags = r.get<uint16_t>();
 				st.locations.emplace_back();
 				auto& loc = st.locations.back();
@@ -24724,9 +27093,11 @@ struct game_load_functions : state_functions {
 		};
 
 		tag_funcs["TRIG"] = [&](data_reader_le r) {
+			int source_index = 0;
 			while (r.left()) {
 				game_st.triggers.emplace_back();
 				auto& t = game_st.triggers.back();
+				t.source_index = source_index++;
 				for (size_t i = 0; i != 16; ++i) {
 					auto& c = t.conditions[i];
 					c.location = r.get<uint32_t>();
@@ -24738,6 +27109,7 @@ struct game_load_functions : state_functions {
 					c.extra_n = r.get<uint8_t>();
 					c.flags = r.get<uint8_t>();
 					c.unk = r.get<uint16_t>();
+					if (c.type == 15 && (c.unit_id >= 228 || c.group >= 27 || c.unk == 0x4353)) game_st.eud_triggers = true;
 				}
 				for (size_t i = 0; i != 64; ++i) {
 					auto& a = t.actions[i];
@@ -24751,8 +27123,9 @@ struct game_load_functions : state_functions {
 					a.type = r.get<uint8_t>();
 					a.num_n = r.get<uint8_t>();
 					a.flags = r.get<uint8_t>();
-					a.unk = r.get<uint16_t>();
-					r.get<uint8_t>(); // padding
+					a.unk = r.get<uint8_t>();
+					a.maskflag = r.get<uint16_t>();   // SC:R masked Set Deaths: 'SC' (mask in location)
+					if (a.type == 45 && (a.extra_n >= 228 || a.group_n >= 27 || a.maskflag == 0x4353)) game_st.eud_triggers = true;
 				}
 				t.execution_flags = r.get<uint32_t>();
 
@@ -24763,6 +27136,8 @@ struct game_load_functions : state_functions {
 				}
 				if (!enabled_for_any) game_st.triggers.pop_back();
 			}
+			// Repeated TRIG chunks stack; re-register all, as appending may have moved earlier triggers.
+			for (auto& v : st.running_triggers) v.clear();
 			for (auto& t : game_st.triggers) {
 				for (int i = 0; i != 8; ++i) {
 					// Must match player_slot_active(), which is what
@@ -24795,12 +27170,20 @@ struct game_load_functions : state_functions {
 				// Which execution-flag groups the map actually uses. A trigger
 				// enabled only for a slot we treat as inactive is silently
 				// inert, and that is invisible from inside the game.
-				int ti = 0;
 				for (auto& t : game_st.triggers) {
 					a_string bits;
 					for (int k = 0; k != 28; ++k) if (t.enabled[k]) bits += format("%d ", k);
-					trigger_trace_sink()(format("trace: trigger %d enabled for: %s\n", ti++, bits));
+					trigger_trace_sink()(format("trace: trigger %d enabled for: %s\n", t.source_index, bits));
 				}
+			}
+		};
+
+		tag_funcs["OESC"] = [&](data_reader_le r) {
+			if (game_st.qol.skip_oescript) return;
+			game_st.oescript.read(r.ptr, r.left());
+			if (trigger_tracing()) {
+				if (game_st.oescript.loaded) trigger_trace_sink()(format("oes loaded %d handlers %d code\n", (int)game_st.oescript.handlers.size(), (int)game_st.oescript.code.size()));
+				else trigger_trace_sink()(format("oes error %s\n", game_st.oescript.error));
 			}
 		};
 
@@ -24812,6 +27195,8 @@ struct game_load_functions : state_functions {
 		};
 
 		st.players = {};
+		game_st.oescript = oescript::program();
+		st.oes = oescript::runtime();
 
 		read_chunks({
 			{"VER ", true},
@@ -24925,6 +27310,7 @@ struct game_load_functions : state_functions {
 					{"UPRP", true},
 					{"MRGN", true},
 					{"TRIG", true},
+					{"OESC", false},
 					{"COLR", false}
 				});
 			} else {
@@ -24933,6 +27319,7 @@ struct game_load_functions : state_functions {
 					{"MTXM", true},
 					{"THG2", true},
 					{"UNIT", true},
+					{"OESC", false},
 					{"COLR", false}
 				});
 			}
@@ -24956,6 +27343,7 @@ struct game_load_functions : state_functions {
 					{"UPRP", true},
 					{"MRGN", true},
 					{"TRIG", true},
+					{"OESC", false},
 					{"COLR", true},
 				});
 			} else {
@@ -24964,10 +27352,14 @@ struct game_load_functions : state_functions {
 					{"MTXM", true},
 					{"THG2", true},
 					{"UNIT", true},
+					{"OESC", false},
 					{"COLR", true}
 				});
 			}
 		} else error("unsupported map version %d", version);
+
+		if (!use_map_settings && game_st.oescript.loaded) read_chunks({{"MRGN", false}});
+		st.oes.active = game_st.oescript.loaded;
 
 		if (!use_map_settings) {
 			if (setup_info.victory_condition == 1) {
@@ -25169,7 +27561,7 @@ void global_init(global_state& st, load_data_file_F&& load_data_file) {
 		ins_data[opc_liftoffcondjmp] = "b";
 		ins_data[opc_warpoverlay] = "2";
 		ins_data[opc_orderdone] = "1";
-		ins_data[opc_grdsprol] = "211";
+		ins_data[opc_grdsprol] = "2s1s1";   // 1.16.1 0x4D77F7: movsx
 		ins_data[opc___43] = "";
 		ins_data[opc_dogrddamage] = "";
 
@@ -25474,6 +27866,58 @@ void global_init(global_state& st, load_data_file_F&& load_data_file) {
 
 }
 
+// Reads the 1.16.1 requirement tables from the user's StarCraft.exe (PE image). Kept only when
+// every table parses to its 1.16.1 end; otherwise empty and the engine's own rules apply.
+inline bool load_requirement_tables(global_state& st, const a_string& exe_path) {
+	st.req_tables.clear();
+	FILE* f = fopen(exe_path.c_str(), "rb");
+	if (!f) return false;
+	a_vector<uint8_t> d;
+	uint8_t buf[65536];
+	for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) != 0;) d.insert(d.end(), buf, buf + n);
+	fclose(f);
+	auto u16 = [&](size_t o) { return o + 2 <= d.size() ? (uint32_t)d[o] | (uint32_t)d[o + 1] << 8 : 0u; };
+	auto u32 = [&](size_t o) { return u16(o) | u16(o + 2) << 16; };
+	size_t pe = u32(0x3c);
+	if (d.size() < 0x40 || u32(pe) != 0x4550 || u16(pe + 4) != 0x14c) return false;
+	size_t nsec = u16(pe + 6), opt = pe + 24, sec = opt + u16(pe + 20);
+	if (u16(opt) != 0x10b) return false;
+	uint32_t image_base = u32(opt + 28);
+	a_vector<uint8_t> t(eud::req_end - eud::req_base);
+	for (uint32_t va = eud::req_base; va != eud::req_end; ++va) {
+		bool found = false;
+		for (size_t i = 0; i != nsec && !found; ++i) {
+			size_t h = sec + 40 * i;
+			uint32_t vs = u32(h + 8), rva = u32(h + 12), raw = u32(h + 16), ptr = u32(h + 20);
+			uint32_t off = va - image_base - rva;
+			if (va - image_base < rva || off >= std::max(vs, raw)) continue;
+			found = true;
+			if (off < raw && (size_t)ptr + off < d.size()) t[va - eud::req_base] = d[ptr + off];
+		}
+		if (!found) return false;
+	}
+	auto w = [&](uint32_t a) { return (uint32_t)t[a - eud::req_base] | (uint32_t)t[a + 1 - eud::req_base] << 8; };
+	for (auto& rt : eud::req_tables) {
+		uint32_t a = rt.table + 2;
+		while (a < rt.end_marker && w(a) != 0xffff) {
+			a += 2;
+			while (a < rt.end_marker && w(a) != 0xffff) a += 2;
+			a += 2;
+		}
+		if (a != rt.end_marker || w(a) != 0xffff) return false;
+	}
+	st.req_tables = std::move(t);
+	return true;
+}
+
+// FNV-1a over the loaded tables; 0 = none. LAN peers compare it before turning the tables on.
+inline uint32_t requirement_tables_hash(const global_state& st) {
+	if (st.req_tables.empty()) return 0;
+	uint32_t h = 2166136261u;
+	for (uint8_t b : st.req_tables) h = (h ^ b) * 16777619u;
+	return h ? h : 1;
+}
+
 struct game_player {
 private:
 	std::unique_ptr<global_state> uptr_global_st;
@@ -25503,6 +27947,13 @@ public:
 		st.game = uptr_game_st.get();
 		global_init(*uptr_global_st, std::forward<load_data_file_F>(load_data_file));
 		set_st(st);
+	}
+	bool load_requirement_tables(const a_string& exe_path) {
+		if (!uptr_global_st) error("game_player: not initialized");
+		return bwgame::load_requirement_tables(*uptr_global_st, exe_path);
+	}
+	uint32_t requirement_tables_hash() const {
+		return uptr_global_st ? bwgame::requirement_tables_hash(*uptr_global_st) : 0;
 	}
 	void load_map_file(const a_string& filename, bool initial_processing = true) {
 		if (!opt_funcs) error("game_player: not initialized");

@@ -154,6 +154,7 @@ final class PortraitView extends View {
      * no scanlines, nothing drawn while the clip is not there yet.
      */
     void setArt(PortraitStore.Clip c) {
+        if (artMode && clip != null && clip.hd && (c == null || !c.hd)) return;   // the SD emblem came in after the HD one
         artMode = true;
         entry = null;
         id = -1;

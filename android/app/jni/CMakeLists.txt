@@ -80,3 +80,28 @@ target_compile_options(openbw_minimap PRIVATE -fexceptions -frtti
     $<$<CONFIG:Debug>:-O1>
     $<$<NOT:$<CONFIG:Debug>>:-O2 -fvisibility=hidden>)
 target_link_libraries(openbw_minimap log)
+
+# v1.0.27: first-run import from RAR / 7z archives (ArchiveImporter.java). RARLab
+# UnRAR (decompression only, deps/unrar/license.txt) + the public-domain LZMA SDK
+# 7z decoder (deps/lzma). Separate library so the launcher loads it on demand.
+set(UNRAR_SRC rar strlist strfn pathfn smallfn global file filefn filcreat archive arcread
+    unicode system crypt crc rawread encname resource match timefn rdwrfn consio options
+    errhnd rarvm secpassword rijndael getbits sha1 sha256 blake2s hash extinfo extract
+    volume list find unpack headers threadpool rs16 cmddata ui largepage filestr scantree
+    dll qopen)
+set(LZMA_SRC 7zAlloc 7zArcIn 7zBuf 7zCrc 7zCrcOpt 7zDec 7zFile 7zStream Bcj2 Bra Bra86
+    BraIA64 CpuArch Delta Lzma2Dec LzmaDec Ppmd7 Ppmd7Dec)
+set(ARCIMPORT_FILES "${CMAKE_CURRENT_SOURCE_DIR}/../src/main/cpp/arc_import_jni.cpp")
+foreach(f ${UNRAR_SRC})
+    list(APPEND ARCIMPORT_FILES "${OPENBW_ROOT}/deps/unrar/${f}.cpp")
+endforeach()
+foreach(f ${LZMA_SRC})
+    list(APPEND ARCIMPORT_FILES "${OPENBW_ROOT}/deps/lzma/C/${f}.c")
+endforeach()
+add_library(arcimport SHARED ${ARCIMPORT_FILES})
+target_compile_definitions(arcimport PRIVATE RARDLL _FILE_OFFSET_BITS=64 _LARGEFILE_SOURCE Z7_PPMD_SUPPORT)
+target_compile_options(arcimport PRIVATE -w -fexceptions -frtti
+    "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/../src/main/cpp/arc_compat.h"
+    $<$<CONFIG:Debug>:-O1>
+    $<$<NOT:$<CONFIG:Debug>>:-O2 -fvisibility=hidden>)
+target_link_libraries(arcimport log)

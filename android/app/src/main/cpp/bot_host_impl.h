@@ -102,7 +102,7 @@ static int32_t bot_api_units(ob_bot_host* h, int32_t p, ob_unit* out, int32_t ma
 		if (!u->sprite) continue;
 		ob_unit& o = out[n++];
 		o.id = (intptr_t)u;
-		o.type = (int32_t)u->unit_type->id;
+		o.type = (int32_t)u->unit_type->behaves_as;   // a mod type looks like its parent to bots
 		o.owner = u->owner;
 		o.x = u->sprite->position.x;
 		o.y = u->sprite->position.y;

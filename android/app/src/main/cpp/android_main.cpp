@@ -22,6 +22,10 @@
 #include "sync.h"
 #include "sync_server_asio_tcp.h"
 #include "bot_api.h"
+#include "test_trace.h"
+#include "ums_slots.h"
+#include "oe_profile.h"
+#include "oe_extensions.h"
 
 #include <chrono>
 #include <thread>
@@ -59,10 +63,17 @@ void log_str(a_string str) {
 	}
 }
 
+// Native message boxes follow the launcher language (--lang); LT keeps its
+// diacritics, the box is an Android dialog, not the game font.
+static bool msg_lt = false;
+static a_string msg_t(const char* en, const char* lt) { return msg_lt ? lt : en; }
+static void msg_box(Uint32 flags, const a_string& text) { SDL_ShowSimpleMessageBox(flags, "OpenBW", text.c_str(), nullptr); }
+
 void fatal_error_str(a_string str) {
 	__android_log_print(ANDROID_LOG_ERROR, "OpenBW", "fatal error: %s", str.c_str());
 	log("fatal error: %s\n", str);
-	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenBW klaida", str.c_str(), nullptr);
+	oetest::active_trace().end("error", -1, 0, 0, 0, str.c_str());
+	msg_box(SDL_MESSAGEBOX_ERROR, msg_t("Error: ", "Klaida: ") + str);
 	std::terminate();
 }
 
@@ -70,6 +81,11 @@ void fatal_error_str(a_string str) {
 }
 
 namespace {
+
+struct scope_exit {
+	std::function<void()> f;
+	~scope_exit() { if (f) f(); }
+};
 
 struct saved_state {
 	state st;
@@ -97,6 +113,7 @@ struct main_t {
 	int local_player = -1;
 	int enemy_player = -1;
 	bool game_over = false;
+	int stop_frame = -1; // World Editor test: --test-frames, the sim never advances past it
 	bool ums_mode = false; // UMS: victory comes from map triggers only, not building counts
 	bool game_won = false;
 	// Network (lockstep) game: set to sync_functions::next_frame(server).
@@ -111,6 +128,7 @@ struct main_t {
 	// it cannot desync - it only inserts render-only iterations.
 	std::function<void()> net_poll;
 	std::function<bool()> net_ready;
+	std::function<void()> on_sim_frame;
 	std::chrono::steady_clock::time_point last_net_advance;
 
 	// --- v0.24 downloadable bot host ------------------------------------
@@ -205,6 +223,7 @@ struct main_t {
 			if (net_poll) net_poll();
 			for (auto i = tick_n; i;) {
 				--i;
+				if (stop_frame >= 0 && (int)ui.st.current_frame >= stop_frame) break;
 				// FPS parity: in a net game, only advance when it won't block on
 				// the lockstep barrier - otherwise stop the sim loop and let the
 				// frame render (smooth) while we wait for the peer. A safety
@@ -233,7 +252,7 @@ struct main_t {
 					last_tick += tick_speed;
 					// Bot commands are injected before the frame advances, the
 					// same ordering as local touch input.
-					if (bot_instance && !net_next_frame) {
+					if (bot_instance && !net_next_frame && !ui.st.trigger_paused) {
 						// DIAG BOT_EXCEPTION (Cat 5b): the bot frame runs inside the outer
 						// game-loop try (a throw silently ends the whole game). Wrap it so a
 						// bot throw is emitted as structured telemetry first, then re-thrown to
@@ -258,7 +277,7 @@ struct main_t {
 					// SCBW2 auto-worker assist: injects the same recorded actions a
 					// tapping player would, at the same pre-frame point as bot/touch
 					// input. No-op unless qol.auto_worker is set (SP only).
-					if (!net_next_frame) ui.qol_auto_worker_tick();
+					if (!net_next_frame && !ui.st.trigger_paused) ui.qol_auto_worker_tick();
 					if (net_next_frame) net_next_frame();
 					else if (bwgame::diag::enabled() && (uint32_t)ui.st.current_frame > 300) {
 							// DIAG SIM_FRAME_SLOW (one-off PERF_HITCH pin): render/asset/memory are
@@ -272,6 +291,7 @@ struct main_t {
 									"a single next_frame blocked >200ms", "\"us\":" + std::to_string(dt) +
 									",\"frame\":" + std::to_string(ui.st.current_frame));
 						} else ui.state_functions::next_frame();
+					if (on_sim_frame) on_sim_frame();
 				}
 				for (auto& v : ui.apm) v.update(ui.st.current_frame);
 				if (i % 4 == 3 && clock.now() - now >= std::chrono::milliseconds(50)) break;
@@ -838,9 +858,11 @@ extern "C" int main(int argc, char* argv[]) {
 	SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
 	SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
 
+	for (int i = 1; i + 1 < argc; ++i)
+		if (argv[i] && argv[i + 1] && a_string(argv[i]) == "--lang") ui::msg_lt = a_string(argv[i + 1]) == "lt";
 	const char* storage = SDL_AndroidGetExternalStoragePath();
 	if (!storage) {
-		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenBW", "Nepavyko gauti programos duomenu aplanko.", nullptr);
+		ui::msg_box(SDL_MESSAGEBOX_ERROR, ui::msg_t("Could not get the app's data folder.", "Nepavyko gauti programos duomenų aplanko."));
 		return 1;
 	}
 	a_string data_dir = storage;
@@ -848,8 +870,8 @@ extern "C" int main(int argc, char* argv[]) {
 
 	for (const char* fn : {"StarDat.mpq", "BrooDat.mpq", "Patch_rt.mpq"}) {
 		if (!file_exists(data_dir + "/" + fn)) {
-			a_string msg = a_string("Truksta failo: ") + fn + "\nPaleiskite nustatymu ekrana ir importuokite MPQ failus.";
-			SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenBW", msg.c_str(), nullptr);
+			ui::msg_box(SDL_MESSAGEBOX_ERROR, ui::msg_t("Missing file: ", "Trūksta failo: ") + fn +
+				ui::msg_t("\nOpen Settings and import the MPQ files.", "\nAtidarykite nustatymus ir importuokite MPQ failus."));
 			return 1;
 		}
 	}
@@ -891,9 +913,16 @@ extern "C" int main(int argc, char* argv[]) {
 	a_string teams_csv;   // per-slot team id (e.g. "0,0,1,1" = 2v2); empty = FFA
 	int team_mode = 0;    // 0 = FFA, 1 = two teams (native splits active slots in half)
 	a_string mods_csv;    // active mod ids (files/mods/<id>/), later = higher priority
+	// G10: game-data fingerprint of those mods (launcher's ModFingerprint, 16 hex; 0 = none).
+	// --mod-fingerprint is part of the game (kept in a save's args); --mod-fingerprint-now is
+	// what the same mod ids hash to today, added by the launcher when it resumes a save.
+	uint64_t mod_fp = 0;
+	uint64_t mod_fp_now = 0;
+	bool mod_fp_now_given = false;
 	a_string casc_dir;    // open1161HD Faze 2: SC:R install root (holds data/data); enables read-only CASC asset source. OFF unless set.
 	a_string game_mode = "melee"; // melee | ums | <trg name: ctf/greed10000/slaughter30/suddendeath/...>
 	a_string campaign_dir;        // e.g. "campaign/terran/terran01" - mission loaded from the MPQ chain
+	a_string oec_mission;         // G11: "oec:<campaign>/<mission>" - a .oecampaign mission (UMS map file); kept in saves
 	int vs_ai = 0;                // melee: non-local active slots run the aiscript melee AI
 	int rgba_sprites = 0;         // v0.22: true-color sprite pass (HD foundation)
 	a_string bot_path;            // v0.24: bot .so playing the enemy slot (overrides vs-ai)
@@ -902,10 +931,19 @@ extern "C" int main(int argc, char* argv[]) {
 	a_string name_portraits_arg;  // LAN: "id=name|id=name" from the launcher lobby (render-only)
 	a_string kbm_players_arg;     // LAN: "name|name" -- players in keyboard + mouse mode (render-only)
 	a_string key_binds_arg;       // keyboard + mouse: "id=code,id=code"
+	bool key_layout_classic = false;   // --key-layout classic: card letters from stat_txt.tbl
 	bool input_kbm = false;       // --input-mode kbm
 	int edge_scroll = 1;
+	int gamepad = 1;              // --gamepad 0/1: game controller play
+	int pad_speed = 100;          // --pad-speed: controller cursor speed, %
+	int pad_dead = 18;            // --pad-dead: stick dead zone, %
+	bool pad_swap = false;        // --pad-swap: cursor on the right stick
+	std::string pad_map;          // --pad-map: button / trigger actions (gamepad.h pad_set_map)
 	a_string slot_races_csv;      // v0.43: per active slot race (0 Z,1 T,2 P, else random); index 0 = local
 	a_string slot_colors_csv;     // per active slot player colour (0..7); index 0 = local (render-only)
+	a_string ums_slots_arg;       // UMS lobby, per map slot 0-7: c computer (default), x closed
+	a_string ums_races_arg;       // UMS lobby, per map slot 0-7 race csv (0 Z,1 T,2 P, else random)
+	int ums_local_slot = -1;      // UMS: the human's map slot (.oecampaign mission "player"); -1 = first human slot
 	bool trigger_trace = false;   // v0.62: --trigger-trace, campaign trigger diagnosis
 	bool diag_on = false;         // --diag: in-engine bug-catcher (DIAG), read-only
 	bool scale_filter_linear = false; // open1161HD Faze 4.1: --scale-filter linear -> bilinear logical->physical upscale (A/B; default nearest)
@@ -925,6 +963,7 @@ extern "C" int main(int argc, char* argv[]) {
 	int sun_shadow = 0;           // SHADOWS Phase 1: directional sun shadow (0 = off)
 	int sun_shadow_len = 40;      // sun-shadow lean length 0..100
 	int sun_shadow_sign = 1;      // sun azimuth sign: +1 = cast right/SE, -1 = left
+	int scr_font = 0;             // SC:R in-game font (HD tiers)
 	int point_lights = 0;         // SHADOWS Phase 2: dynamic point lights (0 = off)
 	int light_strength = 100;     // point-light intensity/radius 0..200 %
 	bool hd_anim_diag = false;    // DIAG: log each image's HD-anim load result
@@ -943,6 +982,16 @@ extern "C" int main(int argc, char* argv[]) {
 	int version_code = 0;         // v0.86: --version-code <n> — app versionCode, gates save compat
 	int autosave_frame = -1;      // v0.86 test hook: --autosave-at <frame> — write slot 1 then continue
 	a_string diag_selftest;       // --diag-selftest <name>: scripted DIAG scenario at frame 40
+	// World Editor "Test in engine" (oetrace/1, ui/test_trace.h): single-player only.
+	a_string test_trace_path;     // --test-trace <file.oetrace.jsonl>
+	a_string test_session;        // --test-session <id>
+	bool test_seed_set = false;   // --seed <u32>: fixed RNG seed instead of the clock
+	uint32_t test_seed = 0;
+	int test_frames = -1;         // --test-frames <n>: end the session at sim frame n
+	int test_frame_hash = 0;      // --test-frame-hash <n>: frameHash event every n sim frames
+	std::string test_map_sha_expected; // --test-map-sha256: the editor's staged copy; a different file ends the test
+	std::string test_map_sha_loaded;
+	a_string oescript_path;       // --oescript <file.obc>: the map's OEScript (else <map>.obc beside it)
 	for (int i = 1; i < argc; ++i) {
 		if (!argv[i] || !argv[i][0]) continue;
 		a_string arg = argv[i];
@@ -986,11 +1035,14 @@ extern "C" int main(int argc, char* argv[]) {
 		else if (arg == "--teams" && i + 1 < argc) teams_csv = argv[++i];
 		else if (arg == "--team-mode" && i + 1 < argc) team_mode = atoi(argv[++i]);
 		else if (arg == "--mods" && i + 1 < argc) mods_csv = argv[++i];
+		else if (arg == "--mod-fingerprint" && i + 1 < argc) mod_fp = strtoull(argv[++i], nullptr, 16);
+		else if (arg == "--mod-fingerprint-now" && i + 1 < argc) { mod_fp_now = strtoull(argv[++i], nullptr, 16); mod_fp_now_given = true; }
 		else if (arg == "--casc" && i + 1 < argc) casc_dir = argv[++i];
 		else if (arg == "--gfx-tier" && i + 1 < argc) gfx_tier = argv[++i];
 		else if (arg == "--test-cinematic" && i + 1 < argc) test_cinematic = argv[++i];
 		else if (arg == "--game-mode" && i + 1 < argc) game_mode = argv[++i];
 		else if (arg == "--campaign" && i + 1 < argc) campaign_dir = argv[++i];
+		else if (arg == "--oec-mission" && i + 1 < argc) oec_mission = argv[++i];
 		else if (arg == "--vs-ai" && i + 1 < argc) vs_ai = atoi(argv[++i]);
 		else if (arg == "--rgba-sprites" && i + 1 < argc) rgba_sprites = atoi(argv[++i]);
 		else if (arg == "--bot" && i + 1 < argc) bot_path = argv[++i];
@@ -999,9 +1051,18 @@ extern "C" int main(int argc, char* argv[]) {
 		else if (arg == "--name-portraits" && i + 1 < argc) name_portraits_arg = argv[++i];
 		else if (arg == "--kbm-players" && i + 1 < argc) kbm_players_arg = argv[++i];
 		else if (arg == "--key-binds" && i + 1 < argc) key_binds_arg = argv[++i];
+		else if (arg == "--key-layout" && i + 1 < argc) key_layout_classic = a_string(argv[++i]) == "classic";
 		else if (arg == "--input-mode" && i + 1 < argc) input_kbm = std::string(argv[++i]) == "kbm";
+		else if (arg == "--gamepad" && i + 1 < argc) gamepad = atoi(argv[++i]);
+		else if (arg == "--pad-speed" && i + 1 < argc) pad_speed = atoi(argv[++i]);
+		else if (arg == "--pad-dead" && i + 1 < argc) pad_dead = atoi(argv[++i]);
+		else if (arg == "--pad-swap") pad_swap = true;
+		else if (arg == "--pad-map" && i + 1 < argc) pad_map = argv[++i];
 		else if (arg == "--edge-scroll" && i + 1 < argc) edge_scroll = atoi(argv[++i]);
 		else if (arg == "--races" && i + 1 < argc) slot_races_csv = argv[++i];
+		else if (arg == "--ums-slots" && i + 1 < argc) ums_slots_arg = argv[++i];
+		else if (arg == "--ums-races" && i + 1 < argc) ums_races_arg = argv[++i];
+		else if (arg == "--ums-local" && i + 1 < argc) ums_local_slot = atoi(argv[++i]);
 		else if (arg == "--colors" && i + 1 < argc) slot_colors_csv = argv[++i]; // per-slot player colours (render-only)
 		else if (arg == "--trigger-trace") trigger_trace = true;
 		// v0.81: same sink, different question -- which aiscript opcodes the
@@ -1025,6 +1086,7 @@ extern "C" int main(int argc, char* argv[]) {
 		else if (arg == "--sun-shadow" && i + 1 < argc) sun_shadow = atoi(argv[++i]); // directional sun shadow (0/1)
 		else if (arg == "--sun-shadow-len" && i + 1 < argc) sun_shadow_len = atoi(argv[++i]); // 0..100
 		else if (arg == "--sun-shadow-sign" && i + 1 < argc) sun_shadow_sign = atoi(argv[++i]); // +1/-1
+		else if (arg == "--scr-font" && i + 1 < argc) scr_font = atoi(argv[++i]);
 		else if (arg == "--point-lights" && i + 1 < argc) point_lights = atoi(argv[++i]); // 0/1
 		else if (arg == "--light-strength" && i + 1 < argc) light_strength = atoi(argv[++i]); // 0..200
 		else if (arg == "--hd-anim-diag") hd_anim_diag = true; // DIAG: log HD-anim load results
@@ -1041,11 +1103,55 @@ extern "C" int main(int argc, char* argv[]) {
 		else if (arg == "--version-code" && i + 1 < argc) version_code = atoi(argv[++i]);
 		else if (arg == "--autosave-at" && i + 1 < argc) autosave_frame = atoi(argv[++i]);
 		else if (arg == "--diag-selftest" && i + 1 < argc) diag_selftest = argv[++i];
+		else if (arg == "--test-trace" && i + 1 < argc) test_trace_path = argv[++i];
+		else if (arg == "--test-session" && i + 1 < argc) test_session = argv[++i];
+		else if (arg == "--seed" && i + 1 < argc) { test_seed = (uint32_t)strtoul(argv[++i], nullptr, 10); test_seed_set = true; }
+		else if (arg == "--test-frames" && i + 1 < argc) test_frames = atoi(argv[++i]);
+		else if ((arg == "--test-frame-hash" || arg == "--frame-hash") && i + 1 < argc) test_frame_hash = atoi(argv[++i]);
+		else if ((arg == "--oescript" || arg == "--script") && i + 1 < argc) oescript_path = argv[++i];
+		else if ((arg == "--test-map-sha256" || arg == "--map-sha256") && i + 1 < argc) test_map_sha_expected = argv[++i];
 		else if (replay_path.empty()) replay_path = arg;
 	}
 	if (volume < 0) volume = 0;
 	if (volume > 100) volume = 100;
-	if (trigger_trace) bwgame::trigger_trace_sink() = [](const bwgame::a_string& s) { ui::log_str(s); };
+	static bool trace_to_log;
+	trace_to_log = trigger_trace;
+	if (!test_trace_path.empty() && !net_host && net_join.empty()) {
+		auto& tt = oetest::active_trace();
+		if (!oetest::valid_trace_path(test_trace_path.c_str())) log("test: rejected trace path %s\n", test_trace_path.c_str());
+		else if (!test_session.empty() && !oetest::valid_session_id(test_session.c_str())) log("test: rejected session id\n");
+		else if (!tt.open(test_trace_path.c_str())) log("test: cannot write %s\n", test_trace_path.c_str());
+		else {
+			uint64_t map_bytes = 0;
+			std::string sha = map_path.empty() ? std::string() : oetest::sha256_file(map_path.c_str(), &map_bytes);
+			test_map_sha_loaded = sha;
+			tt.session(test_session.c_str(), "android", app_version.c_str(), version_code,
+				!map_path.empty() ? map_path.c_str() : !map_mpq.empty() ? map_mpq.c_str() : campaign_dir.c_str(), sha, map_bytes, (int)bwgame::oescript::api_version);
+			log("test: session %s -> %s\n", test_session.c_str(), test_trace_path.c_str());
+		}
+	}
+	if (oetest::active_trace().active()) {
+		bwgame::trigger_trace_sink() = [](const bwgame::a_string& s) {
+			oetest::active_trace().engine_line(s.c_str());
+			if (trace_to_log) ui::log_str(s);
+		};
+	} else if (trigger_trace) bwgame::trigger_trace_sink() = [](const bwgame::a_string& s) { ui::log_str(s); };
+	const bool test_mode = oetest::active_trace().active();
+	a_string test_result = "error";
+	a_string test_message;
+	a_string test_replay_path;
+	struct { int frame = -1; uint32_t rand = 0; uint64_t hash = 0; int units = 0; } test_end;
+	scope_exit test_end_outer;
+	if (test_mode) test_end_outer.f = [&]() {
+		oetest::active_trace().end(test_result.c_str(), test_end.frame, test_end.rand, test_end.hash, test_end.units,
+			test_message.c_str(), test_replay_path.c_str());
+	};
+	if (test_mode && !test_map_sha_expected.empty() && !oetest::sha256_equal(test_map_sha_expected, test_map_sha_loaded)) {
+		test_message = "mapSha256 mismatch: expected " + a_string(test_map_sha_expected.c_str()) + ", loaded "
+			+ (test_map_sha_loaded.empty() ? a_string("(no map file)") : a_string(test_map_sha_loaded.c_str()));
+		log("test: %s\n", test_message.c_str());
+		return 1;
+	}
 	if (diag_on) {
 		// Structured events land on the dedicated "OBDIAG" logcat tag and mirror to
 		// files/diag-session.jsonl (adb-pullable), next to openbw-log.txt.
@@ -1087,12 +1193,25 @@ extern "C" int main(int argc, char* argv[]) {
 	if (!melee) {
 		if (replay_path.empty()) replay_path = find_first_replay(data_dir + "/replays");
 		if (replay_path.empty() || !file_exists(replay_path)) {
-			SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenBW", "Nerastas replay (.rep) failas. Importuokite ji nustatymu ekrane.", nullptr);
+			ui::msg_box(SDL_MESSAGEBOX_ERROR, ui::msg_t("Replay (.rep) file not found. Import it in Settings.", "Nerastas replay (.rep) failas. Importuokite jį nustatymuose."));
 			return 1;
 		}
 	} else if (!campaign && map_mpq.empty() && !file_exists(map_path)) {
-		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenBW", "Nerastas zemelapio failas.", nullptr);
+		test_message = "map file not found";
+		if (test_mode) return 1;
+		ui::msg_box(SDL_MESSAGEBOX_ERROR, ui::msg_t("Map file not found.", "Nerastas žemėlapio failas."));
 		return 1;
+	}
+	if (melee && !campaign && map_mpq.empty()) {
+		oeprofile::manifest prof = oeprofile::check_map_file(map_path.c_str());
+		if (prof.present) log("map profile: open1161hd-extended runtime %d -> %s\n", prof.runtime, prof.playable ? "playable" : prof.reason.c_str());
+		if (!prof.playable) {
+			test_message = ("Extended map refused: " + prof.reason).c_str();
+			if (test_mode) return 1;
+			ui::msg_box(SDL_MESSAGEBOX_ERROR, ui::msg_t("This map needs a newer game (extended profile).\n\n",
+				"Šiam žemėlapiui reikia naujesnio žaidimo (išplėstinis profilis).\n\n") + prof.reason.c_str());
+			return 1;
+		}
 	}
 
 	log("OpenBW Android starting, data dir: %s\n", data_dir);
@@ -1209,6 +1328,7 @@ extern "C" int main(int argc, char* argv[]) {
 		a_string hd_ui_dir;   // v0.23: mod ui/ dir (HD cmdicons.dds.grp)
 		a_string icons_png_dir; // v0.23: mod icons/ dir (NNN.png overrides)
 		a_string hd_tileset_dir; // v0.23: mod tileset/ dir (<name>.dds.vr4)
+		oeext::registry oe_ext; // G13(2): Extended mods' new types (installed into every game below)
 		if (!mods_csv.empty()) {
 			log("mods: '%s'\n", mods_csv.c_str());
 			size_t pos = 0;
@@ -1232,6 +1352,14 @@ extern "C" int main(int argc, char* argv[]) {
 					closedir(d);
 					mod_loader.loose_dirs.insert(mod_loader.loose_dirs.begin(), loose);
 					log("mod '%s': loose data dir attached\n", id.c_str());
+				}
+				if (FILE* ef = fopen((loose + "/oe/extensions.json").c_str(), "rb")) {
+					std::string ej;
+					char eb[16384];
+					size_t en;
+					while ((en = fread(eb, 1, sizeof eb, ef)) && ej.size() < (8u << 20)) ej.append(eb, en);
+					fclose(ef);
+					oeext::add_file(oe_ext, id.c_str(), ej.data(), ej.size());
 				}
 				// v0.23: HD sprite mod - anim/main_NNN.anim (SC:R extract)
 				a_string animdir = dir + "/anim";
@@ -1260,12 +1388,76 @@ extern "C" int main(int argc, char* argv[]) {
 					log("mod '%s': HD tileset dir attached\n", id.c_str());
 				}
 			}
+			oeext::finish(oe_ext);
+			if (!oe_ext.defs.empty() || !oe_ext.errors.empty()) {
+				log("oe extensions: %d units, %d buildings, %d heroes, %d abilities\n",
+					oe_ext.count(oeext::k_unit), oe_ext.count(oeext::k_building), oe_ext.count(oeext::k_hero), oe_ext.count(oeext::k_ability));
+				for (auto& d : oe_ext.defs) log("oe extensions: %s %d %s\n", oeext::kind_name(d.kind), d.index, d.id.c_str());
+				for (auto& e : oe_ext.errors) log("oe extensions: ERROR %s\n", e.c_str());
+			}
 		}
 
 		game_player player(mod_loader);
+		const bool req_tables = player.load_requirement_tables(data_dir + "/StarCraft.exe");
+		const uint32_t req_hash = player.requirement_tables_hash();
+		if (req_tables) log("requirement tables loaded from StarCraft.exe (hash %08x)\n", (unsigned)req_hash);
 
 		main_t m(std::move(player));
 		auto& ui = m.ui;
+		{
+			// A registry with problems installs nothing: the game stays classic.
+			auto& defs = const_cast<global_state&>(*ui.st.global).ext_unit_defs;
+			oeext::to_engine<ext_unit_def>(oe_ext, defs);
+			auto& heroes = const_cast<global_state&>(*ui.st.global).ext_hero_defs;
+			oeext::to_engine_heroes<ext_hero_def>(oe_ext, heroes);
+			auto& abilities = const_cast<global_state&>(*ui.st.global).ext_ability_defs;
+			oeext::to_engine_abilities<ext_ability_def>(oe_ext, abilities);
+			if (!defs.empty()) log("oe extensions: %d new unit / building types installed\n", (int)defs.size());
+			if (!heroes.empty()) log("oe extensions: %d heroes installed\n", (int)heroes.size());
+			if (!abilities.empty()) log("oe extensions: %d abilities installed\n", (int)abilities.size());
+		}
+		scope_exit test_end_inner;
+		if (test_mode) test_end_inner.f = [&]() {
+			int units = 0;
+			uint64_t hash = oetest::state_hash(ui.st, [&](int p, const std::function<void(int, int, int, int, int)>& emit) {
+				for (const unit_t* u : ptr(ui.st.player_units[p])) {
+					++units;
+					emit((int)u->unit_type->id, u->sprite ? u->sprite->position.x : 0, u->sprite ? u->sprite->position.y : 0,
+						u->hp.raw_value, u->shield_points.raw_value);
+				}
+			}, ui.game_st.oescript.loaded ? ui.st.oes.hash() : 0);
+			if (ui.game_st.oescript.loaded) {
+				std::vector<std::pair<std::string, int>> obj;
+				for (auto& o : ui.st.oes.objectives) obj.emplace_back(o.first.c_str(), o.second);
+				std::vector<std::pair<std::string, long long>> ctr;
+				for (auto& c : ui.st.oes.counters) ctr.emplace_back(c.first.c_str(), (long long)c.second);
+				oetest::active_trace().script_state((int)ui.st.oes.frame, ui.st.oes.hash(), obj, ctr, ui.st.oes.faults, ui.st.oes.last_fault.c_str());
+			}
+			if (m.local_player >= 0) {
+				std::vector<std::tuple<std::string, std::string, int, bool>> co;
+				for (auto& o : classic_objectives::read(ui.game_st, ui.st, m.local_player))
+					co.emplace_back(o.id.c_str(), o.title.c_str(), (int)classic_objectives::state_of(o, ui.st, m.local_player), o.optional);
+				if (!co.empty()) oetest::active_trace().classic_objectives(co);
+			}
+			test_end.frame = (int)ui.st.current_frame;
+			test_end.rand = ui.st.lcg_rand_state;
+			test_end.hash = hash;
+			test_end.units = units;
+		};
+		if (test_mode && test_frame_hash > 0) m.on_sim_frame = [&]() {
+			if (ui.st.current_frame % test_frame_hash) return;
+			uint64_t hash = oetest::state_hash(ui.st, [&](int p, const std::function<void(int, int, int, int, int)>& emit) {
+				for (const unit_t* u : ptr(ui.st.player_units[p])) {
+					emit((int)u->unit_type->id, u->sprite ? u->sprite->position.x : 0, u->sprite ? u->sprite->position.y : 0,
+						u->hp.raw_value, u->shield_points.raw_value);
+				}
+			}, ui.game_st.oescript.loaded ? ui.st.oes.hash() : 0);
+			char hx[80];
+			snprintf(hx, sizeof(hx), "\"hash\":\"%016llx\",\"script\":\"%016llx\"", (unsigned long long)hash,
+				(unsigned long long)(ui.game_st.oescript.loaded ? ui.st.oes.hash() : 0));
+			oetest::active_trace().write("{\"ev\":\"frameHash\",\"f\":" + std::to_string(ui.st.current_frame) + ",\"rand\":"
+				+ std::to_string(ui.st.lcg_rand_state) + "," + hx + "}");
+		};
 
 		m.ui.load_all_image_data(mod_loader);
 
@@ -1323,8 +1515,8 @@ extern "C" int main(int argc, char* argv[]) {
 				log("bundled map extract failed: %s\n", map_mpq.c_str());
 			}
 			if (map_path.empty()) {
-				SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenBW",
-					"Nepavyko iskelti zemelapio is MPQ. Ar importuoti StarCraft.mpq / BroodWar.mpq?", nullptr);
+				ui::msg_box(SDL_MESSAGEBOX_ERROR, ui::msg_t("Could not extract the map from the MPQ. Are StarCraft.mpq / BroodWar.mpq imported?",
+					"Nepavyko išskleisti žemėlapio iš MPQ. Ar importuoti StarCraft.mpq / BroodWar.mpq?"));
 				return 1;
 			}
 		}
@@ -1497,6 +1689,7 @@ extern "C" int main(int argc, char* argv[]) {
 		ui.hd_shadow_dir = sun_shadow;        // SHADOWS: directional sun shadow (0/1)
 		ui.hd_shadow_len = sun_shadow_len;    // sun-shadow lean length 0..100
 		ui.hd_shadow_sign = sun_shadow_sign;  // sun azimuth sign +1/-1
+		ui.hd_scr_font = scr_font != 0;
 		ui.hd_point_lights = point_lights;    // SHADOWS Phase 2: dynamic point lights
 		ui.hd_light_strength = light_strength; // point-light strength 0..200
 		ui.hd_anim_diag = hd_anim_diag;       // DIAG: HD-anim load logging
@@ -1508,7 +1701,13 @@ extern "C" int main(int argc, char* argv[]) {
 		native_window::set_mouse_mode(mouse_buttons);
 		ui.kbm_mode = input_kbm;
 		ui.kbm_edge_scroll = edge_scroll != 0;
+		ui.pad_enabled = gamepad != 0;
+		ui.pad_speed = pad_speed < 25 ? 25 : (pad_speed > 300 ? 300 : pad_speed);
+		ui.pad_dead = pad_dead < 5 ? 5 : (pad_dead > 50 ? 50 : pad_dead);
+		ui.pad_swap = pad_swap;
+		if (!pad_map.empty()) ui.pad_set_map(pad_map);
 		if (input_kbm) {
+			ui.kbm_classic = key_layout_classic;
 			ui.kbm_parse_binds(key_binds_arg);
 			auto btn = [&](int a) { int c = ui.kbm_bind[(size_t)a] - native_window::event_t::mouse_key_base; return c >= 1 && c <= 5 ? c : -1; };
 			native_window::set_mouse_buttons(btn(ui.kb_mouse_select), btn(ui.kb_mouse_command), btn(ui.kb_mouse_pan));
@@ -1524,6 +1723,22 @@ extern "C" int main(int argc, char* argv[]) {
 		// Networking objects live for the whole game (referenced by the
 		// input-submit and next-frame hooks).
 		const bool net_mode = melee && (net_host || !net_join.empty());
+		// LAN Use Map Settings: the map's slots, SIDE races, units and triggers; each device
+		// takes the map slot its launcher assigned (--ums-local), in the map's order.
+		const bool net_ums = net_mode && game_mode == "ums" && !campaign;
+		// OEScript bytecode for a single-player map that does not carry it as its OESC chunk.
+		// Added to the map data (and so to the replay); LAN games only run a script the map has.
+		a_vector<uint8_t> script_obc;
+		if (!net_mode && !campaign && !map_path.empty()) {
+			a_string sp = !oescript_path.empty() ? oescript_path : map_path + ".obc";
+			if (FILE* f = fopen(sp.c_str(), "rb")) {
+				uint8_t b[16384];
+				size_t n;
+				while ((n = fread(b, 1, sizeof(b), f)) != 0) script_obc.insert(script_obc.end(), b, b + n);
+				fclose(f);
+				log("oescript: %s (%d bytes)\n", sp.c_str(), (int)script_obc.size());
+			}
+		}
 		// v0.81.004: peer-loss is decided once. Without this the check would
 		// re-fire every frame after the opponent is gone.
 		bool peer_lost_handled = false;
@@ -1580,6 +1795,7 @@ extern "C" int main(int argc, char* argv[]) {
 			} catch (...) {
 				replay_map_data = scm_data; // map was already a raw CHK
 			}
+			if (!script_obc.empty()) oescript::add_chunk(replay_map_data, script_obc.data(), script_obc.size());
 			replay_rs.map_data = replay_map_data.data();
 			replay_rs.map_data_size = replay_map_data.size();
 			replay_rs.player_name = player_name.empty() ? "Player" : player_name;
@@ -1598,6 +1814,7 @@ extern "C" int main(int argc, char* argv[]) {
 			// as they stand now, before the first frame. Computer slots add their
 			// aiscript id where they are started (replay_rs.ai_script).
 			replay_rs.has_setup = true;
+			if (mod_fp) { replay_rs.mod_fp = mod_fp; replay_rs.mods_csv = mods_csv; }
 			for (size_t i = 0; i != 12; ++i) {
 				for (size_t j = 0; j != 12; ++j) replay_rs.alliances[i][j] = (uint8_t)ui.st.alliances[i][j];
 				replay_rs.shared_vision[i] = (uint32_t)ui.st.shared_vision[i];
@@ -1624,6 +1841,7 @@ extern "C" int main(int argc, char* argv[]) {
 			// created on this load; the map is reloaded when the game
 			// starts, with the negotiated slots/races and the shared seed.
 			load_funcs.load_map_file(map_path, [&]() {
+				if (net_ums) return;   // OWNR / SIDE as the map has them
 				load_funcs.setup_info.victory_condition = 1;
 				load_funcs.setup_info.starting_units = 1;
 				load_funcs.setup_info.resource_type = 1;
@@ -1643,7 +1861,7 @@ extern "C" int main(int argc, char* argv[]) {
 						v.race = (bwgame::race_t)5;
 				}
 			});
-			log("net melee: map loaded, %s port %d\n", net_host ? "hosting on" : "joining", net_port);
+			log("net %s: map loaded, %s port %d\n", net_ums ? "ums" : "melee", net_host ? "hosting on" : "joining", net_port);
 		} else if (melee) {
 			// Game modes (v0.20): a non-melee .trg (ctf/greed/slaughter/sudden
 			// death) replaces the Melee.trg victory triggers. The engine reads
@@ -1687,6 +1905,7 @@ extern "C" int main(int argc, char* argv[]) {
 					mod_loader(campaign_chk, chk_path);
 					log("campaign: %s (%d bytes)\n", campaign_dir.c_str(), (int)campaign_chk.size());
 				}
+				ums_slot_result ums_slots;
 				auto ums_setup = [&]() {
 					{
 						a_string ownr = "ums: OWNR controllers:";
@@ -1697,41 +1916,122 @@ extern "C" int main(int argc, char* argv[]) {
 						}
 						log("%s\n", ownr.c_str());
 					}
-					// Some maps pre-set the human slot as "occupied" instead of
-					// "open"; accept either, preferring an already-occupied one.
-					for (auto& v : ui.st.players) {
-						size_t index = (size_t)(&v - ui.st.players.data());
-						if (index >= 8) continue;
-						if (v.controller == player_t::controller_occupied && chosen_local < 0) {
-							chosen_local = (int)index;
-							active_slots.push_back(index);
-						}
+					// Seeded first: random lobby races draw from it.
+					ui.st.lcg_rand_state = test_seed_set ? test_seed
+						: (uint32_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+					ums_slot_plan plan;
+					if (campaign) {
+						// campaign missions: one human, no lobby (vanilla single player)
+						plan.kind.fill('x');
+						plan.melee_units = false;
+					} else {
+						ums_slot_plan_parse_kinds(plan, ums_slots_arg);
+						ums_slot_plan_parse_races(plan, ums_races_arg);
 					}
-					for (auto& v : ui.st.players) {
-						size_t index = (size_t)(&v - ui.st.players.data());
-						if (index >= 8) continue;
-						if (v.controller == player_t::controller_open) {
-							if (chosen_local < 0) {
-								chosen_local = (int)index;
-								v.controller = player_t::controller_occupied;
-								active_slots.push_back(index);
-							} else {
-								v.controller = player_t::controller_closed;
-							}
-						} else if (v.controller == player_t::controller_computer) {
-							// Providing setup_f skips the engine's own flip to
-							// computer_game, so do it here — triggers and the
-							// aiscript VM only run for computer_game players.
-							v.controller = player_t::controller_computer_game;
-							if (chosen_enemy < 0) chosen_enemy = (int)index;
-							active_slots.push_back(index);
-						}
-					}
+					plan.local_race = local_race;
+					if (!campaign) plan.local_slot = ums_local_slot;
+					ui.st.game->qol.ums_unit_properties = !campaign;   // recorded (qol bit8)
+					ums_slots = ums_apply_slots(ui.st, load_funcs.setup_info, plan);
+					chosen_local = ums_slots.local;
+					chosen_enemy = ums_slots.first_enemy;
+					for (size_t i : ums_slots.active) active_slots.push_back(i);
+					for (size_t i = 0; i != 8; ++i) if (ums_slots.random_race[i]) ui.loading_slot_random[i] = true;
 					if (chosen_local < 0) error("UMS: map has no open human slot");
 					if (chosen_enemy < 0) chosen_enemy = chosen_local;
-					ui.st.lcg_rand_state = (uint32_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
 					replay_rs.random_seed = ui.st.lcg_rand_state;
-					// setup_info stays at defaults -> use_map_settings = true.
+					// setup_info otherwise stays at defaults -> use_map_settings = true.
+				};
+				// v0.26: mission briefing from the CHK MBRF chunk. Same
+				// 2400-byte trigger records as TRIG; actions play as a
+				// sequential slideshow before frame 0.
+				auto setup_briefing = [&](const a_vector<uint8_t>& chk) {
+					auto chk_string = [&](uint32_t index) -> a_string {
+						if (!index) return "";
+						size_t pos = 0;
+						while (pos + 8 <= chk.size()) {
+							uint32_t tag;
+							int32_t len;
+							memcpy(&tag, chk.data() + pos, 4);
+							memcpy(&len, chk.data() + pos + 4, 4);
+							pos += 8;
+							if (memcmp(&tag, "STR ", 4) == 0 && len > 2) {
+								const uint8_t* s = chk.data() + pos;
+								uint16_t count;
+								memcpy(&count, s, 2);
+								if (index > count) return "";
+								uint16_t off;
+								memcpy(&off, s + index * 2, 2);
+								if (off >= (uint32_t)len) return "";
+								a_string r;
+								for (size_t i = off; i < (size_t)len && s[i]; ++i) r += (char)s[i];
+								return r;
+							}
+							pos += len;
+						}
+						return "";
+					};
+					int local_force = chosen_local < 12 ? ui.st.players[chosen_local].force : 0;
+					size_t pos = 0;
+					while (pos + 8 <= chk.size()) {
+						uint32_t tag;
+						int32_t len;
+						memcpy(&tag, chk.data() + pos, 4);
+						memcpy(&len, chk.data() + pos + 4, 4);
+						pos += 8;
+						if (memcmp(&tag, "MBRF", 4) == 0) {
+							int nt = len / 2400;
+							for (int ti = 0; ti != nt; ++ti) {
+								const uint8_t* t = chk.data() + pos + (size_t)ti * 2400;
+								const uint8_t* en = t + 320 + 64 * 32 + 4;
+								if (!en[chosen_local] && !en[17] && !en[18 + local_force]) continue;
+								for (int ai = 0; ai != 64; ++ai) {
+									const uint8_t* a = t + 320 + ai * 32;
+									uint8_t type = a[26];
+									if (!type) break;
+									uint32_t str, wav, time_ms, slot;
+									uint16_t unit;
+									memcpy(&str, a + 4, 4);
+									memcpy(&wav, a + 8, 4);
+									memcpy(&time_ms, a + 12, 4);
+									memcpy(&slot, a + 16, 4); // player/group field = portrait WINDOW slot (0-3)
+									memcpy(&unit, a + 24, 2);
+									bwgame::ui_functions::briefing_action_t ba;
+									ba.type = type;
+									ba.time_ms = (int)time_ms;
+									ba.unit = unit;
+									ba.slot = (int)slot;
+									if (str) ba.text = chk_string(str);
+									if (wav) ba.wav = chk_string(wav);
+									ui.briefing_actions.push_back(std::move(ba));
+								}
+							}
+						}
+						pos += len;
+					}
+					{
+						// Which action types this map's briefing actually
+						// uses. Recorded because a whole class of them
+						// (type 8, Transmission) was silently unhandled and
+						// nothing surfaced that -- the briefing just had no
+						// dialogue.
+						int counts[16] = {};
+						for (auto& a2 : ui.briefing_actions)
+							if (a2.type >= 0 && a2.type < 16) ++counts[a2.type];
+						a_string s;
+						for (int k = 0; k != 16; ++k)
+							if (counts[k]) s += format("t%d=%d ", k, counts[k]);
+						log("briefing action types: %s\n", s);
+					}
+					if (!ui.briefing_actions.empty()) {
+						ui.briefing_active = true;
+						ui.briefing_reset_cells(); // Faze 4.7: fresh speaker-cell assignment
+						// Faze 6: hold the briefing until the initial loading/prewarm
+						// completes, so it plays start-to-finish AFTER the loading
+						// screen instead of streaming (and fast-forwarding through its
+						// wall-clock waits) underneath it.
+						ui.briefing_hold = true;
+						log("briefing: %d actions\n", (int)ui.briefing_actions.size());
+					}
 				};
 				if (campaign) {
 					m.campaign_dir = campaign_dir;
@@ -1739,98 +2039,7 @@ extern "C" int main(int argc, char* argv[]) {
 					ui.loading_campaign_dir = campaign_dir; // loading screen: show the mission's real title
 					load_funcs.load_map_data(campaign_chk.data(), campaign_chk.size(), ums_setup);
 					ui.map_data_prefix = campaign_dir + "/"; // trigger WAVs: staredit/wav/... under the mission dir
-					// v0.26: mission briefing from the CHK MBRF chunk. Same
-					// 2400-byte trigger records as TRIG; actions play as a
-					// sequential slideshow before frame 0.
-					{
-						auto chk_string = [&](uint32_t index) -> a_string {
-							if (!index) return "";
-							size_t pos = 0;
-							while (pos + 8 <= campaign_chk.size()) {
-								uint32_t tag;
-								int32_t len;
-								memcpy(&tag, campaign_chk.data() + pos, 4);
-								memcpy(&len, campaign_chk.data() + pos + 4, 4);
-								pos += 8;
-								if (memcmp(&tag, "STR ", 4) == 0 && len > 2) {
-									const uint8_t* s = campaign_chk.data() + pos;
-									uint16_t count;
-									memcpy(&count, s, 2);
-									if (index > count) return "";
-									uint16_t off;
-									memcpy(&off, s + index * 2, 2);
-									if (off >= (uint32_t)len) return "";
-									a_string r;
-									for (size_t i = off; i < (size_t)len && s[i]; ++i) r += (char)s[i];
-									return r;
-								}
-								pos += len;
-							}
-							return "";
-						};
-						int local_force = chosen_local < 12 ? ui.st.players[chosen_local].force : 0;
-						size_t pos = 0;
-						while (pos + 8 <= campaign_chk.size()) {
-							uint32_t tag;
-							int32_t len;
-							memcpy(&tag, campaign_chk.data() + pos, 4);
-							memcpy(&len, campaign_chk.data() + pos + 4, 4);
-							pos += 8;
-							if (memcmp(&tag, "MBRF", 4) == 0) {
-								int nt = len / 2400;
-								for (int ti = 0; ti != nt; ++ti) {
-									const uint8_t* t = campaign_chk.data() + pos + (size_t)ti * 2400;
-									const uint8_t* en = t + 320 + 64 * 32 + 4;
-									if (!en[chosen_local] && !en[17] && !en[18 + local_force]) continue;
-									for (int ai = 0; ai != 64; ++ai) {
-										const uint8_t* a = t + 320 + ai * 32;
-										uint8_t type = a[26];
-										if (!type) break;
-										uint32_t str, wav, time_ms, slot;
-										uint16_t unit;
-										memcpy(&str, a + 4, 4);
-										memcpy(&wav, a + 8, 4);
-										memcpy(&time_ms, a + 12, 4);
-										memcpy(&slot, a + 16, 4); // player/group field = portrait WINDOW slot (0-3)
-										memcpy(&unit, a + 24, 2);
-										bwgame::ui_functions::briefing_action_t ba;
-										ba.type = type;
-										ba.time_ms = (int)time_ms;
-										ba.unit = unit;
-										ba.slot = (int)slot;
-										if (str) ba.text = chk_string(str);
-										if (wav) ba.wav = chk_string(wav);
-										ui.briefing_actions.push_back(std::move(ba));
-									}
-								}
-							}
-							pos += len;
-						}
-						{
-							// Which action types this map's briefing actually
-							// uses. Recorded because a whole class of them
-							// (type 8, Transmission) was silently unhandled and
-							// nothing surfaced that -- the briefing just had no
-							// dialogue.
-							int counts[16] = {};
-							for (auto& a2 : ui.briefing_actions)
-								if (a2.type >= 0 && a2.type < 16) ++counts[a2.type];
-							a_string s;
-							for (int k = 0; k != 16; ++k)
-								if (counts[k]) s += format("t%d=%d ", k, counts[k]);
-							log("briefing action types: %s\n", s);
-						}
-						if (!ui.briefing_actions.empty()) {
-							ui.briefing_active = true;
-							ui.briefing_reset_cells(); // Faze 4.7: fresh speaker-cell assignment
-							// Faze 6: hold the briefing until the initial loading/prewarm
-							// completes, so it plays start-to-finish AFTER the loading
-							// screen instead of streaming (and fast-forwarding through its
-							// wall-clock waits) underneath it.
-							ui.briefing_hold = true;
-							log("briefing: %d actions\n", (int)ui.briefing_actions.size());
-						}
-					}
+					setup_briefing(campaign_chk);
 					// v0.26: campaign intro cinematic before the first mission's
 					// briefing (vanilla campaigns: smk/<race>1.smk).
 					{
@@ -1856,7 +2065,23 @@ extern "C" int main(int argc, char* argv[]) {
 						}
 					}
 				} else {
-					load_funcs.load_map_file(map_path, ums_setup);
+					// load_map_file, keeping the CHK bytes for the briefing
+					a_vector<uint8_t> map_chk;
+					{
+						data_loading::mpq_file<> map_archive(map_path);
+						map_archive(map_chk, "staredit/scenario.chk");
+					}
+					if (!script_obc.empty()) oescript::add_chunk(map_chk, script_obc.data(), script_obc.size());
+					load_funcs.load_map_data(map_chk.data(), map_chk.size(), ums_setup);
+					setup_briefing(map_chk);
+				}
+				{
+					auto ai = ums_start_lobby_ai(ui, ui.st, load_funcs.setup_info, ums_slots);
+					for (size_t i = 0; i != 8; ++i) {
+						if (!ai[i]) continue;
+						replay_rs.ai_script[i] = ai[i];   // playback restarts it (trailer v2)
+						log("ums: lobby computer slot %d plays melee AI 0x%08x\n", (int)i, ai[i]);
+					}
 				}
 				m.live_mode = true;
 				m.local_player = chosen_local;
@@ -1872,6 +2097,8 @@ extern "C" int main(int argc, char* argv[]) {
 				// concern; the LAN path stays gated through net.smart_rally.
 				ui.smart_rally = true;
 				ui.st.game->qol.smart_rally = true;   // v1.0.2: recorded (qol bit7), so playback runs it too
+				ui.st.game->qol.trigger_pause = true;   // single player only (qol bit10)
+				ui.st.game->qol.eud_requirements = req_tables;   // recorded (qol bit12)
 				if (!campaign) ui.map_mpq_path = map_path;
 				if (!campaign) ui.loading_map_label = !map_mpq.empty() ? map_mpq : map_path; // loading screen map name
 				for (size_t i = 0; i != 12; ++i) ui.action_st.player_id[i] = (int)i;
@@ -1892,7 +2119,18 @@ extern "C" int main(int argc, char* argv[]) {
 			// starting units) is built; see query_bot_race.
 			const int bot_race = (!bot_path.empty() && !net_host && net_join.empty())
 					? query_bot_race(bot_path) : -1;
-			load_funcs.load_map_file(map_path, [&]() {
+			auto load_melee_map = [&](std::function<void()> setup) {
+				if (script_obc.empty()) {
+					load_funcs.load_map_file(map_path, std::move(setup));
+					return;
+				}
+				a_vector<uint8_t> map_chk;
+				data_loading::mpq_file<> map_archive(map_path);
+				map_archive(map_chk, "staredit/scenario.chk");
+				oescript::add_chunk(map_chk, script_obc.data(), script_obc.size());
+				load_funcs.load_map_data(map_chk.data(), map_chk.size(), std::move(setup));
+			};
+			load_melee_map([&]() {
 				bwgame::static_vector<size_t, 12> available;
 				for (auto& v : ui.st.players) {
 					size_t index = (size_t)(&v - ui.st.players.data());
@@ -1905,8 +2143,9 @@ extern "C" int main(int argc, char* argv[]) {
 				}
 				if (available.size() < 2) error("map has fewer than 2 player slots");
 				// Single-player melee is not networked, so determinism does
-				// not matter; seed from the clock.
-				ui.st.lcg_rand_state = (uint32_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+				// not matter; seed from the clock (or --seed for a repeatable test).
+				ui.st.lcg_rand_state = test_seed_set ? test_seed
+					: (uint32_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
 				// Activate up to player_count of the map's slots. The local player
 				// plays; the extra slots are opponents (passive until AI/LAN — a
 				// sandbox that exercises the FFA/Teams alliance + vision machinery).
@@ -2040,6 +2279,7 @@ extern "C" int main(int argc, char* argv[]) {
 			}
 			ui.smart_rally = true; // melee: rally-to-resource gathers, rally-to-enemy attacks
 			ui.st.game->qol.smart_rally = true;   // v1.0.2: recorded (qol bit7), so playback runs it too
+			ui.st.game->qol.eud_requirements = req_tables;   // recorded (qol bit12)
 			// Action routing for direct action_* calls uses the owner index
 			// directly, but set player_id so any raw-action path also works.
 			for (size_t i = 0; i != 12; ++i) ui.action_st.player_id[i] = (int)i;
@@ -2061,6 +2301,18 @@ extern "C" int main(int argc, char* argv[]) {
 			// Timeline marks + the Economy tab: scan the whole replay on a worker
 			// thread, on its own copy of the frame-0 state (ui.h replay_scanner).
 			ui.replay_scan_start();
+			if (ui.replay_st.mod_fp != mod_fp) {
+				char fa[24], fb[24];
+				snprintf(fa, sizeof(fa), "%016llx", (unsigned long long)ui.replay_st.mod_fp);
+				snprintf(fb, sizeof(fb), "%016llx", (unsigned long long)mod_fp);
+				log("replay mods differ: recorded %s '%s', active %s '%s'\n", fa, ui.replay_st.mods_csv.c_str(), fb, mods_csv.c_str());
+				a_string no_mods = ui::msg_t("no mods", "be modų");
+				a_string msg = ui::msg_t("This replay was recorded with different game data (mods), so it may go out of sync.\n\n",
+					"Šis replay įrašytas su kitais žaidimo duomenimis (modais), todėl gali išsiskirti.\n\n");
+				msg += ui::msg_t("Recorded: ", "Įrašyta: ") + (ui.replay_st.mod_fp ? ui.replay_st.mods_csv + " (" + a_string(fa) + ")" : no_mods) + "\n";
+				msg += ui::msg_t("Now: ", "Dabar: ") + (mod_fp ? mods_csv + " (" + a_string(fb) + ")" : no_mods);
+				ui::msg_box(SDL_MESSAGEBOX_WARNING, msg);
+			}
 			if (ui.replay_st.qol_bits)
 				log("SCBW2 qol restored from replay trailer: bits=%u (multiselect=%d workerrally=%d)\n",
 				    (unsigned)ui.replay_st.qol_bits, (int)ui.st.game->qol.multi_building_select, (int)ui.st.game->qol.worker_rally_split);
@@ -2078,10 +2330,13 @@ extern "C" int main(int argc, char* argv[]) {
 			// decisions are not in the file.
 			for (size_t i = 0; i != 8 && !ui.replay_st.has_setup; ++i) {
 				if (ui.st.players[i].controller == player_t::controller_computer_game) {
-					SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenBW",
-						"Sis replay yra zaidimo pries kompiuteri irasas.\n"
-						"AI veiksmai replay faile nesaugomi, o OpenBW AI simuliuoti negali,\n"
-						"todel toks replay neatkuriamas. Veikia zmogus-pries-zmogu replay.", nullptr);
+					ui::msg_box(SDL_MESSAGEBOX_ERROR, ui::msg_t(
+						"This replay is of a game against the computer.\n"
+						"The replay file does not store the computer's actions and OpenBW cannot simulate them,\n"
+						"so this replay cannot be played back. Replays of games between people work.",
+						"Šis replay yra žaidimo prieš kompiuterį įrašas.\n"
+						"Kompiuterio veiksmai replay faile nesaugomi, o OpenBW jų simuliuoti negali,\n"
+						"todėl toks replay neatkuriamas. Veikia žmonių tarpusavio žaidimų replay."));
 					return 1;
 				}
 			}
@@ -2190,13 +2445,15 @@ extern "C" int main(int argc, char* argv[]) {
 			ui.loading_map_label = !map_mpq.empty() ? map_mpq : map_path;
 			ui.loading_local_color = player_color;
 			sync_st.setup_info = &load_funcs.setup_info;
-			sync_st.game_type_melee = true;
+			sync_st.game_type_melee = !net_ums;
 			// task 1: the HOST negotiates the SCBW2 house-rules. Its --qol bitmask is
 			// broadcast with the start-game message so every peer adopts the identical
 			// config (see sync.h send_start_game). Only the host's value is sent; a
 			// joiner's local qol_bits is ignored so the session always runs the host's
 			// rules. Determinism holds because all clients apply the SAME bitmask.
 			sync_st.host_qol = (uint32_t)qol_bits;
+			sync_st.local_req_hash = req_hash;   // the host turns qol bit12 on only if every peer's tables match
+			sync_st.host_mod_fp = net_host ? mod_fp : 0;
 			net.set_local_client_name(!player_name.empty() ? player_name : (net_host ? "host" : "guest"));
 			udp_responder discovery;
 			if (net_host) {
@@ -2335,6 +2592,19 @@ extern "C" int main(int argc, char* argv[]) {
 					}
 					return 0;
 				}
+				if (!net_host && sync_st.lobby_info_seen && sync_st.lobby_mod_fp != mod_fp) {
+					log("net lobby: mod fingerprint differs (host %016llx, local %016llx)\n",
+						(unsigned long long)sync_st.lobby_mod_fp, (unsigned long long)mod_fp);
+					discovery.close();
+					net.leave_game(server);
+					ui.lobby_status = "MODAI SKIRIASI NUO HOSTO - SUVIENODINKITE MODUS";
+					auto until = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+					while (std::chrono::steady_clock::now() < until && !ui.window_closed) {
+						ui.update();
+						std::this_thread::sleep_for(std::chrono::milliseconds(42));
+					}
+					return 0;
+				}
 				auto* lc = sync_st.local_client;
 				if (lc->player_slot == -1) {
 					// A new client's id_client_uid resets every slot to -1 and every
@@ -2343,12 +2613,19 @@ extern "C" int main(int argc, char* argv[]) {
 					// race. Without this only the last-joined player kept their race
 					// (the host's got knocked back to random).
 					sent_race = false;
-					for (int i = 0; i != 8; ++i) {
-						if (ui.st.players[i].controller == player_t::controller_open) {
-							net.switch_to_slot(server, i);
-							break;
+					if (net_ums && ums_local_slot >= 0 && ums_local_slot < 8
+							&& ui.st.players[ums_local_slot].controller == player_t::controller_open) {
+						net.switch_to_slot(server, ums_local_slot);
+					} else {
+						for (int i = 0; i != 8; ++i) {
+							if (ui.st.players[i].controller == player_t::controller_open) {
+								net.switch_to_slot(server, i);
+								break;
+							}
 						}
 					}
+				} else if (net_ums && (int)sync_st.initial_slot_races[lc->player_slot] != 5) {
+					// the map fixes this slot's race: nothing to send
 				} else if (!sent_race) {
 					if (local_race >= 0 && local_race <= 2) net.set_local_client_race(server, (race_t)local_race);
 					sent_race = true;
@@ -2431,10 +2708,15 @@ extern "C" int main(int argc, char* argv[]) {
 			reload_funcs.load_map_file(map_path, [&]() {
 				ui.st.players = players;
 				ui.st.lcg_rand_state = seed;
+				if (net_ums) {
+					// Use Map Settings (setup_info stays at its defaults); unit properties as in SP UMS
+					ui.st.game->qol.ums_unit_properties = true;   // recorded (qol bit8)
+				} else {
 				reload_funcs.setup_info.victory_condition = 1;
 				reload_funcs.setup_info.starting_units = 1;
 				reload_funcs.setup_info.resource_type = 1;
 				reload_funcs.setup_info.starting_minerals = 50;
+				}
 				// task 1: apply the HOST-negotiated SCBW2 house-rules. start_game_qol
 				// was broadcast identically to every peer (sync.h), so all clients set
 				// the SAME game_state.qol here -> lockstep-deterministic. The reload
@@ -2460,13 +2742,22 @@ extern "C" int main(int argc, char* argv[]) {
 				q.mbs_train             = (nq >> 2) & 1;
 				q.unlimited_selection   = (nq >> 3) & 1;
 				q.smart_cast            = (nq >> 4) & 1;
+				q.eud_requirements      = ((sync_st.start_game_qol >> 12) & 1) && req_tables;
 			});
 			if (sync_st.start_game_qol)
 				log("SCBW2 qol negotiated over LAN: host bits=%u\n", (unsigned)sync_st.start_game_qol);
 			// FFA alliances (each occupied slot its own team). Deterministic and
 			// identical on every client, so no team config needs to be synced.
 			// Team play over LAN is a follow-up (needs the team map synced).
-			apply_team_alliances(ui.st, active_slots, parse_teams(a_string()));
+			if (!net_ums) apply_team_alliances(ui.st, active_slots, parse_teams(a_string()));
+			else {
+				m.ums_mode = true;   // victory and defeat come from the map's triggers
+				log("net ums: local slot %d, races%s\n", local_slot, [&]() {
+					a_string r;
+					for (size_t i = 0; i != 8; ++i) r += format(" %d/%d", (int)ui.st.players[i].controller, (int)ui.st.players[i].race);
+					return r;
+				}().c_str());
+			}
 
 			m.live_mode = true;
 			m.local_player = local_slot;
@@ -2486,7 +2777,14 @@ extern "C" int main(int argc, char* argv[]) {
 			// v0.52: when a peer leaves this LAN melee, hand their units to the
 			// aiscript AI instead of neutralizing them (only fires when the
 			// local sim is the sole remaining human - see actions.h).
-			net.ai_takeover_on_leave = true;
+			net.ai_takeover_on_leave = !net_ums;
+			net.on_rejected_action = [&](int slot, int reason, int opcode, size_t size) {
+				if (bwgame::diag::enabled())
+					bwgame::diag::emit((long)ui.st.current_frame, "net", bwgame::diag::Sev::warn, "LAN_ACTION_REJECTED",
+						"peer action dropped by the command whitelist",
+						"\"slot\":" + std::to_string(slot) + ",\"reason\":" + std::to_string(reason) +
+						",\"opcode\":" + std::to_string(opcode) + ",\"size\":" + std::to_string(size));
+			};
 			for (size_t i = 0; i != 12; ++i) ui.action_st.player_id[i] = (int)i;
 
 			// LAN recording: the reload above restored exactly the players +
@@ -2548,7 +2846,7 @@ extern "C" int main(int argc, char* argv[]) {
 			// Save/load submilestone 1: campaign vs single-player saves live in
 			// separate slot namespaces (cslotN vs slotN) so the pause-menu Save/Load
 			// never crosses them.
-			ui.is_campaign_game = campaign;
+			ui.is_campaign_game = campaign || !oec_mission.empty();
 			ui.save_engine_version = (uint32_t)version_code;
 			ui.save_map_id = data_loading::crc32_t()((const uint8_t*)map_ref.data(), map_ref.size());
 			ui.save_map_name = map_disp;
@@ -2571,6 +2869,15 @@ extern "C" int main(int argc, char* argv[]) {
 			// with the same args, so applying the blob now restores the exact saved
 			// state onto the live st (never rebinding st, so the bound game_st/
 			// global_st refs stay valid). A loaded game does not record a replay.
+			if (!load_savefile.empty() && mod_fp_now_given && mod_fp != mod_fp_now) {
+				log("save load REJECTED: mods changed (save %016llx, now %016llx)\n", (unsigned long long)mod_fp, (unsigned long long)mod_fp_now);
+				ui::msg_box(SDL_MESSAGEBOX_ERROR, ui::msg_t(
+					"This saved game was made with a different version of the mods (their game data changed).\n"
+					"Turn on the same mods the game was saved with.",
+					"Išsaugotas žaidimas sukurtas su kita modų versija (pasikeitė modų žaidimo duomenys).\n"
+					"Įjunkite tuos pačius modus, su kuriais žaidimas buvo išsaugotas."));
+				return 1;
+			}
 			if (!load_savefile.empty()) {
 				a_vector<uint8_t> buf;
 				FILE* lf = fopen(load_savefile.c_str(), "rb");
@@ -2628,11 +2935,20 @@ extern "C" int main(int argc, char* argv[]) {
 					auto& q = ui.st.game->qol;
 					replay_rs.qol_bits = (q.multi_building_select ? 1u : 0u) | (q.group_rally ? 2u : 0u)
 						| (q.mbs_train ? 4u : 0u) | (q.unlimited_selection ? 8u : 0u) | (q.smart_cast ? 16u : 0u)
-						| (q.auto_worker ? 32u : 0u) | (q.worker_rally_split ? 64u : 0u) | (q.smart_rally ? 128u : 0u);
+						| (q.auto_worker ? 32u : 0u) | (q.worker_rally_split ? 64u : 0u) | (q.smart_rally ? 128u : 0u)
+						| (q.ums_unit_properties ? 256u : 0u) | (ui.st.game->oescript.loaded ? 512u : 0u)
+						| (q.trigger_pause ? 1024u : 0u) | 2048u   // bit11: game-second trigger timers
+						| (q.eud_requirements ? 4096u : 0u);
 				}
-				a_string path = data_dir + "/replays/LastGame.rep";
+				// An editor test keeps the player's LastGame.rep and writes its replay next to
+				// the trace instead, where the editor can read it (files/ is private to this app).
+				a_string path = test_mode ? test_trace_path.substr(0, test_trace_path.size() - strlen(".oetrace.jsonl")) + ".rep"
+					: data_dir + "/replays/LastGame.rep";
+				// only a replay import used to create the folder: a fresh install never saved one
+				if (!test_mode) ::mkdir((data_dir + "/replays").c_str(), 0770);
 				data_loading::file_writer<> w(path);
 				replay_rsf.save_replay((int)ui.st.current_frame, w);
+				if (test_mode) test_replay_path = path;
 				// the end state, so a playback of this file can be checked against the game
 				// (`aidump replay` prints the same two numbers)
 				int live_units = 0;
@@ -2654,6 +2970,12 @@ extern "C" int main(int argc, char* argv[]) {
 		// timing the Faze 4.7 prewarm fix uncovered. Defer it (like test_cinematic)
 		// and play it on the first iteration BEFORE prewarm/briefing, so the order
 		// stays cinematic -> loading -> briefing -> start with no briefing flash.
+		if (test_mode) {
+			oetest::active_trace().loaded(game_mode.c_str(), replay_rs.random_seed, m.local_player,
+				(int)ui.game_st.map_tile_width, (int)ui.game_st.map_tile_height, (int)ui.game_st.triggers.size());
+			test_result = "quit";
+			if (test_frames >= 0) m.stop_frame = test_frames;
+		}
 		bool intro_cine_pending = !m.intro_cinematic.empty();
 		a_string intro_cine = m.intro_cinematic;
 		m.intro_cinematic.clear();
@@ -2678,6 +3000,15 @@ extern "C" int main(int argc, char* argv[]) {
 			// v0.86 test hook: --autosave-at <frame> writes slot 1 once the sim
 			// reaches that frame, so the disk save + cross-session --load path can
 			// be validated on-device without touching the in-game pause menu.
+			if (test_mode && !ui.briefing_active && ui.st.current_frame > 0) {
+				oetest::active_trace().game_start((int)ui.st.current_frame);
+				if (test_frames >= 0 && (int)ui.st.current_frame >= test_frames) {
+					log("test: reached frame %d\n", test_frames);
+					test_result = "timeout";
+					save_recorded_replay();
+					return 0;
+				}
+			}
 			if (autosave_frame >= 0 && !ui.briefing_active && (int)ui.st.current_frame >= autosave_frame) {
 				bool ok = ui.disk_save(1);
 				log("autosave-at %d: slot 1 %s (%s)\n", autosave_frame, ok ? "written" : "FAILED",
@@ -2764,10 +3095,25 @@ extern "C" int main(int argc, char* argv[]) {
 			if (m.game_over && !ui.end_dialog_done && !ui.window_closed) continue;
 			if (m.game_over) {
 				log("game over: %s\n", m.game_won ? "victory" : "defeat");
+				// Trigger action 56 (Draw) leaves every active player at victory_state 5.
+				const bool drawn = m.game_won && m.local_player >= 0 && m.local_player < 8
+					&& ui.st.players[m.local_player].victory_state == 5;
+				test_result = drawn ? "draw" : m.game_won ? "victory" : "defeat";
 				// v0.31: melee/LAN match result for profile statistics. Campaign
 				// wins are tracked separately (campaign-next.txt) and excluded.
 				// The launcher reads this on resume and updates per-profile stats.
-				if (!campaign) {
+				// An editor test session is not a played game: no profile stats, no score screen.
+				// G11: the launcher follows the .oecampaign edges from this result.
+				if (!oec_mission.empty() && !test_mode) {
+					a_string opath = data_dir + "/oec-result.txt";
+					FILE* of = fopen(opath.c_str(), "wb");
+					if (of) {
+						fprintf(of, "%s\n%s\n", oec_mission.c_str(), m.game_won ? "victory" : "defeat");
+						fclose(of);
+					}
+					log("oecampaign: %s -> %s\n", oec_mission.c_str(), m.game_won ? "victory" : "defeat");
+				}
+				if (!campaign && oec_mission.empty() && !test_mode) {
 					int lp = m.local_player;
 					int race = (lp >= 0 && lp < 12) ? (int)ui.st.players[lp].race : 5;
 					// A downloaded bot is also an AI opponent, so it counts as "ai".
@@ -2790,12 +3136,12 @@ extern "C" int main(int argc, char* argv[]) {
 				// drives the melee win/loss profile stats). One line per
 				// participating player; the same numbers the in-engine screen
 				// reads, so the two can never disagree.
-				{
+				if (!test_mode) {
 					a_string spath = data_dir + "/score.txt";
 					FILE* sf = fopen(spath.c_str(), "wb");
 					if (sf) {
 						fprintf(sf, "won=%d\nlocal=%d\nframes=%d\ncampaign=%d\n",
-							m.game_won ? 1 : 0, m.local_player, (int)ui.st.current_frame, campaign ? 1 : 0);
+							m.game_won ? 1 : 0, m.local_player, (int)ui.st.current_frame, campaign || !oec_mission.empty() ? 1 : 0);
 						for (int p = 0; p != 12; ++p) {
 							auto c = ui.st.players[p].controller;
 							if (c != player_t::controller_occupied
@@ -2856,8 +3202,7 @@ extern "C" int main(int argc, char* argv[]) {
 				// window to return through, so the player never sees the same
 				// numbers twice.
 				if (!(ui.rgba_surface && ui.wnd)) {
-					SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "OpenBW",
-						ui.L(m.game_won ? "VICTORY!" : "Defeat..."), nullptr);
+					ui::msg_box(SDL_MESSAGEBOX_INFORMATION, m.game_won ? ui::msg_t("VICTORY!", "PERGALĖ!") : ui::msg_t("Defeat...", "Pralaimėjimas..."));
 				}
 				return 0;
 			}
@@ -2890,9 +3235,8 @@ extern "C" int main(int argc, char* argv[]) {
 					log("net: peer lost mid-game, no takeover (%d humans) -- ending\n", humans);
 					save_recorded_replay();
 					net.leave_game(server);
-					SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "OpenBW",
-						ui.L("The opponent disconnected or sync was lost.\nReturning to the menu."),
-						nullptr);
+					ui::msg_box(SDL_MESSAGEBOX_INFORMATION, ui::msg_t("The opponent disconnected or sync was lost.\nReturning to the menu.",
+						"Priešininkas atsijungė arba prarasta sinchronizacija.\nGrįžtama į meniu."));
 					return 0;
 				}
 			}
@@ -2905,11 +3249,16 @@ extern "C" int main(int argc, char* argv[]) {
 		}
 	} catch (const std::exception& e) {
 		log("load failed: %s\n", e.what());
+		if (test_mode) {
+			test_result = "error";
+			test_message = e.what();
+			return 1;
+		}
 		// Neutral wording: this catch handles melee/campaign/replay alike, so it
 		// no longer claims "replay" for a campaign or map failure.
-		a_string msg = a_string("Nepavyko paleisti: ") + e.what() +
-			"\n(Replay atveju dazna priezastis - zaidimas pries kompiuteri arba UMS zemelapis.)";
-		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenBW", msg.c_str(), nullptr);
+		ui::msg_box(SDL_MESSAGEBOX_ERROR, ui::msg_t("Could not start: ", "Nepavyko paleisti: ") + e.what() +
+			ui::msg_t("\n(For a replay the usual cause is a game against the computer or a UMS map.)",
+				"\n(Replay atveju dažna priežastis — žaidimas prieš kompiuterį arba UMS žemėlapis.)"));
 		return 1;
 	}
 

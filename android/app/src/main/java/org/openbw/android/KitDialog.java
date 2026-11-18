@@ -27,6 +27,7 @@ class KitDialog {
     private final CharSequence[] btnLabel = new CharSequence[3];      // positive, negative, neutral
     private final DialogInterface.OnClickListener[] btnListener = new DialogInterface.OnClickListener[3];
     private boolean cancelable = true;
+    private int widthDp;
     private DialogInterface.OnDismissListener onDismiss;
 
     KitDialog(Activity a) {
@@ -42,6 +43,8 @@ class KitDialog {
     KitDialog setNegativeButton(CharSequence s, DialogInterface.OnClickListener l) { btnLabel[1] = s; btnListener[1] = l; return this; }
     KitDialog setNeutralButton(CharSequence s, DialogInterface.OnClickListener l) { btnLabel[2] = s; btnListener[2] = l; return this; }
     KitDialog setCancelable(boolean c) { cancelable = c; return this; }
+    /** Panel width in dp (default 560, or 760 with a custom view); capped to the screen. */
+    KitDialog setWidth(int dp) { widthDp = dp; return this; }
     KitDialog setOnDismissListener(DialogInterface.OnDismissListener l) { onDismiss = l; return this; }
 
     Dialog show() {
@@ -54,7 +57,7 @@ class KitDialog {
         final Dialog[] dref = new Dialog[1];
         LinearLayout panel = new LinearLayout(a);
         panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setBackground(kit.box(0xF205080A, Kit.STEEL));
+        panel.setBackground(kit.box(0xFF000000, Kit.LINE));
         int pad = kit.dp(kit.compact ? 14 : 20);
         panel.setPadding(pad, pad, pad, pad);
 
@@ -62,8 +65,13 @@ class KitDialog {
             TextView t = kit.text(title.toString().toUpperCase(java.util.Locale.ROOT), Kit.LABEL, kit.compact ? 15 : 17);
             t.setLetterSpacing(0.1f);
             t.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-            t.setPadding(0, 0, 0, kit.dp(10));
+            t.setPadding(0, 0, 0, kit.dp(kit.compact ? 8 : 10));
             panel.addView(t);
+            View rule = new View(a);                             // the launcher's red section divider
+            rule.setBackgroundColor(Kit.LINE);
+            LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, kit.dp(1)));
+            rl.bottomMargin = kit.dp(kit.compact ? 10 : 14);
+            panel.addView(rule, rl);
         }
         // message / items scroll inside the panel; a supplied view keeps its own layout
         LinearLayout body = new LinearLayout(a);
@@ -78,7 +86,7 @@ class KitDialog {
                 final int which = i;
                 TextView row = kit.text(String.valueOf(items[i]), Kit.TEXT, kit.compact ? 14 : 16);
                 row.setPadding(kit.dp(12), kit.dp(kit.compact ? 8 : 11), kit.dp(12), kit.dp(kit.compact ? 8 : 11));
-                row.setBackground(kit.box(0xFF0B1114, 0xFF2A3338));
+                row.setBackground(kit.box(0xFF000000, Kit.LINE));
                 row.setClickable(true);
                 row.setOnClickListener(v -> {
                     MenuAudio.play(MenuAudio.CLICK);
@@ -131,7 +139,7 @@ class KitDialog {
 
         int sw = a.getResources().getDisplayMetrics().widthPixels;
         int sh = a.getResources().getDisplayMetrics().heightPixels;
-        int w = Math.min(sw - kit.dp(32), kit.dp(view != null ? 760 : 560));
+        int w = Math.min(sw - kit.dp(32), kit.dp(widthDp > 0 ? widthDp : view != null ? 760 : 560));
         LinearLayout sizer = new LinearLayout(a);                 // caps the panel to the screen
         sizer.setOrientation(LinearLayout.VERTICAL);
         sizer.addView(panel, new LinearLayout.LayoutParams(w, ViewGroup.LayoutParams.WRAP_CONTENT));

@@ -87,6 +87,7 @@ void sdl_init() {
 		auto original_handler = signal(SIGINT, SIG_DFL);
 		if (SDL_Init(SDL_INIT_VIDEO) == 0) {
 			sdl_initialized = true;
+			if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) log("SDL game controller init failed: %s\n", SDL_GetError());
 		} else {
 			log("SDL_Init failed: %s\n", SDL_GetError());
 		}
@@ -818,6 +819,23 @@ struct window_impl {
 				e.sym = sdl_e.key.keysym.sym;
 				e.scancode = sdl_e.key.keysym.scancode;
 				if ((size_t)e.scancode < key_state.size()) key_state[e.scancode] = false;
+				return true;
+			case SDL_CONTROLLERDEVICEADDED:
+				if (SDL_IsGameController(sdl_e.cdevice.which)) SDL_GameControllerOpen(sdl_e.cdevice.which);
+				break;
+			case SDL_CONTROLLERDEVICEREMOVED:
+				if (SDL_GameController* c = SDL_GameControllerFromInstanceID(sdl_e.cdevice.which)) SDL_GameControllerClose(c);
+				e.type = event_t::type_pad_reset;
+				return true;
+			case SDL_CONTROLLERBUTTONDOWN:
+			case SDL_CONTROLLERBUTTONUP:
+				e.type = sdl_e.type == SDL_CONTROLLERBUTTONDOWN ? event_t::type_pad_button_down : event_t::type_pad_button_up;
+				e.button = sdl_e.cbutton.button;
+				return true;
+			case SDL_CONTROLLERAXISMOTION:
+				e.type = event_t::type_pad_axis;
+				e.button = sdl_e.caxis.axis;
+				e.mouse_x = sdl_e.caxis.value;
 				return true;
 			case SDL_TEXTINPUT:
 				e.type = event_t::type_text_input;

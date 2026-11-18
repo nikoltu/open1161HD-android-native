@@ -55,6 +55,7 @@ public class SetupActivity extends Activity {
     private static final int REQ_PICK_MOD = 5; // v0.26: mod .zip packages
     private static final int REQ_PICK_SCR = 6; // open1161hd: SC:R install folder (CASC source)
     private static final int REQ_PICK_MPQ_DIR = 7; // v1.0.26: folder that holds the 1.16.1 MPQs
+    private static final int REQ_PICK_OECAMPAIGN = 8; // G11: Ganymede .oecampaign bundles
     private TextView scrStatus;                 // Faze 6: green "SC:R OK" / red "no folder"
     private View scrIndicator;                  // green when an SC:R folder is set
 
@@ -100,6 +101,84 @@ public class SetupActivity extends Activity {
     // v0.56: scenario name + description ("name\ndescription"), or null on fail.
     private static native String nativeMapInfo(String mapFile);
     private static native String nativeMapInfoInternal(String gameDir, String mapPath, String scratch);
+    // 1.0.27 UMS lobby: "<scenario 0/1>;<OWNR hex x8>;<SIDE hex x8>", or null on fail.
+    private static native String nativeMapSlots(String mapFile);
+    private static native String nativeMapSlotsInternal(String gameDir, String mapPath, String scratch);
+    // G13: Extended profile; null = classic map, "ok;<rt>" or "refuse;<rt>;<kind>;<arg>;<reason>".
+    private static native String nativeMapProfile(String mapFile);
+    private static native String nativeOrigin(String[] signerDigests);
+
+    // [author, url, official?] from the native library, so a resource or dex edit does not change it.
+    String[] origin() {
+        String a = "open1161HD by nikoltu", u = "github.com/" + Updater.REPO;
+        boolean off = Updater.isReleaseSigned(this);
+        if (minimapLibOk) {
+            try {
+                String[] r = nativeOrigin(Updater.ownSignerDigests(this)).split("\n");
+                if (r.length == 3) { a = r[0]; u = r[1]; off = "1".equals(r[2]); }
+            } catch (Throwable ignored) {
+            }
+        }
+        return new String[] {a, u, off ? "1" : "0"};
+    }
+
+    // Once per installed version: a build not signed with the release key says where the original is.
+    private void noteUnofficialOnce() {
+        String[] org = origin();
+        if ("1".equals(org[2])) return;
+        int vc = versionCode();
+        if (prefs().getInt("unofficialNoted", -1) == vc) return;
+        prefs().edit().putInt("unofficialNoted", vc).apply();
+        Kit.toast(this, S.t("Originalus projektas:") + " " + org[1], Toast.LENGTH_LONG);
+    }
+
+    void openUrl(String url) {
+        try {
+            startActivity(new android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url)));
+        } catch (Exception e) {
+            Kit.toast(this, e.getMessage(), Toast.LENGTH_LONG);
+        }
+    }
+
+    /** G13: null when this game can play the map, else {title, message} in the launcher's language. */
+    static String[] extendedMapBlock(File f) {
+        if (f == null || !minimapLibOk) return null;
+        String r;
+        try { r = nativeMapProfile(f.getAbsolutePath()); } catch (Throwable t) { return null; }
+        if (r == null || r.startsWith("ok;")) return null;
+        String[] p = r.split(";", 5);
+        String kind = p.length > 2 ? p[2] : "", arg = p.length > 3 ? p[3] : "";
+        android.util.Log.i("OpenBW", "Extended map refused: " + (p.length > 4 ? p[4] : r));
+        String update = S.t("Atnaujinkite žaidimą, kad jį žaistumėte.");
+        switch (kind) {
+            case "runtime":
+                return new String[]{S.t("Reikia naujesnio žaidimo"),
+                        S.t("Šis žemėlapis sukurtas naujesnei žaidimo versijai (išplėstinio profilio versija") + " " + arg + "). " + update};
+            case "feature":
+                return new String[]{S.t("Reikia naujesnio žaidimo"),
+                        S.t("Šiam žemėlapiui reikia galimybės, kurios ši žaidimo versija dar neturi:")
+                        + (S.LT.equals(S.language()) ? " „" + arg + "“. " : " “" + arg + "”. ") + update};
+            case "newer":
+                return new String[]{S.t("Reikia naujesnio žaidimo"),
+                        S.t("Šis žemėlapis išsaugotas naujesniu išplėstinio profilio formatu, kurio ši žaidimo versija neskaito.") + " " + update};
+            default:
+                return new String[]{S.t("Žemėlapio aprašas sugadintas"),
+                        S.t("Šio žemėlapio išplėstinio profilio aprašas sugadintas arba neperskaitomas, todėl žemėlapio paleisti negalima.")
+                        + " " + S.t("Išsaugokite žemėlapį redaktoriuje iš naujo.")};
+        }
+    }
+
+    /** True (and a dialog) when the selected map file is an Extended map this game cannot play. */
+    private boolean refuseExtendedMap(File f) {
+        String[] why = extendedMapBlock(f);
+        if (why == null) return false;
+        new KitDialog(this)
+                .setTitle(why[0])
+                .setMessage(why[1])
+                .setPositiveButton(S.t("Gerai"), null)
+                .show();
+        return true;
+    }
     private final java.util.concurrent.ExecutorService minimapExec =
             java.util.concurrent.Executors.newSingleThreadExecutor();
 
@@ -487,7 +566,9 @@ public class SetupActivity extends Activity {
         // campaign-next.txt after a campaign victory. v1.0.26: recorded silently --
         // the campaign score screen offers Mission list / Restart / Continue instead
         // of the old "Mission complete" dialog.
-        String[] outcome = consumeCampaignNext();
+        String[] outcome = consumeOecResult();
+        if (outcome == null) outcome = consumeCampaignNext();
+        else new File(getExternalFilesDir(null), "campaign-next.txt").delete();
         if (!gateMode && showScoreScreenIfPending(outcome)) return;
         if (outcome != null) {
             // no score (Skip Tutorial): straight to the episode's list, next mission selected
@@ -502,7 +583,7 @@ public class SetupActivity extends Activity {
         refresh();
         returnToReplayIfPending();
         // v1.0.24: in-app update from the public fork's GitHub releases (once per start, release-signed builds only).
-        if (!gateMode) { Updater.resumePending(this); Updater.maybeAutoCheck(this); }
+        if (!gateMode) { Updater.resumePending(this); Updater.maybeAutoCheck(this); noteUnofficialOnce(); }
     }
 
     private LinearLayout listColumn(String title, LinearLayout list) {
@@ -540,6 +621,15 @@ public class SetupActivity extends Activity {
     // v0.43 Single Player page (#5): left column = controls, right = map list.
     private LinearLayout mapListMp;       // MULTIPLAYER Create map list (mirrors mapList)
     private LinearLayout playerRacesBox;  // SP per-player [name][race] rows
+    // UMS lobby (1.0.27): the selected map's slots as the native CHK reader sees them.
+    private String umsInfoFor;            // map id (MPQ path or file path) the info belongs to
+    private boolean umsScenario;          // the map plays by its own triggers
+    private int umsOes;                   // its OEScript: 0 none, 1 runs here, 2 needs a newer game
+    private int[] umsOwnr, umsSide;       // per slot 0-7 (OWNR 5 computer, 6 human; SIDE 5 user selectable)
+    private final int[] umsKind = new int[8];   // other human slots: 0 Computer (default), 1 Closed
+    private final int[] umsRace = new int[8];   // RACE_VALUES value per slot
+    private boolean umsAutoMode;          // the mode went to UMS because of the map pick
+    private LinearLayout spCountRow, modeBox;
     private int mpSub = 0;                // MULTIPLAYER sub-screen: 0 = Create, 1 = Join
     private LinearLayout mpCreateBox, mpJoinBox, mpJoinTools, mpRaceCreate, mpRaceJoin;
     private LanLobby.HostInfo mpSelHost;  // Join: the host picked in the list
@@ -576,8 +666,8 @@ public class SetupActivity extends Activity {
         Color.rgb(0x08,0x80,0x08), Color.rgb(0xFC,0xFC,0x7C), Color.rgb(0xEC,0xC4,0xB0),
         Color.rgb(0x40,0x68,0xD4), Color.rgb(0x74,0xA4,0x7C), Color.rgb(0x90,0x90,0xB8),
         Color.rgb(0xFC,0xFC,0x7C), Color.rgb(0x00,0xE4,0xFC) };
-    static final String[] PLAYER_COLOR_NAMES = { "Red","Blue","Teal","Purple","Orange","Brown","White","Yellow",
-        "Green","Pale Yellow","Tan","Azure","Pale Green","Blue Grey","Pale Yellow","Cyan" };
+    static final String[] PLAYER_COLOR_NAMES = { "Raudona","Mėlyna","Žalsvai mėlyna","Violetinė","Oranžinė","Ruda","Balta","Geltona",
+        "Žalia","Šviesiai geltona","Smėlio","Dangaus mėlyna","Šviesiai žalia","Melsvai pilka","Šviesiai geltona","Žydra" };
     static final int PLAYER_COLOR_DUPLICATE = 14;
 
     // A row of tappable colour swatches. `takenMask` bit N set = colour N is already
@@ -676,6 +766,7 @@ public class SetupActivity extends Activity {
         tlp.leftMargin = dp(10);
         cntRow.addView(teams, tlp);
         cards[0].addView(cntRow);
+        spCountRow = cntRow;
 
         // opponent: the built-in AI's four levels + the original AI as segments; other
         // bots, "no AI" and bot import behind "More"
@@ -691,9 +782,10 @@ public class SetupActivity extends Activity {
 
         // game mode
         cards[1].addView(kit.label(S.t("Režimas")));
-        cards[1].addView(kit.segmented(GAME_MODE_LABELS, indexOfGameMode(prefs().getString("gameMode", "melee")),
-                idx -> prefs().edit().putString("gameMode", GAME_MODE_VALUES[idx]).apply()),
-                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, hdp(48)));
+        modeBox = new LinearLayout(this);
+        modeBox.setOrientation(LinearLayout.VERTICAL);
+        cards[1].addView(modeBox, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, hdp(48)));
+        rebuildModeRow();
 
         // SCBW2 house rules: negotiated game rules (single player defaults them on for
         // touch comfort); the bitmask ships to the sim via the "qol" extra (qolBits()).
@@ -895,6 +987,89 @@ public class SetupActivity extends Activity {
     // bit N set = colour N is used by someone else (shown "(užimta)" and non-pickable);
     // -1 = nothing taken. `editable` false renders it read-only (a joiner viewing
     // another slot). onPick fires with the chosen index after a change.
+    // Compact palette: small swatches in two rows, the pick ringed, its name underneath;
+    // colours held by others are dimmed and not pickable.
+    private View colorPalette(int selected, int takenMask, IntSink onPick) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER_HORIZONTAL);
+        final int perRow = 8, ssz = dp(compact ? 30 : 36), gap = dp(compact ? 3 : 4);
+        LinearLayout rowV = null;
+        int shown = 0;
+        for (int i = 0; i < PLAYER_COLORS.length; i++) {
+            if (i == PLAYER_COLOR_DUPLICATE) continue;
+            if (shown++ % perRow == 0) {
+                rowV = new LinearLayout(this);
+                rowV.setOrientation(LinearLayout.HORIZONTAL);
+                box.addView(rowV);
+            }
+            final int idx = i;
+            final boolean sel = idx == selected;
+            boolean taken = takenMask >= 0 && !sel && ((takenMask >> idx) & 1) != 0;
+            View sw = new View(this);
+            LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(ssz, ssz);
+            slp.setMargins(gap, gap, gap, gap);
+            android.graphics.drawable.GradientDrawable fill = new android.graphics.drawable.GradientDrawable();
+            fill.setColor(PLAYER_COLORS[idx]);
+            fill.setCornerRadius(dp(3));
+            fill.setStroke(dp(1), 0xFF000000);
+            android.graphics.drawable.GradientDrawable ring = new android.graphics.drawable.GradientDrawable();
+            ring.setColor(0);
+            ring.setCornerRadius(dp(4));
+            ring.setStroke(dp(2), sel ? Kit.LABEL : 0);
+            android.graphics.drawable.LayerDrawable ld = new android.graphics.drawable.LayerDrawable(
+                    new android.graphics.drawable.Drawable[]{ring, fill});
+            if (sel) ld.setLayerInset(1, dp(3), dp(3), dp(3), dp(3));
+            sw.setBackground(ld);
+            sw.setAlpha(taken ? 0.25f : 1f);
+            if (!taken) sw.setOnClickListener(x -> { MenuAudio.play(MenuAudio.CLICK); onPick.accept(idx); });
+            rowV.addView(sw, slp);
+        }
+        TextView name = kit.text(S.t(PLAYER_COLOR_NAMES[selected]).toUpperCase(Locale.ROOT), Kit.TEXT2, 11);
+        name.setLetterSpacing(0.1f);
+        name.setPadding(0, dp(8), 0, 0);
+        box.addView(name);
+        return box;
+    }
+
+    // Race picker: four large portrait cards (Hydralisk, Stukov, Artanis, static for Random); the current one lit.
+    private void showRacePicker(int selected, IntSink onPick) {
+        final String[] names = raceNames();
+        final int[] portrait = {21, 93, 95, -1};
+        final int[] tint = {0xFFB46CE0, 0xFF5AA8F0, 0xFFF2C53D, Kit.TEXT2};
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        final Dialog[] dlg = new Dialog[1];
+        File gameDir = getExternalFilesDir(null);
+        int scale = Math.max(1, Math.round(dp(compact ? 110 : 140) / 56f));
+        for (int i = 0; i < names.length; i++) {
+            final int which = i;
+            final boolean sel = i == selected;
+            LinearLayout card = new LinearLayout(this);
+            card.setOrientation(LinearLayout.VERTICAL);
+            card.setGravity(Gravity.CENTER);
+            card.setPadding(dp(6), dp(6), dp(6), dp(6));
+            card.setBackground(kit.box(sel ? Kit.SEL_BG : 0xFF000000, sel ? Kit.LABEL : Kit.LINE));
+            card.setContentDescription(names[i]);
+            PortraitView pv = new PortraitView(this);
+            pv.setScale(scale);
+            pv.setBorderColor(sel ? Kit.LABEL : tint[i]);
+            pv.setPortrait(gameDir, portrait[i]);
+            card.addView(pv);
+            card.setClickable(true);
+            card.setOnClickListener(v -> {
+                MenuAudio.play(MenuAudio.CLICK);
+                onPick.accept(which);
+                if (dlg[0] != null) dlg[0].dismiss();
+            });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            if (i > 0) lp.leftMargin = dp(compact ? 6 : 8);
+            row.addView(card, lp);
+        }
+        dlg[0] = new KitDialog(this).setTitle(S.t("Rasė")).setView(row).setWidth(compact ? 600 : 720).create();
+        dlg[0].show();
+    }
+
     private View colorDropdown(int selected, int takenMask, boolean editable, IntSink onPick) {
         final int[] cur = { (selected >= 0 && selected < PLAYER_COLORS.length) ? selected : 0 };
         // The control itself is a small colour SQUARE showing the current pick.
@@ -912,40 +1087,13 @@ public class SetupActivity extends Activity {
         };
         skin.run();
         if (editable) btn.setOnClickListener(v -> {
-            // Tapping opens a palette grid (the old swatch row, now in a popup): tap a
-            // swatch to pick it; colours held by others are dimmed + non-selectable.
-            LinearLayout grid = new LinearLayout(this);
-            grid.setOrientation(LinearLayout.VERTICAL);
-            grid.setPadding(dp(18), dp(16), dp(18), dp(8));
-            grid.setGravity(Gravity.CENTER_HORIZONTAL);
             final Dialog[] dlg = new Dialog[1];
-            final int perRow = 5;
-            LinearLayout[] rowRef = { null };
-            int shown = 0;
-            for (int i = 0; i < PLAYER_COLORS.length; i++) {
-                if (i == PLAYER_COLOR_DUPLICATE) continue;
-                if (shown++ % perRow == 0) { rowRef[0] = new LinearLayout(this); rowRef[0].setOrientation(LinearLayout.HORIZONTAL); grid.addView(rowRef[0]); }
-                final int idx = i;
-                boolean taken = takenMask >= 0 && idx != cur[0] && ((takenMask >> idx) & 1) != 0;
-                View sw = new View(this);
-                int ssz = dp(48);
-                LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(ssz, ssz);
-                slp.setMargins(dp(6), dp(6), dp(6), dp(6));
-                sw.setLayoutParams(slp);
-                android.graphics.drawable.GradientDrawable sg = new android.graphics.drawable.GradientDrawable();
-                sg.setColor(PLAYER_COLORS[idx]);
-                sg.setCornerRadius(dp(7));
-                sg.setStroke(dp(idx == cur[0] ? 4 : 1), idx == cur[0] ? Color.WHITE : Color.rgb(70, 70, 80));
-                sw.setBackground(sg);
-                sw.setAlpha(taken ? 0.30f : 1f);
-                if (!taken) sw.setOnClickListener(x -> {
-                    cur[0] = idx; skin.run(); onPick.accept(idx);
-                    if (dlg[0] != null) dlg[0].dismiss();
-                });
-                rowRef[0].addView(sw);
-            }
-            dlg[0] = new KitDialog(this).setTitle(S.t("Spalva")).setView(grid)
-                    .setNegativeButton(S.t("Atšaukti"), null).create();
+            dlg[0] = new KitDialog(this).setTitle(S.t("Spalva"))
+                    .setView(colorPalette(cur[0], takenMask, idx -> {
+                        cur[0] = idx; skin.run(); onPick.accept(idx);
+                        if (dlg[0] != null) dlg[0].dismiss();
+                    }))
+                    .setWidth(compact ? 330 : 400).create();
             dlg[0].show();
         });
         return btn;
@@ -959,6 +1107,19 @@ public class SetupActivity extends Activity {
     private void rebuildPlayerRaces() {
         if (playerRacesBox == null) return;
         playerRacesBox.removeAllViews();
+        String mapId = selectedMapId();
+        if (umsOes == 2 && mapId != null && mapId.equals(umsInfoFor)) {
+            TextView w = kit.text(S.t("Šiam žemėlapiui reikia naujesnės žaidimo versijos: jo scenarijus čia neveiks."), Kit.DANGER, 12);
+            w.setPadding(0, dp(4), 0, dp(4));
+            playerRacesBox.addView(w);
+        }
+        boolean ums = isUmsLobby();
+        if (spCountRow != null) spCountRow.setVisibility(ums ? View.GONE : View.VISIBLE);
+        if (ums) {
+            buildUmsRows();
+            updateActionSummary();
+            return;
+        }
         int count = clampCount(prefs().getInt("playerCount", 2));
         boolean twoTeams = prefs().getInt("teamMode", 0) == 1;
         int half = (count + 1) / 2;
@@ -1010,13 +1171,10 @@ public class SetupActivity extends Activity {
             pv.setBorderColor(PLAYER_COLORS[idx % PLAYER_COLORS.length]);
         }));
         final String[] races = raceNames();
-        TextView raceBtn = kit.smallButton(races[raceIdx] + "  \u25BE", () -> new KitDialog(this)
-                .setItems(races, (d, which) -> {
+        TextView raceBtn = kit.smallButton(races[raceIdx] + "  \u25BE", () -> showRacePicker(raceIdx, which -> {
                     prefs().edit().putInt("spRace." + slot, RACE_VALUES[which]).apply();
                     rebuildPlayerRaces();   // the row's caption and the AI portrait follow the race
-                })
-                .setNegativeButton(S.t("Atšaukti"), null)
-                .show());
+                }));
         raceBtn.setMinWidth(dp(96));
         raceBtn.setMinimumWidth(dp(96));
         LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(40));
@@ -1028,6 +1186,154 @@ public class SetupActivity extends Activity {
         col.addView(line, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, dp(1))));
         return col;
     }
+    private void rebuildModeRow() {
+        if (modeBox == null) return;
+        modeBox.removeAllViews();
+        modeBox.addView(kit.segmented(GAME_MODE_LABELS, indexOfGameMode(prefs().getString("gameMode", "melee")), idx -> {
+            prefs().edit().putString("gameMode", GAME_MODE_VALUES[idx]).apply();
+            umsAutoMode = false;
+            rebuildPlayerRaces();
+        }), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+    }
+
+    // ---- UMS lobby (1.0.27) ----
+    private String selectedMapId() {
+        if (selectedMpqMap != null) return selectedMpqMap;
+        return selectedMap != null ? selectedMap.getAbsolutePath() : null;
+    }
+    private boolean isUmsLobby() {
+        String id = selectedMapId();
+        if (id == null || umsOwnr == null || !id.equals(umsInfoFor)) return false;
+        return "ums".equals(prefs().getString("gameMode", "melee")) || id.contains("/scenario/");
+    }
+    private int umsLocalSlot() {
+        if (umsOwnr == null) return -1;
+        for (int s = 0; s < 8; s++) if (umsOwnr[s] == 6) return s;
+        return -1;
+    }
+    // The map's OWNR/SIDE and whether it is a scenario, read off the UI thread.
+    private void loadUmsSlots(final boolean isInternal, final String mapArg) {
+        if (!minimapLibOk || mapArg == null) return;
+        final String gameDir = getExternalFilesDir(null).getAbsolutePath();
+        final String scratch = new File(getCacheDir(), "umsslots.tmp").getAbsolutePath();
+        minimapExec.execute(() -> {
+            String r = null;
+            try { r = isInternal ? nativeMapSlotsInternal(gameDir, mapArg, scratch) : nativeMapSlots(mapArg); }
+            catch (Throwable ignored) {}
+            final String fr = r;
+            ui.post(() -> applyUmsSlots(mapArg, fr));
+        });
+    }
+    private void applyUmsSlots(String mapId, String r) {
+        if (!mapId.equals(selectedMapId())) return;
+        if (r == null || r.length() < 19) { umsInfoFor = null; umsOwnr = null; rebuildPlayerRaces(); return; }
+        int[] ownr = new int[8], side = new int[8];
+        for (int s = 0; s < 8; s++) {
+            ownr[s] = Character.digit(r.charAt(2 + s), 16);
+            side[s] = Character.digit(r.charAt(11 + s), 16);
+        }
+        umsInfoFor = mapId;
+        umsScenario = r.charAt(0) == '1';
+        umsOes = r.length() >= 21 ? Character.digit(r.charAt(20), 10) : 0;
+        umsOwnr = ownr;
+        umsSide = side;
+        java.util.Arrays.fill(umsKind, 0);
+        java.util.Arrays.fill(umsRace, 5);
+        // a scenario map opens in Use Map Settings; the mode stays changeable
+        if (activeTab == TAB_SINGLE) {
+            String mode = prefs().getString("gameMode", "melee");
+            if (umsScenario && "melee".equals(mode)) {
+                prefs().edit().putString("gameMode", "ums").apply();
+                umsAutoMode = true;
+            } else if (!umsScenario && "ums".equals(mode) && umsAutoMode) {
+                prefs().edit().putString("gameMode", "melee").apply();
+                umsAutoMode = false;
+            }
+            rebuildModeRow();
+        }
+        rebuildPlayerRaces();
+    }
+    private void buildUmsRows() {
+        TextView note = kit.text(S.t("Žemėlapio slotai (Use Map Settings)").toUpperCase(Locale.ROOT), Kit.ACCENT, 11);
+        note.setLetterSpacing(0.1f);
+        note.setPadding(0, dp(4), 0, dp(2));
+        playerRacesBox.addView(note);
+        int local = umsLocalSlot();
+        boolean anyFixed = false;
+        for (int s = 0; s < 8; s++) {
+            if (umsOwnr[s] != 5 && umsOwnr[s] != 6) continue;
+            playerRacesBox.addView(umsSlotRow(s, s == local, umsOwnr[s] == 5));
+            anyFixed |= umsFixedRace(s) >= 0;
+        }
+        if (anyFixed) {
+            TextView n = kit.text(S.t("Pilkas rases nustato žemėlapis — jų pakeisti negalima."), Kit.TEXT2, 11);
+            n.setPadding(0, dp(6), 0, 0);
+            playerRacesBox.addView(n);
+        }
+    }
+    private LinearLayout umsSlotRow(final int slot, boolean local, boolean mapComputer) {
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(6), 0, dp(6));
+        LinearLayout who = new LinearLayout(this);
+        who.setOrientation(LinearLayout.VERTICAL);
+        who.setPadding(0, 0, dp(8), 0);
+        TextView name = kit.text(local ? activeProfile() : S.t("Slotas") + " " + (slot + 1), Color.WHITE, 15);
+        name.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
+        name.setSingleLine(true);
+        name.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        who.addView(name);
+        int side = umsSide[slot];
+        boolean plays = local || mapComputer || umsKind[slot] == 0;
+        boolean fixedRace = plays && side >= 0 && side <= 2;
+        String cap = local ? S.t("tu") : mapComputer ? S.t("Žemėlapio kompiuteris") : S.t("Žaidėjo slotas");
+        who.addView(kit.text(cap, Kit.TEXT2, 11));
+        row.addView(who, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        // an open slot: Computer / Closed on its own line, so the name keeps its width on a phone
+        LinearLayout seg = null;
+        if (!local && !mapComputer) {
+            seg = kit.segmented(new String[]{S.t("Kompiuteris"), S.t("Uždaryta")}, umsKind[slot], idx -> {
+                umsKind[slot] = idx;
+                rebuildPlayerRaces();
+            });
+        }
+        if (plays && (side == 5 || fixedRace)) {
+            int cur = fixedRace ? side : local ? spSlotRace(0) : umsRace[slot];
+            TextView raceBtn = raceButton(cur, fixedRace, which -> {
+                        if (local) prefs().edit().putInt("spRace.0", RACE_VALUES[which]).apply();
+                        else umsRace[slot] = RACE_VALUES[which];
+                        rebuildPlayerRaces();
+                    });
+            LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(36));
+            rlp.leftMargin = dp(8);
+            row.addView(raceBtn, rlp);
+        }
+        col.addView(row);
+        if (seg != null) {
+            LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(dp(compact ? 200 : 240), hdp(36));
+            slp.bottomMargin = dp(6);
+            col.addView(seg, slp);
+        }
+        View line = new View(this);
+        line.setBackgroundColor(Kit.LINE);
+        col.addView(line, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, dp(1))));
+        return col;
+    }
+    private void putUmsExtras(Intent i) {
+        if (!isUmsLobby()) return;
+        StringBuilder k = new StringBuilder(), rc = new StringBuilder();
+        for (int s = 0; s < 8; s++) {
+            k.append(umsKind[s] == 1 ? 'x' : 'c');
+            if (s > 0) rc.append(',');
+            rc.append(umsRace[s]);
+        }
+        i.putExtra(OpenBWActivity.EXTRA_UMS_SLOTS, k.toString());
+        i.putExtra(OpenBWActivity.EXTRA_UMS_RACES, rc.toString());
+    }
+
     private String opponentShortLabel() {
         boolean bot = prefs().getBoolean("useBot", false);
         if (spAiLevel() >= 0 || (!bot && prefs().getBoolean("vsAi", true))) return "AI";
@@ -1051,6 +1357,30 @@ public class SetupActivity extends Activity {
     }
     // Portraits in list rows: the whole multiple of the 56 px clip nearest to 44 dp.
     private int rowPortraitScale() { return Math.max(1, Math.round(dp(compact ? 32 : 44) / 56f)); }
+    // Race button for a lobby row. Locked = the map (or the campaign mission) fixes the
+    // race: greyed, not tappable, no drop-down arrow.
+    private TextView raceButton(int raceValue, boolean locked, IntSink onPick) {
+        final String[] races = raceNames();
+        final int idx = indexOfRace(raceValue);
+        TextView b = kit.smallButton(locked ? races[idx] : races[idx] + "  ▾",
+                locked ? () -> {} : () -> showRacePicker(idx, onPick));
+        if (locked) {
+            b.setOnClickListener(null);
+            b.setClickable(false);
+            b.setEnabled(false);
+            b.setAlpha(0.5f);
+            b.setContentDescription(races[idx] + " — " + S.t("rasę nustato žemėlapis"));
+        }
+        b.setMinWidth(dp(96));
+        b.setMinimumWidth(dp(96));
+        return b;
+    }
+    // The race the map fixes for a UMS slot (SIDE 0-2), else -1.
+    private int umsFixedRace(int slot) {
+        if (umsSide == null || slot < 0 || slot >= 8) return -1;
+        int s = umsSide[slot];
+        return s >= 0 && s <= 2 ? s : -1;
+    }
     private int indexOfRace(int raceValue) {
         for (int i = 0; i < RACE_VALUES.length; i++) if (RACE_VALUES[i] == raceValue) return i;
         return RACE_VALUES.length - 1; // random
@@ -1354,9 +1684,21 @@ public class SetupActivity extends Activity {
         int players = clampCount(prefs().getInt("playerCount", 2));
         int race = prefs().getInt("race", 5);
         int speed = prefs().getInt("gameSpeed", 100);
+        String selId = selectedMapId();
+        boolean ums = umsOwnr != null && selId != null && selId.equals(umsInfoFor)
+                && (umsScenario || selId.contains("/scenario/"));
+        if (ums) {
+            int humans = 0;
+            for (int s = 0; s < 8; s++) if (umsOwnr[s] == 6) humans++;
+            if (humans < 2) {
+                Kit.toast(this, S.t("Šiame žemėlapyje tik viena žaidėjo vieta — LAN žaidimui reikia bent dviejų."), Toast.LENGTH_LONG);
+                return;
+            }
+        }
         mpIsHost = true;
         mpLocalReady = false;
-        mpLobby = new LanLobby(mpLobbyListener, versionName(), enabledModsCsv());
+        mpLobby = new LanLobby(mpLobbyListener, versionName(), lobbyModsTag());
+        if (ums) mpLobby.setUmsMap(hexDigits(umsOwnr), hexDigits(umsSide));
         mpLobby.setLocalPortrait(PortraitStore.activeId(prefs(), activeProfile(), getExternalFilesDir(null)));
         mpLobby.setLocalKbm(Keybinds.kbm(prefs()));
         mpLobby.startHost(activeProfile(), race, mapId, players, speed);
@@ -1412,7 +1754,7 @@ public class SetupActivity extends Activity {
         mid.addView(kit.text((h.name.isEmpty() ? h.ip : h.name) + "  ·  " + S.t("greitis: ") + gameSpeedName(String.valueOf(h.speed)), Kit.TEXT2, 12));
         card.addView(mid, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         // what stands in the way, if anything
-        String myMods = enabledModsCsv();
+        String myMods = lobbyModsTag();
         if (myMods == null || myMods.isEmpty()) myMods = "-";
         String tag = null;
         int tagColor = Kit.ACCENT;
@@ -1458,7 +1800,7 @@ public class SetupActivity extends Activity {
         int race = prefs().getInt("race", 5);
         mpIsHost = false;
         mpLocalReady = false;
-        mpLobby = new LanLobby(mpLobbyListener, versionName(), enabledModsCsv());
+        mpLobby = new LanLobby(mpLobbyListener, versionName(), lobbyModsTag());
         mpLobby.setLocalPortrait(PortraitStore.activeId(prefs(), activeProfile(), getExternalFilesDir(null)));
         mpLobby.setLocalKbm(Keybinds.kbm(prefs()));
         mpLobby.startJoin(activeProfile(), race, h.ip);
@@ -1513,6 +1855,22 @@ public class SetupActivity extends Activity {
         updateStartButtonVisibility();
     }
 
+    private static String hexDigits(int[] v) {
+        StringBuilder b = new StringBuilder();
+        for (int x : v) b.append(Character.forDigit(Math.max(0, Math.min(15, x)), 16));
+        return b.toString();
+    }
+    // My row in the lobby snapshot: the host is row 0, a joiner the non-host row with my profile.
+    private int mpMyIndex(LanLobby.State s) {
+        if (s == null) return -1;
+        if (mpIsHost) return 0;
+        for (int i = 0; i < s.slots.size(); i++) {
+            LanLobby.Slot sl = s.slots.get(i);
+            if (!sl.host && sl.userId.equals(activeProfile())) return i;
+        }
+        return -1;
+    }
+
     private static String lobbyPeople(LanLobby.State s) {
         StringBuilder b = new StringBuilder();
         if (s != null) for (LanLobby.Slot sl : s.slots) b.append(sl.userId).append('|');
@@ -1523,11 +1881,13 @@ public class SetupActivity extends Activity {
         if (mpState != null && activeTab != TAB_MULTI && !lobbyPeople(mpState).equals(lobbyPeople(s))) setLanAttention(true);
         mpState = s;
         mpLobbyTitle.setText((S.t("Žaidėjai") + "  ·  " + s.slots.size() + " / " + s.target).toUpperCase(Locale.ROOT));
-        mpLobbyStatus.setText(mapBasename(s.map) + "  ·  " + S.t("greitis: ") + gameSpeedName(String.valueOf(s.speed)));
+        mpLobbyStatus.setText(mapBasename(s.map) + "  ·  " + S.t("greitis: ") + gameSpeedName(String.valueOf(s.speed))
+                + (s.ums ? "  ·  " + S.t("žemėlapio nustatymai") : ""));
         if (lobbyPane != null && !s.map.equals(lobbyPreviewMap)) { lobbyPreviewMap = s.map; lobbyPane.showMapId(s.map); }
         if (screenTitle != null && activeTab == TAB_MULTI)
             screenTitle.setText(S.t("LAN LOBBY"));
         mpSlotsBox.removeAllViews();
+        boolean anyFixed = false;
         for (int i = 0; i < s.slots.size(); i++) {
             LanLobby.Slot sl = s.slots.get(i);
             LinearLayout col = new LinearLayout(this);
@@ -1567,8 +1927,11 @@ public class SetupActivity extends Activity {
                 who.addView(nameRow);
             } else who.addView(name);
             boolean isMe = (mpIsHost && i == 0) || (!mpIsHost && sl.userId.equals(activeProfile()) && !sl.host);
-            // the race of the others; my own is on the race button of my row
-            if (!isMe) who.addView(kit.text(sl.race >= 0 && sl.race <= 2 ? raceNames()[indexOfRace(sl.race)] : S.t("Atsitiktinė"), Kit.TEXT2, 11));
+            // the race of the others; my own is on the race button of my row. A UMS map may fix it.
+            final int fixed = s.fixedRace(i);
+            anyFixed |= fixed >= 0;
+            int shownRace = fixed >= 0 ? fixed : sl.race;
+            if (!isMe) who.addView(kit.text(shownRace >= 0 && shownRace <= 2 ? raceNames()[indexOfRace(shownRace)] : S.t("Atsitiktinė"), Kit.TEXT2, 11));
             row.addView(who, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
             // Colour. Editable when it's my slot OR I'm the host (the host may recolour
             // anyone); a joiner can only change its own. Colours held by OTHER slots are
@@ -1594,17 +1957,11 @@ public class SetupActivity extends Activity {
             }));
             // Race picker on my own slot.
             if (isMe) {
-                final String[] races = raceNames();
-                TextView raceBtn = kit.smallButton(races[indexOfRace(sl.race)] + "  \u25BE", () -> new KitDialog(this)
-                        .setItems(races, (d, which) -> {
+                TextView raceBtn = raceButton(fixed >= 0 ? fixed : sl.race, fixed >= 0, which -> {
                             int rv = RACE_VALUES[which];
                             prefs().edit().putInt("race", rv).apply();
                             if (mpLobby != null) { if (mpIsHost) mpLobby.setHostRace(rv); else mpLobby.setJoinRace(rv); }
-                        })
-                        .setNegativeButton(S.t("Atšaukti"), null)
-                        .show());
-                raceBtn.setMinWidth(dp(96));
-                raceBtn.setMinimumWidth(dp(96));
+                        });
                 LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(40));
                 rlp.leftMargin = dp(8);
                 row.addView(raceBtn, rlp);
@@ -1621,10 +1978,17 @@ public class SetupActivity extends Activity {
             col.addView(line, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, dp(1))));
             mpSlotsBox.addView(col);
         }
+        if (anyFixed) {
+            TextView n = kit.text(S.t("Pilkas rases nustato žemėlapis — jų pakeisti negalima."), Kit.TEXT2, 11);
+            n.setPadding(dp(4), dp(6), 0, 0);
+            mpSlotsBox.addView(n);
+        }
         updateStartButtonVisibility();
     }
 
     private void launchNetGame(boolean isHost, String hostIp, int race, int speed, int players) {
+        if (selectedMpqMap == null && refuseExtendedMap(selectedMap)) return;
+        if (refuseModSet()) return;
         Intent i = new Intent(this, OpenBWActivity.class);
         if (selectedMpqMap != null) i.putExtra(OpenBWActivity.EXTRA_MAP_MPQ, selectedMpqMap);
         else if (selectedMap != null) i.putExtra(OpenBWActivity.EXTRA_MAP, selectedMap.getAbsolutePath());
@@ -1662,11 +2026,18 @@ public class SetupActivity extends Activity {
             }
             if (kb.length() > 0) i.putExtra(OpenBWActivity.EXTRA_KBM_PLAYERS, kb.toString());
         }
+        if (mpState != null && mpState.ums) {
+            // the map slot this device plays (lobby order -> the map's human slots), its race if fixed
+            int me = mpMyIndex(mpState);
+            int slot = mpState.mapSlot(me);
+            int fixed = mpState.fixedRace(me);
+            if (fixed >= 0) { race = fixed; i.putExtra(OpenBWActivity.EXTRA_RACE, race); }
+            if (slot >= 0) i.putExtra(OpenBWActivity.EXTRA_UMS_LOCAL, slot);
+            i.putExtra(OpenBWActivity.EXTRA_GAME_MODE, "ums");
+        }
         prefs().edit().putInt("lastLocalRace", race).apply();
         addCommonExtras(i);
         if (speed >= 25 && speed <= 800) i.putExtra(OpenBWActivity.EXTRA_GAME_SPEED, speed);
-        if (selectedMpqMap != null && selectedMpqMap.contains("/scenario/"))
-            i.putExtra(OpenBWActivity.EXTRA_GAME_MODE, "ums");
         startActivity(i);
     }
 
@@ -1747,9 +2118,12 @@ public class SetupActivity extends Activity {
             return;
         }
         int race = spSlotRace(0);
+        if (isUmsLobby() && umsFixedRace(umsLocalSlot()) >= 0) race = umsFixedRace(umsLocalSlot());
         // Remember the chosen race so the profile stats can bucket a "Random"
         // win under R (the engine only reports the resolved concrete race).
         prefs().edit().putInt("lastLocalRace", race).apply();
+        if (selectedMpqMap == null && refuseExtendedMap(selectedMap)) return;
+        if (refuseModSet()) return;
         Intent i = new Intent(this, OpenBWActivity.class);
         if (selectedMpqMap != null) i.putExtra(OpenBWActivity.EXTRA_MAP_MPQ, selectedMpqMap);
         else i.putExtra(OpenBWActivity.EXTRA_MAP, selectedMap.getAbsolutePath());
@@ -1767,6 +2141,7 @@ public class SetupActivity extends Activity {
         if (selectedMpqMap != null && selectedMpqMap.contains("/scenario/")) {
             i.putExtra(OpenBWActivity.EXTRA_GAME_MODE, "ums");
         }
+        putUmsExtras(i);
         startActivity(i);
     }
 
@@ -1794,6 +2169,7 @@ public class SetupActivity extends Activity {
             Kit.toast(this, S.t("Pirma importuokite MPQ failus."), Toast.LENGTH_LONG);
             return;
         }
+        if (campaignDir.startsWith(OeCampaigns.PREFIX)) { launchOecMission(campaignDir); return; }
         // the progression on return reads the played mission from here
         setCampaignDir(campaignDir);
         // v0.79 item 1: remember which episode this mission came from, so the
@@ -1803,6 +2179,36 @@ public class SetupActivity extends Activity {
         Intent ci = new Intent(this, OpenBWActivity.class);
         ci.putExtra(OpenBWActivity.EXTRA_CAMPAIGN, campaignDir);
         addCommonExtras(ci);
+        startActivity(ci);
+    }
+
+    // G11: a .oecampaign mission is its bundled map played as UMS; --oec-mission tells the
+    // native side to report the result (oec-result.txt) and keeps the context in saves.
+    private void launchOecMission(String key) {
+        Object[] cm = oecMission(key);
+        if (cm == null) {
+            Kit.toast(this, S.t("Šios kampanijos misijos nebėra."), Toast.LENGTH_LONG);
+            return;
+        }
+        File map = ((OeCampaigns.Campaign) cm[0]).mapFile((OeCampaigns.Mission) cm[1]);
+        if (!map.isFile()) {
+            Kit.toast(this, S.t("Šios kampanijos misijos nebėra."), Toast.LENGTH_LONG);
+            return;
+        }
+        if (refuseExtendedMap(map)) return;
+        setCampaignDir(key);
+        prefs().edit().putString("returnToEpisode", episodeTitleFor(key)).apply();
+        OeCampaigns.Mission om = (OeCampaigns.Mission) cm[1];
+        int[] rr = oecRace(key, (OeCampaigns.Campaign) cm[0], om, oecSides.get(key));
+        prefs().edit().putInt("lastLocalRace", rr[0]).apply();
+        Intent ci = new Intent(this, OpenBWActivity.class);
+        ci.putExtra(OpenBWActivity.EXTRA_MAP, map.getAbsolutePath());
+        ci.putExtra(OpenBWActivity.EXTRA_OEC_MISSION, key);
+        addCommonExtras(ci);
+        ci.putExtra(OpenBWActivity.EXTRA_GAME_MODE, "ums");
+        // a map SIDE race wins in the engine anyway; this is the race for a selectable slot
+        ci.putExtra(OpenBWActivity.EXTRA_RACE, rr[0]);
+        if (om.player >= 0 && om.player < 8) ci.putExtra(OpenBWActivity.EXTRA_UMS_LOCAL, om.player);
         startActivity(ci);
     }
 
@@ -1869,10 +2275,13 @@ public class SetupActivity extends Activity {
         return true;
     }
 
+    private static final String RETURN_TO_CAMPAIGN_GRID = "\u0001grid";   // "returnToEpisode": the episode grid itself
+
     private boolean returnToEpisodeIfPending() {
         String backTo = prefs().getString("returnToEpisode", "");
         if (backTo.isEmpty()) return false;
         prefs().edit().remove("returnToEpisode").apply();
+        if (backTo.equals(RETURN_TO_CAMPAIGN_GRID)) { selectTab(TAB_KAMPANIJA); return true; }
         for (Episode e : campaignEpisodes()) {
             if (e.title.equals(backTo)) {
                 selectTab(TAB_KAMPANIJA);
@@ -1977,6 +2386,7 @@ public class SetupActivity extends Activity {
     }
     private String cDirKey() { return "p." + activeProfile() + ".campaignDir"; }
     private String cDoneKey() { return "p." + activeProfile() + ".campaignDone"; }
+    private String cReachedKey() { return "p." + activeProfile() + ".oecReached"; }  // G11: missions an edge led to
     private String getCampaignDir() { return prefs().getString(cDirKey(), ""); }
     private void setCampaignDir(String v) { prefs().edit().putString(cDirKey(), v).apply(); }
     private java.util.Set<String> getCampaignDone() {
@@ -2046,7 +2456,8 @@ public class SetupActivity extends Activity {
                 for (Episode ep : campaignEpisodes()) {
                     int beaten = 0;
                     for (String[] m : ep.missions) if (done.contains(m[1])) beaten++;
-                    out.add(new String[]{ep.title, String.valueOf(beaten), String.valueOf(ep.missions.length)});
+                    String name = ep.oec != null && !ep.oec.title.isEmpty() ? ep.oec.title + " — " + ep.title : ep.title;
+                    out.add(new String[]{name, String.valueOf(beaten), String.valueOf(ep.missions.length)});
                 }
                 return out;
             }
@@ -2096,7 +2507,10 @@ public class SetupActivity extends Activity {
         // the seven screens, in three groups: play / my things / settings
         java.util.Set<String> done = getCampaignDone();
         int beaten = 0, missions = 0;
-        for (Episode ep : campaignEpisodes()) for (String[] m : ep.missions) { ++missions; if (done.contains(m[1])) ++beaten; }
+        for (Episode ep : campaignEpisodes()) {
+            if (ep.oec != null) continue;   // imported campaigns keep their own count on their card
+            for (String[] m : ep.missions) { ++missions; if (done.contains(m[1])) ++beaten; }
+        }
         String mods = enabledModsCsv();
         int modCount = mods == null || mods.isEmpty() ? 0 : mods.split(",").length;
         addRailEntry(rail, TAB_SINGLE, null);
@@ -2165,7 +2579,10 @@ public class SetupActivity extends Activity {
 
         java.util.Set<String> done = getCampaignDone();
         int beaten = 0, missions = 0;
-        for (Episode ep : campaignEpisodes()) for (String[] m : ep.missions) { ++missions; if (done.contains(m[1])) ++beaten; }
+        for (Episode ep : campaignEpisodes()) {
+            if (ep.oec != null) continue;   // imported campaigns keep their own count on their card
+            for (String[] m : ep.missions) { ++missions; if (done.contains(m[1])) ++beaten; }
+        }
         String mods = enabledModsCsv();
         int modCount = mods == null || mods.isEmpty() ? 0 : mods.split(",").length;
         int[] order = {TAB_SINGLE, TAB_MULTI, TAB_KAMPANIJA, -1, TAB_SAVE, TAB_REPLAY, TAB_MODAI, -1, TAB_NUSTATYMAI};
@@ -2390,7 +2807,10 @@ public class SetupActivity extends Activity {
     private static final class ModEntry {
         String id, name, type, version = "", author = "", desc = "";
         java.util.List<String> depends = new ArrayList<>();
+        java.util.List<String> requires = new ArrayList<>();    // G10: mod ids that must be active too
+        java.util.List<String> conflicts = new ArrayList<>();   // G10: mod ids that must not be active
         java.util.List<String> provides = new ArrayList<>();   // S1.2: layer categories
+        int[] extTypes;                                         // G13(2): data/oe/extensions.json units/buildings/heroes/abilities
         int format = 0, engineMin = 0, engineMax = 0;
         boolean executable;
         boolean installed, active;
@@ -2575,6 +2995,7 @@ public class SetupActivity extends Activity {
                 e.installed = true;
                 e.active = prefs().getBoolean("mod_" + e.id, false);
                 readModJson(new File(d, "mod.json"), e);
+                e.extTypes = extensionCounts(new File(d, "data/oe/extensions.json"));
                 // A mod with no mod.json at all (both of the packs in use today)
                 // still gets its categories from what is on disk.
                 if (e.provides.isEmpty()) e.provides.addAll(detectProvides(d));
@@ -2687,6 +3108,27 @@ public class SetupActivity extends Activity {
         return null;
     }
 
+    // G13(2): how many new types a Ganymede Extended mod defines; null without the file.
+    private static int[] extensionCounts(File f) {
+        if (!f.isFile() || f.length() > (8 << 20)) return null;
+        try {
+            byte[] b = new byte[(int) f.length()];
+            try (java.io.FileInputStream in = new java.io.FileInputStream(f)) {
+                int off = 0, n; while (off < b.length && (n = in.read(b, off, b.length - off)) > 0) off += n;
+            }
+            org.json.JSONArray l = new org.json.JSONObject(new String(b, java.nio.charset.StandardCharsets.UTF_8)).optJSONArray("definitions");
+            int[] c = new int[4];
+            String[] kinds = {"unit", "building", "hero", "ability"};
+            for (int i = 0; l != null && i < l.length(); ++i) {
+                String k = l.optJSONObject(i) == null ? "" : l.optJSONObject(i).optString("kind");
+                for (int j = 0; j < 4; ++j) if (kinds[j].equals(k)) c[j]++;
+            }
+            return c;
+        } catch (Exception ex) {
+            return new int[4];
+        }
+    }
+
     private void readModJson(File f, ModEntry e) {
         if (!f.isFile()) return;
         try {
@@ -2702,6 +3144,10 @@ public class SetupActivity extends Activity {
             e.desc = o.optString("description", "");
             org.json.JSONArray dep = o.optJSONArray("depends");
             if (dep != null) for (int i = 0; i < dep.length(); i++) e.depends.add(dep.optString(i));
+            org.json.JSONArray req = o.optJSONArray("requires");
+            if (req != null) for (int i = 0; i < req.length(); i++) { String r = req.optString(i, ""); if (!r.isEmpty()) e.requires.add(r); }
+            org.json.JSONArray con = o.optJSONArray("conflicts");
+            if (con != null) for (int i = 0; i < con.length(); i++) { String c = con.optString(i, ""); if (!c.isEmpty()) e.conflicts.add(c); }
             // v0.83.009 (S1.2) mod.json v1. Every field is optional: a mod
             // written before this format still loads, it simply declares
             // nothing and is gated by nothing.
@@ -2820,18 +3266,44 @@ public class SetupActivity extends Activity {
         String v = e.version != null && !e.version.isEmpty() ? " · v" + e.version : "";
         col.addView(kit.text(modTypeLabel(e.type) + v, Kit.TEXT2, 12));
         row.addView(col, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        if (e.executable) {
-            TextView g = kit.text(S.t("vykdomas kodas"), Kit.ACCENT, 11);
-            g.setBackground(kit.box(0x00000000, Kit.ACCENT));
-            g.setPadding(dp(6), dp(1), dp(6), dp(1));
-            row.addView(g);
-        }
+        if (e.executable) row.addView(modBadge(S.t("vykdomas kodas"), Kit.ACCENT));
+        if (!e.requires.isEmpty()) row.addView(modBadge(S.t("reikalauja modų"), 0xFF9AB0C0));
+        if (!e.conflicts.isEmpty()) row.addView(modBadge(S.t("nesuderinamas"), 0xFFE0B040));
         TextView st = kit.text(e.updatable() ? S.t("yra atnaujinimas") + " → v" + e.repoVersion
                 : e.active ? S.t("aktyvus") : e.installed ? S.t("įdiegtas") : S.t("talpykloje"), Kit.TEXT2, 12);
         st.setPadding(dp(10), 0, 0, 0);
         row.addView(st);
         row.setOnClickListener(v2 -> selectMod(e.id));
         return row;
+    }
+
+    private TextView modBadge(String text, int color) {
+        TextView g = kit.text(text, color, 11);
+        g.setBackground(kit.box(0x00000000, color));
+        g.setPadding(dp(6), dp(1), dp(6), dp(1));
+        g.setSingleLine(true);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.leftMargin = dp(6);
+        g.setLayoutParams(lp);
+        return g;
+    }
+
+    /** Installed mods by id (G10 requires / conflicts are ids; the UI shows their names). */
+    private java.util.Map<String, ModEntry> installedModsById() {
+        java.util.Map<String, ModEntry> byId = new java.util.HashMap<>();
+        for (ModEntry o : loadMods()) if (o.installed) byId.put(o.id, o);
+        return byId;
+    }
+
+    private static String modName(java.util.Map<String, ModEntry> byId, String id) {
+        ModEntry o = byId.get(id);
+        return o != null && o.name != null && !o.name.isEmpty() ? o.name : id;
+    }
+
+    private static String modNames(java.util.Map<String, ModEntry> byId, java.util.Collection<String> ids, String sep) {
+        StringBuilder sb = new StringBuilder();
+        for (String id : ids) { if (sb.length() > 0) sb.append(sep); sb.append(modName(byId, id)); }
+        return sb.toString();
     }
 
     private void showModDetail(ModEntry e) {
@@ -2869,7 +3341,16 @@ public class SetupActivity extends Activity {
             }
             modDetailBox.addView(detailRow(S.t("Teikia"), ps.toString()));
         }
-        modDetailBox.addView(detailRow(S.t("Priklausomybės"), e.depends.isEmpty() ? "—" : android.text.TextUtils.join(", ", e.depends)));
+        java.util.Map<String, ModEntry> byId = installedModsById();
+        if (!e.depends.isEmpty()) modDetailBox.addView(detailRow(S.t("Priklausomybės"), modNames(byId, e.depends, ", ")));
+        if (!e.requires.isEmpty()) modDetailBox.addView(detailRow(S.t("Reikalauja"), modNames(byId, e.requires, ", ")));
+        if (!e.conflicts.isEmpty()) modDetailBox.addView(detailRow(S.t("Nesuderinamas su"), modNames(byId, e.conflicts, ", ")));
+        if (e.extTypes != null) modDetailBox.addView(detailRow(S.t("Nauji tipai"),
+                S.count(e.extTypes[0], "vienetas", "vienetai", "vienetų", "unit", "units") + " · "
+                + S.count(e.extTypes[1], "pastatas", "pastatai", "pastatų", "building", "buildings") + " · "
+                + S.count(e.extTypes[2], "herojus", "herojai", "herojų", "hero", "heroes") + " · "
+                + S.count(e.extTypes[3], "gebėjimas", "gebėjimai", "gebėjimų", "ability", "abilities")
+                + "\n" + S.t("Vienetai, pastatai, herojai ir gebėjimai žaidžiami (statyti — darbininko „MODS“ puslapyje; gebėjimai — vieneto „ABILITIES“ puslapyje; herojus kyla lygiais už nužudymus).")));
         if (e.executable) {
             TextView ex = kit.text(S.t("⚠ Šiame mode yra vykdomo kodo (botų)"), Kit.ACCENT, 13);
             ex.setPadding(0, dp(10), 0, 0);
@@ -2883,11 +3364,44 @@ public class SetupActivity extends Activity {
     }
     private void modToggle(ModEntry e) {
         if (e.active) {
-            prefs().edit().putBoolean("mod_" + e.id, false).apply();
-            selectMod(e.id);
+            java.util.Map<String, ModEntry> byId = installedModsById();
+            final java.util.LinkedHashSet<String> dependents =
+                    activeDependents(byId, java.util.Collections.singleton(e.id), java.util.Collections.<String>emptySet());
+            if (dependents.isEmpty()) {
+                prefs().edit().putBoolean("mod_" + e.id, false).apply();
+                selectMod(e.id);
+                return;
+            }
+            new KitDialog(this)
+                    .setTitle(e.name)
+                    .setMessage(S.t("Bus išjungti nuo jų priklausantys modai:") + "\n• " + modNames(byId, dependents, "\n• "))
+                    .setPositiveButton(S.t("Tęsti"), (d, w) -> {
+                        android.content.SharedPreferences.Editor ed = prefs().edit();
+                        ed.putBoolean("mod_" + e.id, false);
+                        for (String id : dependents) ed.putBoolean("mod_" + id, false);
+                        ed.apply();
+                        selectMod(e.id);
+                    })
+                    .setNegativeButton(S.t("Atšaukti"), null)
+                    .show();
             return;
         }
         activateMod(e);
+    }
+
+    /** G10: active mods that require one of `off` (transitively), so they must go off with it; `keep` stays on. */
+    private static java.util.LinkedHashSet<String> activeDependents(java.util.Map<String, ModEntry> byId,
+            java.util.Collection<String> off, java.util.Collection<String> keep) {
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        for (boolean grew = true; grew; ) {
+            grew = false;
+            for (ModEntry a : byId.values()) {
+                if (!a.active || keep.contains(a.id) || off.contains(a.id) || out.contains(a.id)) continue;
+                for (String r : a.requires)
+                    if (off.contains(r) || out.contains(r)) { out.add(a.id); grew = true; break; }
+            }
+        }
+        return out;
     }
 
     /**
@@ -2913,6 +3427,66 @@ public class SetupActivity extends Activity {
                     .show();
             return;
         }
+        // G10: mod.json "requires" / "conflicts" (mod ids). A missing requirement stops
+        // the activation; an inactive installed one and a conflicting active one are
+        // offered as one switch.
+        java.util.Map<String, ModEntry> byId = installedModsById();
+        java.util.List<String> missing = new ArrayList<>();
+        java.util.LinkedHashSet<String> enable = new java.util.LinkedHashSet<>(), disable = new java.util.LinkedHashSet<>();
+        for (String r : e.requires) {
+            ModEntry o = byId.get(r);
+            if (o == null) missing.add(r);
+            else if (!o.active) enable.add(r);
+        }
+        for (ModEntry o : byId.values()) {
+            if (!o.active || o.id.equals(e.id)) continue;
+            if (e.conflicts.contains(o.id) || o.conflicts.contains(e.id)) disable.add(o.id);
+        }
+        for (String r : enable) {
+            ModEntry o = byId.get(r);
+            for (ModEntry a : byId.values())
+                if (a.active && (o.conflicts.contains(a.id) || a.conflicts.contains(o.id))) disable.add(a.id);
+        }
+        java.util.Set<String> keep = new java.util.HashSet<>(enable);
+        keep.add(e.id);
+        final java.util.LinkedHashSet<String> dependents = activeDependents(byId, disable, keep);
+        if (!missing.isEmpty()) {
+            new KitDialog(this)
+                    .setTitle(S.t("Trūksta reikalingų modų"))
+                    .setMessage(e.name + "\n\n" + S.t("Šiam modui reikia modų, kurių nėra įdiegtų:") + "\n• "
+                            + android.text.TextUtils.join("\n• ", missing))
+                    .setPositiveButton(S.t("Gerai"), null)
+                    .show();
+            return;
+        }
+        if (!enable.isEmpty() || !disable.isEmpty()) {
+            StringBuilder msg = new StringBuilder();
+            if (!enable.isEmpty()) msg.append(S.t("Bus įjungti reikalingi modai:")).append("\n• ")
+                    .append(modNames(byId, enable, "\n• ")).append("\n\n");
+            if (!disable.isEmpty()) msg.append(S.t("Bus išjungti nesuderinami modai:")).append("\n• ")
+                    .append(modNames(byId, disable, "\n• ")).append("\n\n");
+            if (!dependents.isEmpty()) msg.append(S.t("Bus išjungti nuo jų priklausantys modai:")).append("\n• ")
+                    .append(modNames(byId, dependents, "\n• ")).append("\n\n");
+            new KitDialog(this)
+                    .setTitle(e.name)
+                    .setMessage(msg.toString().trim())
+                    .setPositiveButton(S.t("Tęsti"), (d, w) -> {
+                        android.content.SharedPreferences.Editor ed = prefs().edit();
+                        for (String id : enable) ed.putBoolean("mod_" + id, true);
+                        for (String id : disable) ed.putBoolean("mod_" + id, false);
+                        for (String id : dependents) ed.putBoolean("mod_" + id, false);
+                        ed.apply();
+                        activateModChecked(e);
+                    })
+                    .setNegativeButton(S.t("Atšaukti"), null)
+                    .show();
+            return;
+        }
+        activateModChecked(e);
+    }
+
+    /** The category clash step of activateMod (after requires / conflicts). */
+    private void activateModChecked(ModEntry e) {
         java.util.LinkedHashMap<String, ModEntry> clash = new java.util.LinkedHashMap<>();
         for (ModEntry other : loadMods()) {
             if (other.id.equals(e.id) || !other.active) continue;
@@ -2933,6 +3507,10 @@ public class SetupActivity extends Activity {
             msg.append("• ").append(c.getKey()).append(": ").append(c.getValue().name).append('\n');
             toDisable.add(c.getValue().id);
         }
+        java.util.Map<String, ModEntry> byId = installedModsById();
+        final java.util.LinkedHashSet<String> dependents = activeDependents(byId, toDisable, java.util.Collections.singleton(e.id));
+        if (!dependents.isEmpty()) msg.append('\n').append(S.t("Bus išjungti nuo jų priklausantys modai:"))
+                .append("\n• ").append(modNames(byId, dependents, "\n• ")).append('\n');
         new KitDialog(this)
                 .setTitle(S.t("Ta pati kategorija jau užimta"))
                 .setMessage(S.t("Šias kategorijas jau teikia kitas aktyvus modas:") + "\n\n" + msg
@@ -2940,6 +3518,7 @@ public class SetupActivity extends Activity {
                 .setPositiveButton(S.t("Pakeisti"), (d, w) -> {
                     android.content.SharedPreferences.Editor ed = prefs().edit();
                     for (String id : toDisable) ed.putBoolean("mod_" + id, false);
+                    for (String id : dependents) ed.putBoolean("mod_" + id, false);
                     ed.putBoolean("mod_" + e.id, true);
                     ed.apply();
                     selectMod(e.id);
@@ -3165,14 +3744,12 @@ public class SetupActivity extends Activity {
             return;
         }
         final String wantSha = m.optString("sha256", "");
-        final TextView progressText = new TextView(this);
-        int pad = dp(24);
-        progressText.setPadding(pad, pad, pad, pad);
-        progressText.setTextColor(Color.WHITE);
-        progressText.setText(S.t("Siunčiama…"));
+        final Kit.ProgressPanel pp = new Kit(this).progressPanel(null);
+        final TextView progressText = pp.status;
+        pp.busy(S.t("Siunčiama…"));
         final Dialog dialog = new KitDialog(this)
                 .setTitle(S.t("Diegiamas modas: ") + id)
-                .setView(progressText).setCancelable(false).create();
+                .setView(pp.view).setWidth(520).setCancelable(false).create();
         dialog.show();
         new Thread(() -> {
             String err = null;
@@ -3194,13 +3771,13 @@ public class SetupActivity extends Activity {
                     while ((n = in.read(buf)) > 0) {
                         out.write(buf, 0, n);
                         got += n;
-                        if (System.currentTimeMillis() - lastUi > 300) {
+                        if (System.currentTimeMillis() - lastUi > 200) {
                             lastUi = System.currentTimeMillis();
-                            final String p = total > 0
-                                    ? (got * 100 / total) + "%  (" + (got >> 20) + " MB)"
-                                    : (got >> 20) + " MB";
-                            new Handler(Looper.getMainLooper()).post(() ->
-                                    progressText.setText(S.t("Siunčiama… ") + p));
+                            final long g = got;
+                            new Handler(Looper.getMainLooper()).post(() -> {
+                                progressText.setText(S.t("Siunčiama…"));
+                                pp.update(g, total);
+                            });
                         }
                     }
                 }
@@ -3210,7 +3787,7 @@ public class SetupActivity extends Activity {
                 // swapped asset is caught HERE -- before anything is unpacked,
                 // and long before the engine tries to read half an .anim.
                 if (!wantSha.isEmpty()) {
-                    new Handler(Looper.getMainLooper()).post(() -> progressText.setText(S.t("Tikrinama…")));
+                    new Handler(Looper.getMainLooper()).post(() -> pp.busy(S.t("Tikrinama…")));
                     String got2 = sha256Of(tmp);
                     if (!got2.equalsIgnoreCase(wantSha)) {
                         // Distinguish a truncated/wrong download (byte counts differ) from a
@@ -3226,7 +3803,7 @@ public class SetupActivity extends Activity {
                         throw new java.io.IOException(S.t("failas sugadintas, bandyk dar kartą"));   // the digests are in the log
                     }
                 }
-                new Handler(Looper.getMainLooper()).post(() -> progressText.setText(S.t("Išskleidžiama…")));
+                new Handler(Looper.getMainLooper()).post(() -> pp.busy(S.t("Išskleidžiama…")));
                 // Same consent rule as the local import path: a downloaded mod
                 // carrying .so files asks before its code lands on the device.
                 ZipScan dscan = scanModZip(Uri.fromFile(tmp));
@@ -3261,7 +3838,10 @@ public class SetupActivity extends Activity {
     // campaign selection inside our launcher.
     private static final class Episode {
         final String title;
-        final String[][] missions; // each = {display name, MPQ dir}
+        final String[][] missions; // each = {display name, MPQ dir} ("oec:<campaign>/<mission>" for G11)
+        OeCampaigns.Campaign oec;  // G11: a custom campaign's episode
+        int race = -1;
+        boolean anyRace;           // G11: the episode names no race (3 "Any")
         Episode(String t, String[][] m) { title = t; missions = m; }
     }
     private java.util.List<Episode> campaignEpisodes() {
@@ -3346,7 +3926,132 @@ public class SetupActivity extends Activity {
             {"10. Omega", "campaign/expzerg/zerg10"},
             {"★ Dark Origin (slaptoji)", "campaign/expzerg/bonus"},
         }));
+        eps.addAll(customEpisodes());
         return eps;
+    }
+
+    // G11: installed .oecampaign bundles, one card per editor episode (missions in list order).
+    private java.util.List<Episode> customEpisodes() {
+        java.util.ArrayList<Episode> out = new java.util.ArrayList<>();
+        for (OeCampaigns.Campaign c : OeCampaigns.installed(getExternalFilesDir(null))) {
+            java.util.LinkedHashMap<String, java.util.List<String[]>> byEp = new java.util.LinkedHashMap<>();
+            java.util.Map<String, OeCampaigns.Episode> eps = new java.util.HashMap<>();
+            for (OeCampaigns.Episode e : c.episodes) { byEp.put(e.id, new java.util.ArrayList<>()); eps.put(e.id, e); }
+            for (OeCampaigns.Mission m : c.missions) {
+                java.util.List<String[]> l = byEp.get(m.episode);
+                if (l == null) byEp.put(m.episode, l = new java.util.ArrayList<>());
+                l.add(new String[]{(m.code.isEmpty() ? "" : m.code + ". ") + m.title, c.key(m.id)});
+            }
+            for (java.util.Map.Entry<String, java.util.List<String[]>> en : byEp.entrySet()) {
+                if (en.getValue().isEmpty()) continue;
+                OeCampaigns.Episode e = eps.get(en.getKey());
+                String t = c.title + (e != null && !e.title.isEmpty() ? " — " + e.title : "");
+                Episode ep = new Episode(t, en.getValue().toArray(new String[0][]));
+                ep.oec = c;
+                ep.race = e != null && e.race >= 0 && e.race <= 2 ? e.race : 1;
+                ep.anyRace = e == null || e.race < 0 || e.race > 2;
+                out.add(ep);
+            }
+        }
+        return out;
+    }
+
+    // G11: "oec:<campaign>/<mission>" -> {campaign, mission}; null for MPQ campaign dirs or a removed campaign.
+    // The mission map's SIDE races per slot (null until read), by mission key.
+    private final java.util.Map<String, int[]> oecSides = new java.util.HashMap<>();
+
+    // The human's race in a .oecampaign mission: {race, lock} where lock 2 = the map's SIDE
+    // for the human's slot, 1 = the mission (or its episode) names a race, 0 = the player picks.
+    private int[] oecRace(String key, OeCampaigns.Campaign c, OeCampaigns.Mission m, int[] side) {
+        int slot = m.player >= 0 && m.player < 8 ? m.player : -1;
+        if (side != null) {
+            if (slot < 0) for (int s = 0; s < 8; s++) if (side[8 + s] == 6) { slot = s; break; }
+            if (slot >= 0 && side[slot] >= 0 && side[slot] <= 2) return new int[]{side[slot], 2};
+        }
+        if (m.race >= 0 && m.race <= 2) return new int[]{m.race, 1};
+        for (OeCampaigns.Episode e : c.episodes)
+            if (e.id.equals(m.episode) && e.race >= 0 && e.race <= 2) return new int[]{e.race, 1};
+        int pick = prefs().getInt("oecRace." + key, 5);
+        return new int[]{pick >= 0 && pick <= 2 ? pick : 5, 0};
+    }
+
+    // Reads the mission map's SIDE / OWNR off the UI thread, then refreshes the race row.
+    private void loadOecSides(final String key, final File map) {
+        if (!minimapLibOk || oecSides.containsKey(key)) return;
+        minimapExec.execute(() -> {
+            String r = null;
+            try { r = nativeMapSlots(map.getAbsolutePath()); } catch (Throwable ignored) {}
+            if (r == null || r.length() < 19) return;
+            int[] v = new int[16];
+            for (int s = 0; s < 8; s++) {
+                v[s] = Character.digit(r.charAt(11 + s), 16);
+                v[8 + s] = Character.digit(r.charAt(2 + s), 16);
+            }
+            ui.post(() -> {
+                oecSides.put(key, v);
+                bindOecRace(key);
+            });
+        });
+    }
+
+    private void bindOecRace(String key) {
+        if (detailRaceBox == null) return;
+        detailRaceBox.removeAllViews();
+        Object[] cm = key.startsWith(OeCampaigns.PREFIX) ? oecMission(key) : null;
+        if (cm == null) { detailRaceBox.setVisibility(View.GONE); return; }
+        OeCampaigns.Campaign c = (OeCampaigns.Campaign) cm[0];
+        OeCampaigns.Mission m = (OeCampaigns.Mission) cm[1];
+        if (!oecSides.containsKey(key)) loadOecSides(key, c.mapFile(m));
+        int[] rr = oecRace(key, c, m, oecSides.get(key));
+        detailRaceBox.setVisibility(View.VISIBLE);
+        detailRaceBox.addView(kit.text(S.t("Rasė"), Kit.TEXT2, 12), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        TextView b = raceButton(rr[0], rr[1] != 0, which -> {
+            prefs().edit().putInt("oecRace." + key, RACE_VALUES[which]).apply();
+            bindOecRace(key);
+        });
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(36));
+        lp.leftMargin = dp(10);
+        detailRaceBox.addView(b, lp);
+        if (rr[1] != 0) {
+            TextView why = kit.text(S.t(rr[1] == 2 ? "rasę nustato žemėlapis" : "rasę nustato misija"), Kit.TEXT2, 11);
+            why.setPadding(dp(10), 0, 0, 0);
+            detailRaceBox.addView(why);
+        }
+    }
+
+    private Object[] oecMission(String key) {
+        String[] k = OeCampaigns.split(key);
+        if (k == null) return null;
+        OeCampaigns.Campaign c = OeCampaigns.find(getExternalFilesDir(null), k[0]);
+        OeCampaigns.Mission m = c == null ? null : c.mission(k[1]);
+        return m == null ? null : new Object[]{c, m};
+    }
+
+    // G11: the native side leaves oec-result.txt after a .oecampaign mission ends; follow the
+    // campaign's edges (lowest priority first). Same shape as consumeCampaignNext; a third
+    // element marks a defeat that still leads on (a defeat edge).
+    private String[] consumeOecResult() {
+        String[] r = OeCampaigns.consumeResult(getExternalFilesDir(null));
+        if (r == null) return null;
+        Object[] cm = oecMission(r[0]);
+        if (cm == null) return null;
+        OeCampaigns.Campaign c = (OeCampaigns.Campaign) cm[0];
+        OeCampaigns.Mission m = (OeCampaigns.Mission) cm[1];
+        boolean won = "victory".equals(r[1]);
+        if (won) {
+            java.util.Set<String> done = new java.util.HashSet<>(getCampaignDone());
+            done.add(r[0]);
+            setCampaignDone(done);
+        }
+        OeCampaigns.Edge e = c.next(m.id, won ? "victory" : "defeat");
+        String next = e == null || e.to.isEmpty() ? "" : c.key(e.to);
+        if (!next.isEmpty()) {
+            java.util.Set<String> reached = new java.util.HashSet<>(prefs().getStringSet(cReachedKey(), new java.util.HashSet<>()));
+            reached.add(next);
+            prefs().edit().putStringSet(cReachedKey(), reached).apply();
+            setCampaignDir(next);
+        } else setCampaignDir(r[0]);
+        return !won && !next.isEmpty() ? new String[]{r[0], next, "defeat"} : new String[]{r[0], next};
     }
 
     // v0.35 map browser: melee/UMS maps bundled inside the CD MPQ archives
@@ -3413,7 +4118,7 @@ public class SetupActivity extends Activity {
         for (Episode ep : campaignEpisodes())
             for (String[] m : ep.missions)
                 if (m[1].equals(dir)) return m[0];
-        return dir;
+        return dir.startsWith(OeCampaigns.PREFIX) ? "" : dir;   // a removed imported campaign: no raw key
     }
 
     private TextView campaignSelTv; // legacy field (kept null; see onActivityResult guards)
@@ -3426,6 +4131,7 @@ public class SetupActivity extends Activity {
     // Episode race: 0=Zerg 1=Terran 2=Protoss, inferred from the mission path
     // (campaign/{terran,zerg,protoss,expterran,...}/...).
     private int episodeRace(Episode ep) {
+        if (ep.race >= 0) return ep.race;
         String p = ep.missions.length > 0 ? ep.missions[0][1] : "";
         if (p.contains("zerg")) return 0;
         if (p.contains("protoss")) return 2;
@@ -3448,6 +4154,7 @@ public class SetupActivity extends Activity {
     private View[] campaignRows;
     private boolean[] campaignRowUnlocked, campaignRowCurrent;
     private TextView detailTitle, detailDesc, detailStatus;
+    private LinearLayout detailRaceBox;   // .oecampaign missions: the human's race
     private Button startMissionBtn;
 
     private static java.util.Map<String, String> MISSION_DESC;
@@ -3528,6 +4235,10 @@ public class SetupActivity extends Activity {
         return m;
     }
     private String missionDesc(String dir) {
+        if (dir.startsWith(OeCampaigns.PREFIX)) {
+            Object[] cm = oecMission(dir);
+            return cm == null ? "" : ((OeCampaigns.Mission) cm[1]).description;
+        }
         String d = missionDescMap().get(dir);
         return d == null ? "" : d;
     }
@@ -3655,6 +4366,9 @@ public class SetupActivity extends Activity {
                 setAction(primaryAction, isDone ? S.t("Pakartoti misiją") : S.t("Pradėti misiją"),
                         () -> { setCampaignDir(path); launchCampaignMission(path); }, true);
             } else {
+                // .oecampaign import: debug builds only (the editor is not public)
+                if (Kit.gamepadAllowed(this))
+                    setAction(secondaryAction, S.t("Importuoti kampaniją"), () -> pickFiles(REQ_PICK_OECAMPAIGN), true);
                 // the mission the profile stands on (set by the last start / the last victory)
                 final String dir = getCampaignDir();
                 setAction(primaryAction, S.t("Pradėti misiją"), () -> launchCampaignMission(dir), !dir.isEmpty());
@@ -3689,6 +4403,7 @@ public class SetupActivity extends Activity {
             final PortraitStore.Clip c = PortraitStore.art(gameDir, path);
             if (c != null) ui.post(() -> v.setArt(c));
         });
+        PortraitStore.artHdAsync(path, v::setArt);
     }
 
     // Six episode cards, three per row (StarCraft I-III above Brood War IV-VI).
@@ -3723,7 +4438,10 @@ public class SetupActivity extends Activity {
             if (i % 3 != 0) lp.leftMargin = dp(compact ? 6 : 10);
             row.addView(card, lp);
         }
-        if (wide) {
+        if (wide && eps.size() > 6) {
+            // G11: custom campaigns add rows; keep each row the height it has with six cards
+            campaignEpisodeBox.addView(grid, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(240) * ((eps.size() + 2) / 3)));
+        } else if (wide) {
             campaignEpisodeBox.addView(grid, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(480)));
             fitToPanel(grid);
         } else {
@@ -3742,13 +4460,22 @@ public class SetupActivity extends Activity {
         LinearLayout info = new LinearLayout(this);
         info.setOrientation(LinearLayout.VERTICAL);
         info.setPadding(dp(8), dp(2), dp(4), dp(2));
-        TextView lab = kit.label(S.t("Epizodas") + " " + (index < EP_NUMERAL.length ? EP_NUMERAL[index] : String.valueOf(index + 1)) + " · " + RACE_LABEL[race]);
+        TextView lab = kit.label(ep.oec != null ? (ep.oec.author.isEmpty() ? S.t("Importuota kampanija") : ep.oec.author) + " · " + (ep.anyRace ? S.t("bet kuri rasė") : RACE_LABEL[race])
+                : S.t("Epizodas") + " " + (index < EP_NUMERAL.length ? EP_NUMERAL[index] : String.valueOf(index + 1)) + " · " + RACE_LABEL[race]);
         lab.setPadding(0, 0, 0, dp(4));
         info.addView(lab);
-        TextView title = kit.text(episodeName(ep), Color.WHITE, compact ? 15 : 18);
+        // an imported campaign: its own title, the episode underneath
+        String cardTitle = ep.oec != null && !ep.oec.title.isEmpty() ? ep.oec.title : episodeName(ep);
+        TextView title = kit.text(cardTitle, Color.WHITE, compact ? 15 : 18);
         title.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
         title.setPadding(0, 0, 0, dp(compact ? 4 : 8));
-        info.addView(title);
+        if (ep.oec != null && !episodeName(ep).equals(cardTitle)) {
+            title.setPadding(0, 0, 0, 0);
+            info.addView(title);
+            TextView sub = kit.text(episodeName(ep), Kit.TEXT2, compact ? 12 : 13);
+            sub.setPadding(0, 0, 0, dp(compact ? 4 : 8));
+            info.addView(sub);
+        } else info.addView(title);
         info.addView(kit.bar(total > 0 ? (float) beaten / total : 0f, Kit.LABEL),
                 new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(6)));
         TextView pt = kit.text(beaten + " / " + total + " " + S.t("misijų"), Kit.TEXT2, 12);
@@ -3789,7 +4516,12 @@ public class SetupActivity extends Activity {
                 new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(44)));
         TextView t = kit.text(ep.title + "  ·  " + beaten + " / " + total, Kit.TEXT2, compact ? 12 : 13);
         t.setPadding(dp(14), 0, 0, 0);
-        top.addView(t);
+        top.addView(t, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        if (ep.oec != null) {
+            final OeCampaigns.Campaign oc = ep.oec;
+            top.addView(kit.smallButton(S.t("Pašalinti kampaniją").toUpperCase(Locale.ROOT), () -> confirmRemoveOecampaign(oc)),
+                    new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(44)));
+        }
         campaignMissionBox.addView(top);
 
         LinearLayout cols = new LinearLayout(this);
@@ -3802,11 +4534,32 @@ public class SetupActivity extends Activity {
         campaignRowCurrent = new boolean[ep.missions.length];
         LinearLayout listCol = new LinearLayout(this);
         listCol.setOrientation(LinearLayout.VERTICAL);
+        java.util.Set<String> oecOpen = null;
+        String oecCurrent = null;
+        if (ep.oec != null) {
+            java.util.Set<String> reached = new java.util.HashSet<>(done);
+            reached.addAll(prefs().getStringSet(cReachedKey(), new java.util.HashSet<>()));
+            oecOpen = new java.util.HashSet<>();
+            for (String id : ep.oec.unlocked(done)) oecOpen.add(ep.oec.key(id));
+            for (String r : reached) if (r.startsWith(ep.oec.key(""))) oecOpen.add(r);
+            // a branching campaign has one current mission: where the profile stands in it
+            // (none once its last mission is beaten), else the first open one not yet beaten
+            String at = getCampaignDir();
+            boolean inEpisode = false;
+            for (String[] mm : ep.missions) inEpisode |= mm[1].equals(at);
+            String[] atKey = inEpisode ? OeCampaigns.split(at) : null;
+            OeCampaigns.Edge win = atKey == null ? null : ep.oec.next(atKey[1], "victory");
+            if (atKey != null && !done.contains(at)) oecCurrent = at;
+            else if (atKey != null && (win == null || win.to.isEmpty())) oecCurrent = "";
+            else for (String[] mm : ep.missions)
+                if (oecOpen.contains(mm[1]) && !done.contains(mm[1])) { oecCurrent = mm[1]; break; }
+        }
         for (int k = 0; k < ep.missions.length; k++) {
             String path = ep.missions[k][1];
             boolean isDone = done.contains(path);
-            boolean unlocked = unlockAll || k == 0 || isDone || done.contains(ep.missions[k - 1][1]);
-            boolean current = unlocked && !isDone;
+            boolean unlocked = oecOpen != null ? unlockAll || isDone || oecOpen.contains(path)
+                    : unlockAll || k == 0 || isDone || done.contains(ep.missions[k - 1][1]);
+            boolean current = oecOpen != null ? path.equals(oecCurrent) : unlocked && !isDone;
             campaignRowUnlocked[k] = unlocked;
             campaignRowCurrent[k] = current;
             View row = detailMissionRow(ep, k, unlocked, isDone, current, race);
@@ -3844,6 +4597,12 @@ public class SetupActivity extends Activity {
         detailStatus = kit.text("", Kit.ACCENT, 11);
         detailStatus.setPadding(dp(8), dp(2), dp(8), dp(2));
         dt.addView(detailStatus, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        detailRaceBox = new LinearLayout(this);
+        detailRaceBox.setOrientation(LinearLayout.HORIZONTAL);
+        detailRaceBox.setGravity(Gravity.CENTER_VERTICAL);
+        detailRaceBox.setPadding(0, dp(compact ? 4 : 8), 0, 0);
+        detailRaceBox.setVisibility(View.GONE);
+        dt.addView(detailRaceBox);
         dhead.addView(dt, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         detail.addView(dhead);
         detailDesc = kit.text("", Kit.TEXT, compact ? 13 : 15);
@@ -3937,7 +4696,13 @@ public class SetupActivity extends Activity {
 
         detailTitle.setText(stripNum(name));
         String desc = missionDesc(path);
-        if (!desc.isEmpty()) {
+        if (path.startsWith(OeCampaigns.PREFIX)) {
+            detailDesc.setText(desc);
+            if (desc.isEmpty()) {
+                Object[] cm = oecMission(path);
+                if (cm != null) loadNativeDescInto(((OeCampaigns.Campaign) cm[0]).mapFile((OeCampaigns.Mission) cm[1]).getAbsolutePath(), path);
+            }
+        } else if (!desc.isEmpty()) {
             detailDesc.setText(S.t(desc));
         } else {
             // No curated text (should not happen for campaigns) — fall back to the
@@ -3950,6 +4715,7 @@ public class SetupActivity extends Activity {
         detailStatus.setText(isDone ? "\u2713 " + S.t("Įveikta") : current ? S.t("Dabartinė misija") : S.t("Prieinama"));
         detailStatus.setTextColor(sc);
         detailStatus.setBackground(kit.box(0x00000000, sc));
+        bindOecRace(path);
         updateStartButtonVisibility();   // START MISSION / REPLAY MISSION for this pick
     }
 
@@ -3963,7 +4729,8 @@ public class SetupActivity extends Activity {
     // Async-load a map's embedded scenario description into the detail panel, but
     // only apply it if that mission is still the selected one (guards against a
     // race when the user quickly selects another mission).
-    private void loadNativeDescInto(final String path) {
+    private void loadNativeDescInto(final String path) { loadNativeDescInto(path, path); }
+    private void loadNativeDescInto(final String path, final String rowKey) {
         if (!minimapLibOk) { detailDesc.setText(""); return; }
         final String gameDir = getExternalFilesDir(null).getAbsolutePath();
         final String scratch = new File(getCacheDir(), "mi.tmp").getAbsolutePath();
@@ -3974,7 +4741,7 @@ public class SetupActivity extends Activity {
             final String desc = parseMapDesc(info);
             ui.post(() -> {
                 if (campaignDetailEp != null && campaignSelIdx >= 0
-                        && path.equals(campaignDetailEp.missions[campaignSelIdx][1]))
+                        && rowKey.equals(campaignDetailEp.missions[campaignSelIdx][1]))
                     detailDesc.setText(desc.isEmpty() ? S.t("(nėra aprašymo šiam žemėlapiui)") : desc);
             });
         });
@@ -3998,6 +4765,41 @@ public class SetupActivity extends Activity {
 
     // Mods: each subdirectory of files/mods/ is a mod. Checked mods are passed to the native side
     // as --mods and their data.mpq / data/ files override the base MPQs.
+    /**
+     * G10: the LAN beacon's mods field -- "id,id" plus "@" and the game-data fingerprint
+     * when the mods ship game data, so two installs with different versions of the same
+     * mod show "mods differ". The engine itself also refuses a different fingerprint.
+     */
+    private String lobbyModsTag() {
+        String csv = enabledModsCsv();
+        String fp = ModFingerprint.of(this, csv);
+        return fp.isEmpty() ? csv : csv + "@" + fp;
+    }
+
+    /** G10: why the active mod set cannot start (a requirement off, two conflicting mods on), or null. */
+    private String activeModSetProblem() {
+        java.util.Map<String, ModEntry> byId = installedModsById(), active = new java.util.HashMap<>();
+        for (ModEntry o : byId.values()) if (o.active) active.put(o.id, o);
+        StringBuilder sb = new StringBuilder();
+        for (ModEntry o : active.values()) {
+            for (String r : o.requires) if (!active.containsKey(r)) sb.append("• ").append(o.name).append(": ").append(S.t("reikia")).append(' ').append(modName(byId, r)).append('\n');
+            for (String c : o.conflicts) if (active.containsKey(c)) sb.append("• ").append(o.name).append(": ").append(S.t("nesuderinamas su")).append(' ').append(modName(byId, c)).append('\n');
+        }
+        return sb.length() == 0 ? null : sb.toString().trim();
+    }
+
+    /** True (and a dialog) when the active mods break their own requires / conflicts. */
+    private boolean refuseModSet() {
+        String why = activeModSetProblem();
+        if (why == null) return false;
+        new KitDialog(this)
+                .setTitle(S.t("Modų rinkinys netinkamas"))
+                .setMessage(why + "\n\n" + S.t("Pataisykite modų puslapyje."))
+                .setPositiveButton(S.t("Gerai"), null)
+                .show();
+        return true;
+    }
+
     private String enabledModsCsv() {
         File modsDir = new File(getExternalFilesDir(null), "mods");
         File[] dirs = modsDir.listFiles(File::isDirectory);
@@ -4110,9 +4912,26 @@ public class SetupActivity extends Activity {
 
     // A choice among a few labelled values.
     private void setSegments(LinearLayout root, String label, String hint, String[] labels, int sel, Kit.IntSink sink) {
-        LinearLayout row = setRow(label, hint);
-        row.addView(kit.segmented(labels, sel, sink), new LinearLayout.LayoutParams(0, hdp(44), labels.length > 4 ? 2.2f : 1.3f));
+        setSegments(root, label, hint, null, labels, sel, sink, null);
+    }
+
+    // `tip`: a longer explanation shown on long press / hover instead of a second line.
+    // `enabled`: cells that can be picked (null = all).
+    private void setSegments(LinearLayout root, String label, String hint, String tip, String[] labels, int sel,
+                             Kit.IntSink sink, boolean[] enabled) {
+        LinearLayout row = setRow(tip != null ? label + "  ⓘ" : label, hint);
+        row.addView(kit.segmented(labels, sel, sink, enabled), new LinearLayout.LayoutParams(0, hdp(44), labels.length > 4 ? 2.2f : 1.3f));
+        if (tip != null) kit.attachTip(row.getChildAt(0), tip);
         root.addView(row);
+    }
+
+    // SC:R data the engine can read: the folder is set, holds a CASC and the app may open it.
+    private boolean scrAvailable() {
+        String dir = prefs().getString("scrCascDir", "");
+        if (dir.isEmpty() || !new File(dir, ".build.info").exists() || !new File(dir, "data/data").isDirectory()) return false;
+        File gameDir = getExternalFilesDir(null);
+        boolean inApp = gameDir != null && dir.startsWith(gameDir.getAbsolutePath());
+        return android.os.Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager() || inApp;
     }
 
     private void setNote(LinearLayout root, String text) {
@@ -4149,6 +4968,9 @@ public class SetupActivity extends Activity {
         scrRow.addView(scrIndicator, 0, sInd);
         scrRow.addView(kit.smallButton(S.t("Pasirinkti SC:R aplanką"), this::pickScrFolder),
                 new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(40)));
+        LinearLayout.LayoutParams scrArcLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(40));
+        scrArcLp.leftMargin = dp(6);
+        scrRow.addView(kit.smallButton(S.t("Iš archyvo"), () -> pickFiles(REQ_PICK_MPQ)), scrArcLp);
         files.addView(scrRow);
         scrStatus = kit.text("", Kit.TEXT2, 12);
         scrStatus.setPadding(dp(22), 0, 0, dp(10));
@@ -4170,12 +4992,13 @@ public class SetupActivity extends Activity {
                             .remove("gfxTier").remove("emissiveGlow").remove("shadowSoft").remove("bloomLevel")
                             .remove("sharpenFilter").remove("sharpenLevel").remove("gradeLevel")
                             .remove("sunShadow").remove("sunShadowLen").remove("sunShadowSign")
-                            .remove("pointLights").remove("lightStrength")
+                            .remove("pointLights").remove("lightStrength").remove("scrFont")
                             // interface controls
                             .remove("showFps").remove("showApm").remove("healthBarsAlways").remove("cameraSpeed")
                             .remove("resourceCounts").remove("showSaturation").remove("showZoomButtons").remove("equipGrey")
                             .remove("tapCommand").remove("mouseButtons").remove("renderInterp")
                             .remove("inputMode").remove("edgeScroll").remove(Keybinds.PREF)
+                            .remove("gamepad").remove(PadBinds.PREF).remove("padSpeed").remove("padDead").remove("padSwap")
                             .remove("hudStyle").remove("hud3Template").remove("hud3Dock").remove("hud3WheelMs").remove("hud3Pen")
                             .remove("hud3Latch").remove("hud3Labels").remove("hud3Left").remove("hud3Scale").remove("hud3Vibrate").remove("hud3AllGroups")
                             .apply();
@@ -4224,9 +5047,13 @@ public class SetupActivity extends Activity {
         final String[] tierVals = {"sd", "hd2", "full"};
         int tierSel = 1;
         for (int i = 0; i < tierVals.length; ++i) if (tierVals[i].equals(prefs().getString("gfxTier", "hd2"))) tierSel = i;
-        setSegments(gfx, S.t("Grafika (HD)"), S.t("HD2 rekomenduojama. FULL HD reikia SC:R ir galingos planšetės."),
-                new String[]{"SD", "HD2", "FULL HD"}, tierSel, idx -> prefs().edit().putString("gfxTier", tierVals[idx]).apply());
-        if (prefs().getString("scrCascDir", "").isEmpty())
+        final boolean scr = scrAvailable();
+        if (!scr) tierSel = 0;
+        setSegments(gfx, S.t("Grafika (HD)"), scr ? S.t("HD2 rekomenduojama. FULL HD reikia galingos planšetės.")
+                        : S.t("HD2 ir FULL HD reikia StarCraft: Remastered failų (Failai)."), null,
+                new String[]{"SD", "HD2", "FULL HD"}, tierSel, idx -> prefs().edit().putString("gfxTier", tierVals[idx]).apply(),
+                scr ? null : new boolean[]{true, false, false});
+        if (!scr)
             setNote(gfx, S.t("SC:R aplankas nepasirinktas — HD valdikliai veiks tik pasirinkus jį (Failai)."));
         setSwitch(gfx, S.t("Švytintys efektai (emissive)"), "emissiveGlow",
                 S.t("SC:R vienetų savišvytėjimas — ginklų blyksniai, psi, skydai, warp."), true);
@@ -4236,6 +5063,8 @@ public class SetupActivity extends Activity {
                 S.t("Pastatai ir vienetai meta pakreiptą šešėlį."), false);
         setSlider(gfx, S.t("Šešėlio ilgis"),
                 S.t("0 = beveik plokščias."), "sunShadowLen", 40, 100);
+        setSwitch(gfx, S.t("SC:R žaidimo šriftas"), "scrFont",
+                S.t("HUD tekstas SC:R šriftu. Tik HD; išdėstymas nekinta."), false);
         setSwitch(gfx, S.t("Dinaminės šviesos"), "pointLights",
                 S.t("Burtai, ugnis ir sprogimai apšviečia aplinką. Tik HD."), false);
         setSlider(gfx, S.t("Šviesų stiprumas"), null, "lightStrength", 100, 200);
@@ -4256,26 +5085,33 @@ public class SetupActivity extends Activity {
                 S.t("Klasikiniame HUD: komandų eilės ir pažymėjimo papildymo mygtukas."), true);
         setSwitch(ctl, S.t("Bakstelėjimas = komanda"), "tapCommand",
                 S.t("Bakstelėjimas žemėje ar į priešą duoda komandą pažymėtiems."), true);
-        final LinearLayout touchBox = new LinearLayout(this), kbmBox = new LinearLayout(this);
+        final LinearLayout touchBox = new LinearLayout(this), kbmBox = new LinearLayout(this), padBox = new LinearLayout(this);
         touchBox.setOrientation(LinearLayout.VERTICAL);
         kbmBox.setOrientation(LinearLayout.VERTICAL);
-        final boolean kbmOn = Keybinds.kbm(prefs());
-        touchBox.setVisibility(kbmOn ? View.GONE : View.VISIBLE);
-        kbmBox.setVisibility(kbmOn ? View.VISIBLE : View.GONE);
-        setSegments(ctl, S.t("Įvesties režimas"),
-                S.t("Klaviatūra + pelė: kairysis žymi (ir rėmeliu), dešinysis duoda komandą, kamera — ekrano kraštu ir klavišais, klavišai komandoms ir grupėms. LAN žaidėjams prie vardo rodoma klaviatūros žymė."),
-                new String[]{S.t("Lietimas"), S.t("Klaviatūra + pelė")}, kbmOn ? 1 : 0,
+        padBox.setOrientation(LinearLayout.VERTICAL);
+        final boolean padAllowed = Kit.gamepadAllowed(this);
+        final int mode0 = Keybinds.kbm(prefs()) ? 1 : (padAllowed && PadBinds.on(prefs()) ? 2 : 0);
+        touchBox.setVisibility(mode0 == 1 ? View.GONE : View.VISIBLE);
+        kbmBox.setVisibility(mode0 == 1 ? View.VISIBLE : View.GONE);
+        padBox.setVisibility(mode0 == 2 ? View.VISIBLE : View.GONE);
+        final String[] modeIds = {"touch", "kbm", "pad"};
+        setSegments(ctl, S.t("Įvesties režimas"), null,
+                padAllowed ? S.t("Klaviatūra + pelė: kairysis žymi (ir rėmeliu), dešinysis duoda komandą, kamera — ekrano kraštu ir klavišais, klavišai komandoms ir grupėms. Pultas: lazdelės — žymeklis ir kamera, mygtukų veiksmai renkami iš sąrašo; lietimas veikia ir toliau. LAN žaidėjams prie vardo rodoma klaviatūros žymė.")
+                        : S.t("Klaviatūra + pelė: kairysis žymi (ir rėmeliu), dešinysis duoda komandą, kamera — ekrano kraštu ir klavišais, klavišai komandoms ir grupėms. LAN žaidėjams prie vardo rodoma klaviatūros žymė."),
+                padAllowed ? new String[]{S.t("Lietimas"), S.t("Klaviatūra + pelė"), S.t("Pultas")}
+                        : new String[]{S.t("Lietimas"), S.t("Klaviatūra + pelė")}, mode0,
                 idx -> {
-                    prefs().edit().putString("inputMode", idx == 1 ? "kbm" : "touch").apply();
+                    prefs().edit().putString("inputMode", modeIds[idx]).apply();
                     if (mpLobby != null) mpLobby.updateLocalKbm(idx == 1);
                     touchBox.setVisibility(idx == 1 ? View.GONE : View.VISIBLE);
                     kbmBox.setVisibility(idx == 1 ? View.VISIBLE : View.GONE);
-                });
+                    padBox.setVisibility(idx == 2 ? View.VISIBLE : View.GONE);
+                }, null);
         ctl.addView(touchBox);
-        setSegments(touchBox, S.t("Pelės mygtukai"),
+        setSegments(touchBox, S.t("Pelės mygtukai"), null,
                 S.t("Kaip pelė veikia lietimo režime. Kaip pirštas — kairysis mygtukas yra pirštas (bakstelėti, laikyti, tempti), dešiniuoju tempiama kamera. Klasikinis — kairysis tik žymi (spustelėjimas, dvigubas spustelėjimas, rėmelis); dešinysis: spustelėjimas — komanda į tą vietą, laikymas — komandų ratas, tempimas — kamera. Sukeisti — kaip Klasikinis, tik kairysis ir dešinysis sukeisti vietomis (kairiarankiams). Visada: vidurinis mygtukas tempia kamerą, ratukas keičia mastelį."),
                 new String[]{S.t("Kaip pirštas"), S.t("Klasikinis"), S.t("Sukeisti")}, Math.max(0, Math.min(2, prefs().getInt("mouseButtons", 1))),
-                idx -> prefs().edit().putInt("mouseButtons", idx).apply());
+                idx -> prefs().edit().putInt("mouseButtons", idx).apply(), null);
         setSwitch(ctl, S.t("LAN sklandumas"), "renderInterp", S.t("Sklandesnis vienetų judėjimas LAN žaidime."), true);
         setSlider(ctl, S.t("Kameros greitis"), S.t("Krašto ir klaviatūros slinkimo greitis (100 = įprastas)."), "cameraSpeed", 100, 250);
         setSwitch(ctl, S.t("Rodyti mastelio mygtukus"), "showZoomButtons", S.t("Ekrane rodomi - / + mygtukai. Mastelį dviem pirštais keisti galima ir be jų."), false);
@@ -4284,7 +5120,16 @@ public class SetupActivity extends Activity {
         setSwitch(kbmBox, S.t("Kamera ekrano kraštu"), "edgeScroll",
                 S.t("Klaviatūra + pelė: pelė prie ekrano krašto slenka kamerą."), true);
         kbmBox.addView(kit.label(S.t("Klavišai ir pelės mygtukai")));
-        kbmBox.addView(Keybinds.table(this, kit, prefs()));
+        kbmBox.addView(Keybinds.table(this, kit, prefs(), getExternalFilesDir(null)));
+        if (padAllowed) {
+            padBox.setTag(FULL_WIDTH);
+            ctl.addView(padBox);
+            setSlider(padBox, S.t("Pulto žymeklio greitis"), S.t("Žymeklio lazdelės greitis (100 = įprastas)."), "padSpeed", 100, 300);
+            setSlider(padBox, S.t("Lazdelių mirties zona"), S.t("Kiek palenkti lazdelę, kol ji pradeda veikti (18 = įprasta; didink, jei žymeklis slenka pats)."), "padDead", 18, 50);
+            setSwitch(padBox, S.t("Sukeisti lazdeles"), "padSwap", S.t("Dešinė lazdelė — žymeklis, kairė — kamera ir ratas."), false);
+            padBox.addView(kit.label(S.t("Pulto mygtukai")));
+            padBox.addView(PadBinds.table(this, kit, prefs()));
+        }
 
         // ---- Žaidimo HUD: the classic bar (v2) or the touch HUD (v3) and its options ----
         LinearLayout hud = settingsSection(S.t("Žaidimo HUD"));
@@ -4313,10 +5158,13 @@ public class SetupActivity extends Activity {
         // ---- Sąsaja ----
         LinearLayout ifc = settingsSection(S.t("Sąsaja"));
         final String[] splashModes = {"classic", "hd", "off"};
-        setSegments(ifc, S.t("Paleidimo ekranas"), S.t("Žaidimo pradžios paveikslas iš jūsų failų. HD — iš SC:R failų."),
+        final boolean scrSplash = scrAvailable();
+        setSegments(ifc, S.t("Paleidimo ekranas"), scrSplash ? S.t("Žaidimo pradžios paveikslas iš jūsų failų. HD — iš SC:R failų.")
+                        : S.t("Su 1.16.1 failais — tik klasikinis. Kiti atsirakina su StarCraft: Remastered."), null,
                 new String[]{S.t("Klasikinis"), "HD", S.t("Išjungtas")},
-                Math.max(0, Arrays.asList(splashModes).indexOf(prefs().getString("startSplash", "classic"))),
-                idx -> prefs().edit().putString("startSplash", splashModes[idx]).apply());
+                scrSplash ? Math.max(0, Arrays.asList(splashModes).indexOf(prefs().getString("startSplash", "classic"))) : 0,
+                idx -> prefs().edit().putString("startSplash", splashModes[idx]).apply(),
+                scrSplash ? null : new boolean[]{true, false, false});
         final String[] langCodes = {S.EN, S.LT};
         setSegments(ifc, S.t("Kalba"), null, new String[]{"English", "Lietuvių"}, S.LT.equals(prefs().getString("lang", S.EN)) ? 1 : 0, idx -> {
             String code = langCodes[idx];
@@ -4375,6 +5223,17 @@ public class SetupActivity extends Activity {
                   + "Naudoja jūsų paties žaidimo duomenų failus.") + "\n\n"
                 + S.t("Įrenginys: ") + android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL
                 + "  (Android " + android.os.Build.VERSION.RELEASE + ")");
+        final String[] org = origin();
+        LinearLayout orgRow = setRow(S.t("Autorius") + ": " + org[0].replace("open1161HD by ", ""), org[1]);
+        orgRow.addView(kit.smallButton(S.t("Atidaryti"), () -> openUrl("https://" + org[1])),
+                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, hdp(40)));
+        abt.addView(orgRow);
+        if (!"1".equals(org[2])) {
+            TextView unoff = kit.text(S.t("Neoficiali versija — pasirašyta ne autoriaus raktu. Originalas:") + " " + org[1],
+                    Kit.DANGER, 13);
+            unoff.setPadding(0, dp(2), 0, dp(6));
+            abt.addView(unoff);
+        }
         setNote(abt, S.t("Įtaisyti botai:") + "\n"
                 + "• UnifiedAI — open1161HD");
         // v1.0.24: updates from GitHub releases (Updater.REPO).
@@ -4596,7 +5455,7 @@ public class SetupActivity extends Activity {
         }
         if (scrStatus != null) {
             scrStatus.setText(set ? S.t("SC:R rasta — HD įjungta.")
-                                  : S.t("SC:R aplankas nepasirinktas — tik SD / HD2."));
+                                  : S.t("SC:R aplankas nepasirinktas — tik SD."));
             scrStatus.setTextColor(set ? Color.rgb(120, 210, 140) : Color.rgb(220, 120, 120));
         }
     }
@@ -4738,6 +5597,14 @@ public class SetupActivity extends Activity {
             return;
         }
         if (resultCode != RESULT_OK || data == null) return;
+        if (requestCode == REQ_PICK_OECAMPAIGN) {
+            List<Uri> picked = new ArrayList<>();
+            if (data.getClipData() != null)
+                for (int i = 0; i < data.getClipData().getItemCount(); ++i) picked.add(data.getClipData().getItemAt(i).getUri());
+            else if (data.getData() != null) picked.add(data.getData());
+            if (!picked.isEmpty()) importOecampaigns(picked);
+            return;
+        }
         List<Uri> uris = new ArrayList<>();
         if (data.getClipData() != null) {
             for (int i = 0; i < data.getClipData().getItemCount(); ++i) {
@@ -4750,24 +5617,101 @@ public class SetupActivity extends Activity {
         importInBackground(uris, requestCode);
     }
 
+    // G11: copy each picked bundle aside, verify it like the editor does, install it.
+    private void importOecampaigns(final List<Uri> uris) {
+        final Kit.ProgressPanel pp = new Kit(this).progressPanel(null);
+        pp.busy(S.t("Tikrinama…"));
+        final Dialog dialog = new KitDialog(this).setTitle(S.t("Importuojamos kampanijos")).setView(pp.view)
+                .setWidth(560).setCancelable(false).create();
+        dialog.show();
+        new Thread(() -> {
+            final StringBuilder msg = new StringBuilder();
+            File tmp = new File(getCacheDir(), "import.oecampaign");
+            for (Uri uri : uris) {
+                String nm = displayName(uri);
+                if (nm == null) nm = uri.getLastPathSegment();
+                try {
+                    try (InputStream in = getContentResolver().openInputStream(uri);
+                         java.io.FileOutputStream fo = new java.io.FileOutputStream(tmp)) {
+                        if (in == null) throw new java.io.IOException("cannot open");
+                        byte[] b = new byte[65536];
+                        long total = 0;
+                        int n;
+                        while ((n = in.read(b)) > 0) {
+                            fo.write(b, 0, n);
+                            if ((total += n) > OeCampaigns.MAX_TOTAL * 2) throw new java.io.IOException("too big");
+                        }
+                    }
+                    OeCampaigns.Campaign c = OeCampaigns.install(getExternalFilesDir(null), tmp);
+                    msg.append("\u2713 ").append(c.title.isEmpty() ? nm : c.title).append(" · v").append(c.version)
+                       .append(" · ").append(c.missions.size()).append(" ").append(S.t("misijų")).append('\n');
+                } catch (Exception e) {
+                    msg.append("\u2717 ").append(nm).append('\n').append(e.getMessage()).append("\n\n");
+                }
+            }
+            tmp.delete();
+            ui.post(() -> {
+                dialog.dismiss();
+                new KitDialog(this).setTitle(S.t("Importuojamos kampanijos")).setMessage(msg.toString().trim())
+                        .setPositiveButton(S.t("Gerai"), null).show();
+                if (campaignEpisodeBox != null) campaignBackToEpisodes();
+                refresh();
+            });
+        }, "oecampaign-import").start();
+    }
+
+    /** G11: every profile's progress, reached branches and current mission inside campaign `c`. Saves stay. */
+    private void forgetOecampaignProgress(OeCampaigns.Campaign c) {
+        String prefix = c.key("");
+        SharedPreferences.Editor ed = prefs().edit();
+        for (java.util.Map.Entry<String, ?> kv : prefs().getAll().entrySet()) {
+            String k = kv.getKey();
+            if (!k.startsWith("p.")) continue;
+            if (k.endsWith(".campaignDir") && String.valueOf(kv.getValue()).startsWith(prefix)) ed.putString(k, "");
+            else if ((k.endsWith(".campaignDone") || k.endsWith(".oecReached")) && kv.getValue() instanceof java.util.Set) {
+                java.util.Set<String> keep = new java.util.HashSet<>();
+                for (Object o : (java.util.Set<?>) kv.getValue()) if (!String.valueOf(o).startsWith(prefix)) keep.add(String.valueOf(o));
+                ed.putStringSet(k, keep);
+            }
+        }
+        ed.apply();
+    }
+
+    private void confirmRemoveOecampaign(final OeCampaigns.Campaign c) {
+        new KitDialog(this)
+                .setTitle(S.t("Pašalinti kampaniją?"))
+                .setMessage(c.title + (c.author.isEmpty() ? "" : " · " + c.author) + "\n\n"
+                        + S.t("Kampanijos failai ir jos progresas bus ištrinti. Išsaugoti žaidimai lieka, bet juos įkelti pavyks tik vėl importavus šią kampaniją."))
+                .setPositiveButton(S.t("Pašalinti"), (d, w) -> {
+                    try { OeCampaigns.remove(getExternalFilesDir(null), c.id); }
+                    catch (java.io.IOException e) { Kit.toast(this, e.getMessage(), Toast.LENGTH_LONG); }
+                    forgetOecampaignProgress(c);
+                    prefs().edit().putString("returnToEpisode", RETURN_TO_CAMPAIGN_GRID).apply();
+                    recreate();   // the rail's count and the current mission pointed into it
+                })
+                .setNegativeButton(S.t("Atšaukti"), null)
+                .show();
+    }
+
     private void importInBackground(List<Uri> uris, int requestCode) {
         final boolean isMpq = requestCode == REQ_PICK_MPQ;
         final boolean isMap = requestCode == REQ_PICK_MAP;
         final boolean isBot = requestCode == REQ_PICK_BOT;
         final boolean isMod = requestCode == REQ_PICK_MOD;
-        final TextView progressText = new TextView(this);
-        int pad = dp(24);
-        progressText.setPadding(pad, pad, pad, pad);
-        progressText.setTextColor(Color.WHITE);
+        final java.util.concurrent.atomic.AtomicBoolean cancel = new java.util.concurrent.atomic.AtomicBoolean();
+        final Kit.ProgressPanel pp = new Kit(this).progressPanel(null);
+        final TextView progressText = pp.status;
         progressText.setMinLines(2);   // "Copying:" + the file name; the dialog sizes to the first text
-        progressText.setText(S.t("Ruošiamasi…"));
+        pp.busy(S.t("Ruošiamasi…"));
         final Dialog dialog = new KitDialog(this)
                 .setTitle(S.t(isMpq ? "Importuojami MPQ failai"
                         : isMap ? "Importuojami žemėlapiai"
                         : isBot ? "Importuojami botai"
                         : isMod ? "Importuojami modai" : "Importuojami replay failai"))
-                .setView(progressText)
+                .setView(pp.view)
+                .setWidth(560)
                 .setCancelable(false)
+                .setNegativeButton(S.t("Atšaukti"), (d, w) -> cancel.set(true))
                 .create();
         dialog.show();
 
@@ -4775,7 +5719,20 @@ public class SetupActivity extends Activity {
             int copied = 0;
             List<String> warnings = new ArrayList<>();
             File filesDir = getExternalFilesDir(null);
+            // v1.0.27: ZIP / 7z / RAR (split RAR too) holding the MPQs and/or a
+            // Remastered folder; a loose .build.info may come with a Data-only archive.
+            List<ArchiveImporter.Picked> archives = new ArrayList<>();
+            Uri buildInfo = null;
+            List<Uri> plain = new ArrayList<>();
             for (Uri uri : uris) {
+                String nm = isMpq ? displayName(uri) : null;
+                int kind = nm != null ? ArchiveImporter.sniff(getContentResolver(), uri) : ArchiveImporter.KIND_NONE;
+                if (kind != ArchiveImporter.KIND_NONE) archives.add(new ArchiveImporter.Picked(uri, nm, kind));
+                else if (nm != null && nm.equalsIgnoreCase(".build.info")) buildInfo = uri;
+                else plain.add(uri);
+            }
+            for (Uri uri : plain) {
+                if (cancel.get()) break;
                 String name = displayName(uri);
                 if (name == null) continue;
                 final String shownName = name;
@@ -4846,9 +5803,33 @@ public class SetupActivity extends Activity {
                     warnings.add("Nepavyko nukopijuoti " + name + ": " + e.getMessage());
                 }
             }
+            String cascFromArchive = null;
+            if (!archives.isEmpty() && !cancel.get()) {
+                String[] known = new String[MPQ_NAMES.length + OPTIONAL_MPQ_NAMES.length + 1];
+                System.arraycopy(MPQ_NAMES, 0, known, 0, MPQ_NAMES.length);
+                System.arraycopy(OPTIONAL_MPQ_NAMES, 0, known, MPQ_NAMES.length, OPTIONAL_MPQ_NAMES.length);
+                known[known.length - 1] = GAME_EXE;
+                ArchiveImporter.Result ar = ArchiveImporter.run(this, archives, buildInfo, known, new ArchiveImporter.Ui() {
+                    @Override public void status(String text) { ui.post(() -> progressText.setText(text)); }
+                    @Override public boolean cancelled() { return cancel.get(); }
+                });
+                for (File f : ar.mpqs) {
+                    String w = validateMpq(f);
+                    if (w != null) warnings.add(w);
+                    ++copied;
+                }
+                warnings.addAll(ar.warnings);
+                cascFromArchive = ar.cascDir;
+            }
             final int copiedFinal = copied;
+            final String cascFinal = cascFromArchive;
             ui.post(() -> {
                 dialog.dismiss();
+                if (cascFinal != null) {
+                    prefs().edit().putString("scrCascDir", cascFinal).apply();
+                    updateScrIndicator();
+                    Kit.toast(this, S.t("SC:R aplankas nustatytas"), Toast.LENGTH_SHORT);
+                }
                 if (!warnings.isEmpty()) {
                     new KitDialog(this)
                             .setTitle(S.t("Importuota su pastabomis"))
@@ -5098,6 +6079,13 @@ public class SetupActivity extends Activity {
     }
 
     private String validateMpq(File f) {
+        if (GAME_EXE.equals(f.getName())) {
+            try (java.io.RandomAccessFile in = new java.io.RandomAccessFile(f, "r")) {
+                if (in.length() >= 64 && in.read() == 'M' && in.read() == 'Z') return null;
+            } catch (Exception ignored) {
+            }
+            return f.getName() + ": " + S.t("tai ne Windows programos failas.");
+        }
         int idx = -1;
         for (int i = 0; i < MPQ_NAMES.length; ++i) {
             if (MPQ_NAMES[i].equalsIgnoreCase(f.getName())) { idx = i; break; }
@@ -5136,8 +6124,11 @@ public class SetupActivity extends Activity {
     // Optional CD archives: the in-game music lives in these (not in
     // StarDat/BrooDat). The native side looks them up by exact name.
     private static final String[] OPTIONAL_MPQ_NAMES = {"StarCraft.mpq", "BroodWar.mpq"};
+    // The user's own 1.16.1 StarCraft.exe: the engine reads its requirement tables (EUD maps).
+    private static final String GAME_EXE = "StarCraft.exe";
 
     private String canonicalMpqName(String name) {
+        if (GAME_EXE.equalsIgnoreCase(name)) return GAME_EXE;
         for (String m : MPQ_NAMES) {
             if (m.equalsIgnoreCase(name)) return m;
         }
@@ -5212,7 +6203,8 @@ public class SetupActivity extends Activity {
         final boolean bwOk = !blank && missing.isEmpty();
         String scrDir = blank ? "" : prefs().getString("scrCascDir", "");
         boolean scrContent = !scrDir.isEmpty() && new File(scrDir, ".build.info").exists() && new File(scrDir, "data/data").isDirectory();
-        boolean access = !blank && (android.os.Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager());
+        boolean scrInApp = !scrDir.isEmpty() && gameDir != null && scrDir.startsWith(gameDir.getAbsolutePath());
+        boolean access = !blank && (android.os.Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager() || scrInApp);
         boolean scrOk = scrContent && access;
         final int GOOD = Kit.LABEL, BAD = Kit.DANGER, NONE = Kit.TEXT2;
         boolean wideCards = getResources().getConfiguration().screenWidthDp >= 700;
@@ -5249,6 +6241,9 @@ public class SetupActivity extends Activity {
         bw.addView(new android.widget.Space(this), new LinearLayout.LayoutParams(1, 0, 1f));
         LinearLayout.LayoutParams bwBtn = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         bwBtn.topMargin = dp(12);
+        TextView bwNote = kit.text(S.t("Tinka ir ZIP / 7z / RAR archyvas (taip pat padalytas RAR) — MPQ failai ir SC:R aplankas išskleidžiami automatiškai."), Kit.TEXT2, 11);
+        bwNote.setPadding(0, dp(8), 0, 0);
+        bw.addView(bwNote);
         LinearLayout bwButtons = new LinearLayout(this);
         bwButtons.setOrientation(LinearLayout.HORIZONTAL);
         bwButtons.setGravity(Gravity.CENTER_VERTICAL);
@@ -5270,8 +6265,14 @@ public class SetupActivity extends Activity {
         scNote.setPadding(0, dp(8), 0, dp(10));
         sc.addView(scNote);
         sc.addView(new android.widget.Space(this), new LinearLayout.LayoutParams(1, 0, 1f));
-        sc.addView(kit.button(S.t("Pasirinkti SC:R aplanką"), 0, this::pickScrFolder),
+        LinearLayout scBtns = new LinearLayout(this);
+        scBtns.setOrientation(LinearLayout.HORIZONTAL);
+        scBtns.addView(kit.button(S.t("Pasirinkti SC:R aplanką"), 0, this::pickScrFolder),
                 new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout.LayoutParams arcLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        arcLp.leftMargin = dp(8);
+        scBtns.addView(kit.button(S.t("Iš archyvo"), 0, () -> pickFiles(REQ_PICK_MPQ)), arcLp);
+        sc.addView(scBtns, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         if (wideCards) {
             LinearLayout.LayoutParams l1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
@@ -5424,7 +6425,7 @@ public class SetupActivity extends Activity {
         if (rows.isEmpty()) return false;
         // campaign: the mission just played and the one it unlocked (victory only)
         String played = outcome != null ? outcome[0] : getCampaignDir();
-        String next = outcome != null && won ? outcome[1] : null;
+        String next = outcome != null && (won || outcome.length > 2) && !outcome[1].isEmpty() ? outcome[1] : null;
         setContentView(buildScoreScreen(won, local, frames, rows, campaign ? played : null, next));
         return true;
     }
@@ -5581,7 +6582,8 @@ public class SetupActivity extends Activity {
                 if (!ep.isEmpty()) prefs().edit().putString("returnToEpisode", ep).apply();
                 recreate();
             };
-            final boolean canContinue = won && nextDir != null && !nextDir.isEmpty();
+            // nextDir is set only for a victory, or a .oecampaign defeat edge (G11)
+            final boolean canContinue = nextDir != null && !nextDir.isEmpty();
             String[] labels = {S.t("Misijų sąrašas"), S.t("Iš naujo"), S.t("Tęsti")};
             Runnable[] runs = {toList, () -> launchAfterRecreate(campaignDir),
                     () -> { if (canContinue) launchAfterRecreate(nextDir); }};
@@ -5854,7 +6856,15 @@ public class SetupActivity extends Activity {
                 try { mi = isInternal ? nativeMapInfoInternal(gameDir, mapArg, scratch) : nativeMapInfo(mapArg); }
                 catch (Throwable ignored) {}
                 final Bitmap bmp = err == null && out.exists() ? android.graphics.BitmapFactory.decodeFile(out.getAbsolutePath()) : null;
-                final String d = parseMapDesc(mi);
+                String dd = parseMapDesc(mi);
+                if (!isInternal) {
+                    String[] why = extendedMapBlock(new File(mapArg));
+                    String prof = null;
+                    try { prof = nativeMapProfile(mapArg); } catch (Throwable ignored) {}
+                    if (why != null) dd = "\u26A0 " + why[0] + ". " + why[1] + (dd.isEmpty() ? "" : "\n\n" + dd);
+                    else if (prof != null) dd = S.t("Išplėstinis profilis") + (dd.isEmpty() ? "" : "\n\n" + dd);
+                }
+                final String d = dd;
                 ui.post(() -> {
                     if (my != seq) return;
                     img.setImageBitmap(bmp);
@@ -5884,6 +6894,7 @@ public class SetupActivity extends Activity {
 
     // The map selection is shared by the single-player and the LAN Create lists.
     private void showSpPreview(String title, boolean isInternal, String mapArg) {
+        loadUmsSlots(isInternal, mapArg);
         if (spPane != null) spPane.show(title, isInternal, mapArg);
         if (mpPane != null) mpPane.show(title, isInternal, mapArg);
     }
@@ -6199,6 +7210,11 @@ public class SetupActivity extends Activity {
     // slotN = single-player). Its human title comes from the container's relaunch args
     // (the same argv the launcher uses to resume it): a campaign dir -> Episode +
     // Mission; a melee -> NvN race-vs-race. Date/time is the file's mtime.
+    // The save's campaign mission: the MPQ dir (--campaign) or a .oecampaign mission key (G11).
+    private String saveCampaignArg(String[] args) {
+        String d = argValue(args, "--campaign");
+        return d != null ? d : argValue(args, "--oec-mission");
+    }
     private boolean saveIsCampaign(File f) {
         return f.getName().toLowerCase(Locale.ROOT).startsWith("cslot");
     }
@@ -6260,7 +7276,7 @@ public class SetupActivity extends Activity {
     // Categorised display title for a save (kind decided by the slot prefix).
     private String saveDisplayTitle(File sv) {
         String[] args = readSaveArgs(sv);
-        return saveIsCampaign(sv) ? campaignTitle(argValue(args, "--campaign")) : spTitle(args);
+        return saveIsCampaign(sv) ? campaignTitle(saveCampaignArg(args)) : spTitle(args);
     }
 
     private void renderSaveList() {
@@ -6288,8 +7304,10 @@ public class SetupActivity extends Activity {
     // The save's local race (for its portrait): the campaign dir's race, or --race.
     private int saveRace(File sv, String[] args) {
         if (saveIsCampaign(sv)) {
-            String d = argValue(args, "--campaign");
+            String d = saveCampaignArg(args);
             if (d == null) return -1;
+            Object[] cm = oecMission(d);
+            if (cm != null) { int r = ((OeCampaigns.Mission) cm[1]).race; return r >= 0 && r <= 2 ? r : -1; }
             return d.contains("zerg") ? 0 : d.contains("protoss") ? 2 : 1;
         }
         return parseIntSafe(argValue(args, "--race"), -1);
@@ -6333,7 +7351,7 @@ public class SetupActivity extends Activity {
         // (an unnamed save's title already says it)
         if (user != null) {
             if (saveIsCampaign(sv)) {
-                String dir = argValue(args, "--campaign");
+                String dir = saveCampaignArg(args);
                 String epT = "?", mi = dir == null ? "?" : dir;
                 if (dir != null) for (Episode ep : campaignEpisodes()) for (String[] m : ep.missions)
                     if (m[1].equalsIgnoreCase(dir)) { epT = ep.title; mi = m[0]; }
@@ -6359,7 +7377,7 @@ public class SetupActivity extends Activity {
         // its checkmark. The mission dir lives in the save's own relaunch args
         // ("--campaign campaign/<race>/<m>").
         if (saveIsCampaign(sv)) {
-            String cdir = argValue(readSaveArgs(sv), "--campaign");
+            String cdir = saveCampaignArg(readSaveArgs(sv));
             if (cdir != null && !cdir.isEmpty()) setCampaignDir(cdir);
         }
         Intent i = new Intent(this, OpenBWActivity.class);
@@ -6623,6 +7641,15 @@ public class SetupActivity extends Activity {
             return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
         } catch (Exception e) {
             return "?";
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private int versionCode() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionCode;
+        } catch (Exception e) {
+            return 0;
         }
     }
 

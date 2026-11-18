@@ -88,6 +88,26 @@ final class PortraitStore {
     private static native int[] nativeDecodeSmkStep(String gameDir, String path, int step, int maxFrames);
     private static native int[] nativeDecodeWebm(String cascDir, String name, int maxFrames);
     private static native int[] nativeDecodeDds(String cascDir, String name);
+    private static native int[] nativeDecodeArtWebm(String cascDir, String name, int step, int maxH);
+    private static native String nativeKeyDefaults();
+    private static native String[] nativeStatTxt(String gameDir, int[] idx);
+    private static native int[] nativeCmdicons(String gameDir);
+
+    /** The game's default key bindings, "id=code,..." (ui/kbm_defaults.h); "" without the library. */
+    static String keyDefaults() {
+        if (!libOk) return "";
+        try { String s = nativeKeyDefaults(); return s == null ? "" : s; } catch (Throwable t) { return ""; }
+    }
+    /** rez\stat_txt.tbl entries (1-based), raw bytes as chars; null without game files. Off the UI thread. */
+    static String[] statTxt(File gameDir, int[] idx) {
+        if (!libOk || gameDir == null) return null;
+        try { return nativeStatTxt(gameDir.getAbsolutePath(), idx); } catch (Throwable t) { return null; }
+    }
+    /** cmdicons.grp as int[]{n, w, h, ARGB frames...}; null without game files. Off the UI thread. */
+    static int[] cmdicons(File gameDir) {
+        if (!libOk || gameDir == null) return null;
+        try { return nativeCmdicons(gameDir.getAbsolutePath()); } catch (Throwable t) { return null; }
+    }
 
     // ---- HD portraits (F5): hd2/portrait/<folder>/<code><variant>.webm in the user's SC:R ----
     // A clip takes hundreds of ms to decode (the project's own VP9 decoder; measured on
@@ -242,22 +262,105 @@ final class PortraitStore {
         return c;
     }
 
+    // SC:R twins of the emblems (glue/campaign/terr.webm ...: 76 frames of ~900x900 with
+    // alpha). ~8 s each on the PC, so: one low-priority worker, every 2nd frame at 360
+    // rows, the sheet kept as JPEG in cacheDir/portraits; the SD emblem shows meanwhile.
+    private static final Map<String, Clip> artHd = new HashMap<>();
+    private static final java.util.concurrent.ExecutorService artExec = java.util.concurrent.Executors.newSingleThreadExecutor();
+    static void artHdAsync(final String smkPath, final ClipSink sink) {
+        final String dir;
+        final File cache;
+        synchronized (PortraitStore.class) {
+            if (!hdEnabled()) return;
+            dir = cascDir;
+            cache = hdCacheDir;
+        }
+        final String name = smkPath.replace('\\', '/').toLowerCase(java.util.Locale.ROOT).replace(".smk", ".webm");
+        final String key = dir + "|" + name;
+        synchronized (artHd) {
+            if (artHd.containsKey(key)) { final Clip c = artHd.get(key); if (c != null) ui.post(() -> sink.got(c)); return; }
+        }
+        artExec.execute(() -> {
+            Clip c = null;
+            synchronized (artHd) { if (artHd.containsKey(key)) c = artHd.get(key); }
+            if (c == null) c = artHdLoad(dir, cache, name);
+            synchronized (artHd) { artHd.put(key, c); }
+            final Clip fc = c;
+            if (fc != null) ui.post(() -> sink.got(fc));
+        });
+    }
+    private static Clip artHdLoad(String dir, File cache, String name) {
+        try {
+            String tag = "art-" + Integer.toHexString(dir.hashCode()) + "-" + name.replace('/', '_') + "-";
+            cache.mkdirs();
+            File[] fs = cache.listFiles();
+            if (fs != null) for (File f : fs) {
+                String n = f.getName();
+                if (!n.startsWith(tag) || !n.endsWith(".jpg")) continue;
+                // "<tag><w>x<h>x<frames>x<cols>x<ms>.jpg"
+                String[] d = n.substring(tag.length(), n.length() - 4).split("x");
+                android.graphics.BitmapFactory.Options o = new android.graphics.BitmapFactory.Options();
+                o.inPreferredConfig = Bitmap.Config.RGB_565;
+                Bitmap b = android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath(), o);
+                if (b == null || d.length != 5) continue;
+                Clip c = new Clip();
+                c.strip = b; c.w = Integer.parseInt(d[0]); c.h = Integer.parseInt(d[1]); c.frames = Integer.parseInt(d[2]);
+                c.cols = Integer.parseInt(d[3]); c.msPerFrame = Integer.parseInt(d[4]); c.hd = true;
+                if (c.cols > 0 && c.w * c.cols <= b.getWidth() && c.h * ((c.frames + c.cols - 1) / c.cols) <= b.getHeight()) return c;
+            }
+            int[] px = nativeDecodeArtWebm(dir, name, 2, 360);
+            if (px == null || px.length < 4 || px[0] <= 0 || px[1] <= 0 || px[2] <= 0 || px.length < 4 + px[0] * px[1] * px[2]) return null;
+            int w = px[0], h = px[1], frames = px[2], stride = w * frames;
+            int cols = Math.max(1, Math.min(frames, 2048 / w));
+            int rows = (frames + cols - 1) / cols;
+            Bitmap sheet = Bitmap.createBitmap(w * cols, h * rows, Bitmap.Config.RGB_565);
+            for (int f = 0; f != frames; ++f)
+                sheet.setPixels(px, 4 + f * w, stride, (f % cols) * w, (f / cols) * h, w, h);
+            Clip c = new Clip();
+            c.strip = sheet; c.w = w; c.h = h; c.frames = frames; c.cols = cols; c.hd = true;
+            c.msPerFrame = Math.max(33, px[3] / 1000);
+            File out = new File(cache, tag + w + "x" + h + "x" + frames + "x" + cols + "x" + c.msPerFrame + ".jpg");
+            try (java.io.FileOutputStream os = new java.io.FileOutputStream(out)) {
+                sheet.compress(Bitmap.CompressFormat.JPEG, 90, os);
+            } catch (Exception ignored) {}
+            return c;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     // ---- launcher backdrop: the main-menu space scene from the user's StarDat ------
     private static Bitmap backdrop;
     private static String backdropDir = "";
-    static synchronized Bitmap cachedBackground(File gameDir) {
-        return gameDir != null && gameDir.getAbsolutePath().equals(backdropDir) ? backdrop : null;
+    private static String backdropKey(File gameDir) {
+        String hd;
+        synchronized (PortraitStore.class) { hd = cascDir; }
+        return (gameDir == null ? "" : gameDir.getAbsolutePath()) + "|" + hd;
     }
-    /** Decodes glue\palmm\backgnd.pcx (640x480); null without game files. Call off the UI thread. */
+    static synchronized Bitmap cachedBackground(File gameDir) {
+        return gameDir != null && backdropKey(gameDir).equals(backdropDir) ? backdrop : null;
+    }
+    /** The main-menu space scene: SC:R hd2/glue/palmm/backgnd.dds (1706x960) with an HD tier,
+     *  else glue\palmm\backgnd.pcx (640x480); null without game files. Call off the UI thread. */
     static Bitmap background(File gameDir) {
         Bitmap c = cachedBackground(gameDir);
         if (c != null) return c;
-        if (!libOk || gameDir == null || !new File(gameDir, "StarDat.mpq").exists()) return null;
-        int[] px;
-        try { px = nativeDecodePcx(gameDir.getAbsolutePath(), "glue\\palmm\\backgnd.pcx"); } catch (Throwable t) { px = null; }
+        if (!libOk || gameDir == null) return null;
+        String key = backdropKey(gameDir);
+        String hdDir;
+        synchronized (PortraitStore.class) { hdDir = cascDir; }
+        int[] px = null;
+        if (!hdDir.isEmpty()) {
+            try { px = nativeDecodeDds(hdDir, "hd2/glue/palmm/backgnd.dds"); } catch (Throwable t) { px = null; }
+        }
+        if (px == null && new File(gameDir, "StarDat.mpq").exists()) {
+            try { px = nativeDecodePcx(gameDir.getAbsolutePath(), "glue\\palmm\\backgnd.pcx"); } catch (Throwable t) { px = null; }
+        }
         if (px == null || px.length < 2 || px[0] <= 0 || px[1] <= 0 || px.length < 2 + px[0] * px[1]) return null;
-        Bitmap b = Bitmap.createBitmap(px, 2, px[0], px[0], px[1], Bitmap.Config.ARGB_8888);
-        synchronized (PortraitStore.class) { backdrop = b; backdropDir = gameDir.getAbsolutePath(); }
+        Bitmap b;
+        try { b = Bitmap.createBitmap(px, 2, px[0], px[0], px[1], Bitmap.Config.ARGB_8888); }
+        catch (Throwable t) { return null; }
+        synchronized (PortraitStore.class) { backdrop = b; backdropDir = key; }
         return b;
     }
 

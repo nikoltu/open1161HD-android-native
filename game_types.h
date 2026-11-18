@@ -184,11 +184,13 @@ struct trigger {
 		int num_n;
 		int flags;
 		int unk;
+		int maskflag = 0;
 	};
 	std::array<condition, 16> conditions;
 	std::array<action, 64> actions;
 	int execution_flags;
 	std::array<bool, 28> enabled;
+	int source_index = -1; // record index in the TRIG chunk it was read from (trace only)
 };
 
 struct running_trigger {
@@ -622,6 +624,15 @@ struct unit_t: flingy_t {
 	int last_event_color;
 	int rank_increase;
 	int kill_count;
+	int hero;          // GE4: Extended hero index, -1 none
+	int hero_level;
+	int hero_xp;
+	int hero_points;   // unspent skill points
+	uint8_t ab_rank[8]; // GE5: rank of each ability, in ext_ability_slots order
+	int ab_ready[8];    // the frame its cooldown ends
+	int ab_bonus;       // timed damage bonus, until frame ab_bonus_until
+	int ab_bonus_until;
+	int hero_attr[3];   // API 3: strength, agility, intelligence
 	int last_attacking_player;
 	int secondary_order_timer;
 	int user_action_flags;
@@ -631,6 +642,7 @@ struct unit_t: flingy_t {
 	static_vector<const unit_type_t*, 5> build_queue_limbo;
 	fp8 energy;
 	unsigned int unit_id_generation;
+	uint8_t build_queue_slot;
 	const order_type_t* secondary_order_type;
 	int damage_overlay_state;
 	fp8 hp_construction_rate;

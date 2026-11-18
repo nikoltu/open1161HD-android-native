@@ -1,0 +1,5 @@
+LZMA SDK 26.06 (7z / LZMA / LZMA2 / PPMd decoders) -- https://www.7-zip.org/sdk.html
+
+LZMA SDK is written and placed in the public domain by Igor Pavlov.
+
+open1161HD uses its C decoder to read .7z archives during the first-run import.

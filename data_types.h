@@ -112,6 +112,8 @@ struct unit_type_t {
 	};
 
 	UnitTypes id;
+	// GE2: the type whose special-case behaviour this one has (= id; a mod type: its parent)
+	UnitTypes behaves_as;
 
 	type_id<const flingy_type_t> flingy;
 	type_id<unit_type_t> turret_unit_type;

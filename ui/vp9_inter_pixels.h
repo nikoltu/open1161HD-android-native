@@ -15,6 +15,7 @@
 #include "vp9_pixels.h"
 #include "yuv_rgb.h"
 #include <atomic>
+#include <functional>
 
 namespace bwgame {
 namespace vp9 {
@@ -484,7 +485,8 @@ static inline void crop_planes(const px::plane_t cur[3], const header_t& h, px::
 static inline uint64_t decode_sequence_hash(const uint8_t* blob, size_t bloblen,
 		const std::vector<webm::block_t>& frames, int* out_shown, bool as_rgb = false,
 		std::vector<std::vector<uint8_t>>* out_rgb = nullptr, int* out_w = nullptr, int* out_h = nullptr,
-		const std::atomic<bool>* cancel = nullptr) {
+		const std::atomic<bool>* cancel = nullptr, bool luma = false,
+		const std::function<void(const uint8_t* rgb, int w, int h)>* sink = nullptr) {
 	std::vector<frame_store_entry> store(8);
 	std::vector<frame_probs> contexts(4, frame_probs::make_default());
 	prev_frame_t prev_a, prev_b; prev_frame_t* prev = nullptr;
@@ -498,7 +500,9 @@ static inline uint64_t decode_sequence_hash(const uint8_t* blob, size_t bloblen,
 	//   else (BT.601 4:2:0, VP8-style / rare cs=0 VP9): the BT.601 matrix, chroma
 	//     subsampled (sx/sy inferred from the crop widths).
 	int clip_cs = yuv::CS_BT_601; // updated per decoded frame below
-	auto hash_frame = [&](const px::plane_t pl[3]) {
+	// sink without out_rgb: frames are handed over one at a time instead of kept
+	std::vector<uint8_t> sink_buf;
+	auto hash_frame_impl = [&](const px::plane_t pl[3]) {
 		if (!as_rgb) {
 			for (int p = 0; p < 3; ++p) { const px::plane_t& P = pl[p]; for (int j = 0; j < P.rows(); ++j) { const uint16_t* row = P[j]; for (int i = 0; i < P.cols(); ++i) mix(row[i]); } }
 			return;
@@ -513,8 +517,15 @@ static inline uint64_t decode_sequence_hash(const uint8_t* blob, size_t bloblen,
 			out_rgb->emplace_back();
 			dst = &out_rgb->back();
 			dst->resize((size_t)w * h * 3);
+		} else if (sink) {
+			sink_buf.resize((size_t)w * h * 3);
+			dst = &sink_buf;
 		}
 		size_t di = 0;
+		if (luma) {      // an alpha stream: Y is the alpha value as is
+			for (int j = 0; j < h; ++j) { const uint16_t* Y = pl[0][j]; for (int i = 0; i < w; ++i) { uint8_t a = (uint8_t)(Y[i] > 255 ? 255 : Y[i]); mix(a); if (dst) { (*dst)[di++] = a; (*dst)[di++] = a; (*dst)[di++] = a; } } }
+			return;
+		}
 		if (clip_cs == yuv::CS_SRGB) {
 			// B9: hoist the per-row plane pointers out of the inner loop (contiguous after B5).
 			for (int j = 0; j < h; ++j) {
@@ -539,6 +550,10 @@ static inline uint64_t decode_sequence_hash(const uint8_t* blob, size_t bloblen,
 				if (dst) { (*dst)[di++] = rgb[0]; (*dst)[di++] = rgb[1]; (*dst)[di++] = rgb[2]; }
 			}
 		}
+	};
+	auto hash_frame = [&](const px::plane_t pl[3]) {
+		hash_frame_impl(pl);
+		if (sink && !out_rgb && as_rgb && pl[0].rows() > 0) (*sink)(sink_buf.data(), pl[0].cols(), pl[0].rows());
 	};
 	int shown = 0;
 	for (const auto& fr : frames) {

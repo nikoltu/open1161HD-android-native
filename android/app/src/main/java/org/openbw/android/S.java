@@ -36,6 +36,14 @@ final class S {
         return en != null ? en : lithuanian;
     }
 
+    /** "n word" with the plural form of the current language (LT: 1 / 2–9 / 0,10–20 forms). */
+    static String count(int n, String ltOne, String ltFew, String ltMany, String enOne, String enMany) {
+        if (!LT.equals(lang)) return n + " " + (n == 1 ? enOne : enMany);
+        int d = Math.abs(n) % 10, h = Math.abs(n) % 100;
+        String w = d == 1 && h != 11 ? ltOne : d >= 2 && (h < 12 || h > 19) ? ltFew : ltMany;
+        return n + " " + w;   // the number never wraps away from its word
+    }
+
     private static final Map<String, String> EN_MAP = new HashMap<>();
     private static void p(String lt, String en) { EN_MAP.put(lt, en); }
 
@@ -94,7 +102,6 @@ final class S {
         p("Tai ne SC:R įdiegimo aplankas. Pasirink aplanką, kuriame yra „data“ ir „.build.info“.", "This is not an SC:R install folder. Pick the folder that contains “data” and “.build.info”.");
         p("Originali meniu muzika.", "The original menu music.");
         p("Mygtukų ir skydelių garsai.", "Button and panel sounds.");
-        p("HD2 rekomenduojama. FULL HD reikia SC:R ir galingos planšetės.", "HD2 is recommended. FULL HD needs SC:R and a strong tablet.");
         p("Pastatai ir vienetai meta pakreiptą šešėlį.", "Buildings and units cast a slanted shadow.");
         p("0 = beveik plokščias.", "0 = almost flat.");
         p("Burtai, ugnis ir sprogimai apšviečia aplinką. Tik HD.", "Spells, fire and explosions light the surroundings. HD only.");
@@ -287,6 +294,7 @@ final class S {
         p("Statistika (", "Statistics (");
         p("Žaidimų ", "Games ");
         p("Gerai", "OK");
+        p("Baigti", "Quit");
         p("Atšaukti", "Cancel");
         p("Uždaryti", "Close");
         p("Grįžti", "Back");
@@ -607,7 +615,11 @@ final class S {
         p("SC:R aplankas nustatytas (CASC įjungtas)", "SC:R folder set (CASC enabled)");
         p("Virš mineralų ir dujų rodomas likutis.", "Shown above minerals and gas.");
         p("SC:R rasta — HD asset'ai įjungti.", "SC:R found — HD assets enabled.");
-        p("SC:R aplankas nepasirinktas — tik SD / HD2.", "No SC:R folder selected — SD / HD2 only.");
+        p("Atstatyta numatyta.", "Default restored.");
+        p("SC:R aplankas nepasirinktas — tik SD.", "No SC:R folder selected — SD only.");
+        p("HD2 rekomenduojama. FULL HD reikia galingos planšetės.", "HD2 recommended. FULL HD needs a powerful tablet.");
+        p("HD2 ir FULL HD reikia StarCraft: Remastered failų (Failai).", "HD2 and FULL HD need the StarCraft: Remastered files (Files).");
+        p("Su 1.16.1 failais — tik klasikinis. Kiti atsirakina su StarCraft: Remastered.", "With the 1.16.1 files — classic only. The others unlock with StarCraft: Remastered.");
         p("SD — klasikinė 8-bit grafika (be SC:R). HD2 — HD, pusės raiškos "
                 + "(rekomenduojama). FULL HD — pilna HD raiška (reikia SC:R + galingos planšetės).",
           "SD — classic 8-bit graphics (no SC:R). HD2 — HD at half resolution "
@@ -625,6 +637,7 @@ final class S {
         p("Šiame aplanke nėra StarCraft 1.16.1 MPQ failų. Pasirink aplanką, kuriame yra StarDat.mpq, BrooDat.mpq ir Patch_rt.mpq (nebūtina: StarCraft.mpq, BroodWar.mpq).",
           "This folder has no StarCraft 1.16.1 MPQ files. Choose the folder that holds StarDat.mpq, BrooDat.mpq and Patch_rt.mpq (optional: StarCraft.mpq, BroodWar.mpq).");
         p("Trūksta MPQ: ", "Missing MPQ: ");
+        p("tai ne Windows programos failas.", "not a Windows program file.");
         p("MPQ failai rasti", "MPQ files found");
         p("Būtini failai", "Required files");
         p("Papildomi failai (kampanijoms ir muzikai)", "Optional files (campaigns and music)");
@@ -677,6 +690,13 @@ final class S {
         p("Tu", "You");
         p("Kompiuteris", "Computer");
         p("Misijų sąrašas", "Mission list");
+        // --- 1.0.27 UMS lobby ---
+        p("Žemėlapio slotai (Use Map Settings)", "Map slots (Use Map Settings)");
+        p("Šiam žemėlapiui reikia naujesnės žaidimo versijos: jo scenarijus čia neveiks.", "This map needs a newer game version: its script will not run here.");
+        p("Slotas", "Slot");
+        p("Žaidėjo slotas", "Player slot");
+        p("Žemėlapio kompiuteris", "Map computer");
+        p("Uždaryta", "Closed");
         p("Iš naujo", "Restart");
         p("Epizodas įveiktas", "Episode complete");
         p("Išsaugoti replay", "Save replay");
@@ -691,6 +711,44 @@ final class S {
         p("Greičiausias", "Fastest");
         p("Pasirinkite žemėlapį.", "Select a map.");
         p("Žemėlapis nerastas.", "Map not found.");
+        p("Reikia naujesnio žaidimo", "A newer game is needed");
+        p("Šis žemėlapis sukurtas naujesnei žaidimo versijai (išplėstinio profilio versija", "This map was made for a newer version of the game (extended profile version");
+        p("Šiam žemėlapiui reikia galimybės, kurios ši žaidimo versija dar neturi:", "This map needs a feature that this version of the game does not have yet:");
+        p("Šis žemėlapis išsaugotas naujesniu išplėstinio profilio formatu, kurio ši žaidimo versija neskaito.", "This map was saved in a newer extended profile format that this version of the game cannot read.");
+        p("Atnaujinkite žaidimą, kad jį žaistumėte.", "Update the game to play it.");
+        p("Žemėlapio aprašas sugadintas", "The map description is damaged");
+        p("Šio žemėlapio išplėstinio profilio aprašas sugadintas arba neperskaitomas, todėl žemėlapio paleisti negalima.", "This map's extended profile description is damaged or unreadable, so the map cannot be started.");
+        p("Išsaugokite žemėlapį redaktoriuje iš naujo.", "Save the map again in the editor.");
+        p("Išplėstinis profilis", "Extended profile");
+        p("Trūksta reikalingų modų", "Required mods are missing");
+        p("Šiam modui reikia modų, kurių nėra įdiegtų:", "This mod needs mods that are not installed:");
+        p("Bus įjungti reikalingi modai:", "These required mods will be turned on:");
+        p("Bus išjungti nesuderinami modai:", "These conflicting mods will be turned off:");
+        p("Bus išjungti nuo jų priklausantys modai:", "These mods depend on them and will be turned off:");
+        p("reikalauja modų", "needs mods");
+        p("nesuderinamas", "conflicts");
+        p("reikia", "needs");
+        p("nesuderinamas su", "conflicts with");
+        p("Modų rinkinys netinkamas", "The mod set cannot start");
+        p("Pataisykite modų puslapyje.", "Fix it on the Mods page.");
+        p("Reikalauja", "Requires");
+        p("Nesuderinamas su", "Conflicts with");
+        p("Importuoti kampaniją", "Import Campaign");
+        p("Importuojamos kampanijos", "Importing campaigns");
+        p("Pašalinti kampaniją", "Remove campaign");
+        p("Pašalinti kampaniją?", "Remove the campaign?");
+        p("Kampanijos failai ir jos progresas bus ištrinti. Išsaugoti žaidimai lieka, bet juos įkelti pavyks tik vėl importavus šią kampaniją.",
+          "The campaign's files and its progress will be deleted. Saved games stay, but they load only after you import this campaign again.");
+        p("Importuota kampanija", "Imported campaign");
+        p("rasę nustato žemėlapis", "race set by the map");
+        p("Pilkas rases nustato žemėlapis — jų pakeisti negalima.", "The map sets the greyed-out races; they cannot be changed.");
+        p("žemėlapio nustatymai", "map settings");
+        p("Šiame žemėlapyje tik viena žaidėjo vieta — LAN žaidimui reikia bent dviejų.", "This map has only one player slot; a LAN game needs at least two.");
+        p("rasę nustato misija", "race set by the mission");
+        p("bet kuri rasė", "any race");
+        p("Šios kampanijos misijos nebėra.", "This campaign mission is no longer installed.");
+        p("Nauji tipai", "New types");
+        p("Vienetai, pastatai, herojai ir gebėjimai žaidžiami (statyti — darbininko „MODS“ puslapyje; gebėjimai — vieneto „ABILITIES“ puslapyje; herojus kyla lygiais už nužudymus).", "Units, buildings, heroes and abilities are playable (build from the worker's MODS page; abilities on the unit's ABILITIES page; a hero levels up from kills).");
         p("REPLAY tabe pasirinkite replay failą.", "Select a replay file in the REPLAY tab.");
         p("Multiplayer: naudokite Create (Sukurti lobby) arba Join (pasirinkite hostą).",
           "Multiplayer: use Create (host a lobby) or Join (pick a host).");
@@ -745,6 +803,39 @@ final class S {
           "How the mouse works in touch mode. As a finger: the left button is a finger (tap, hold, drag), the right button drags the camera. Classic: left only selects (click, double click, box); right: a click orders to that spot, a hold opens the command wheel, a drag moves the camera. Swapped: like Classic with left and right exchanged (left-handed). Always: the middle button drags the camera, the wheel zooms.");
         // --- keyboard + mouse mode ---
         p("Įvesties režimas", "Input mode");
+        p("Nieko", "Nothing");
+        p("Žymėti (laikant — rėmelis)", "Select (hold: box)");
+        p("Komanda į žymeklio vietą", "Command at the cursor");
+        p("Ataka", "Attack");
+        p("Į laisvą grupę", "Into a free group");
+        p("Kita bazė", "Next base");
+        p("Ankstesnė grupė (du kartus — kamera)", "Previous group (twice: camera)");
+        p("Kita grupė (du kartus — kamera)", "Next group (twice: camera)");
+        p("Kamera į pažymėtus", "Camera to the selection");
+        p("Visa armija", "Whole army");
+        p("Tikslus žymeklis (laikant)", "Precise cursor (hold)");
+        p("Į paskutinį įspėjimą", "Last alert");
+        p("Komandų ratas (laikant)", "Command wheel (hold)");
+        p("Komandų kortelė pulto mygtukais (laikant)", "Command card on the pad buttons (hold)");
+        p("Kairės lazdelės paspaudimas", "Left stick press");
+        p("Dešinės lazdelės paspaudimas", "Right stick press");
+        p("Kairysis petys", "Left bumper");
+        p("Dešinysis petys", "Right bumper");
+        p("Kryžmė aukštyn", "D-pad up");
+        p("Kryžmė žemyn", "D-pad down");
+        p("Kryžmė kairėn", "D-pad left");
+        p("Kryžmė dešinėn", "D-pad right");
+        p("Kairysis gaidukas", "Left trigger");
+        p("Dešinysis gaidukas", "Right trigger");
+        p("Bent vienas mygtukas turi žymėti.", "At least one button must select.");
+        p("Kairė lazdelė — žymeklis, dešinė — kamera (ar rato kryptis). Mygtuko veiksmą pasirink iš sąrašo.", "Left stick: cursor, right stick: camera (or the wheel direction). Pick each button's action from the list.");
+        p("Pulto mygtukai atstatyti.", "Controller buttons reset.");
+        p("Mygtukai", "Buttons");
+        p("Kryžmė, meniu ir gaidukai", "D-pad, menu and triggers");
+        p("Pultas", "Controller");
+        p("Pulto mygtukai", "Controller buttons");
+        p("Žymeklio lazdelės greitis (100 = įprastas).", "Cursor stick speed (100 = normal).");
+        p("Klaviatūra + pelė: kairysis žymi (ir rėmeliu), dešinysis duoda komandą, kamera — ekrano kraštu ir klavišais, klavišai komandoms ir grupėms. Pultas: lazdelės — žymeklis ir kamera, mygtukų veiksmai renkami iš sąrašo; lietimas veikia ir toliau. LAN žaidėjams prie vardo rodoma klaviatūros žymė.", "Keyboard + mouse: left selects (also with a box), right gives the command, the camera moves at the screen edge and with keys, keys for commands and groups. Controller: the sticks move the cursor and the camera, button actions are picked from a list; touch keeps working. LAN players see a keyboard flag by the name.");
         p("Klaviatūra + pelė: kairysis žymi (ir rėmeliu), dešinysis duoda komandą, kamera — ekrano kraštu ir klavišais, klavišai komandoms ir grupėms. LAN žaidėjams prie vardo rodoma klaviatūros žymė.",
           "Keyboard + mouse: left selects (and box-selects), right commands, the camera follows the screen edge and the keys, hotkeys for commands and groups. LAN players see a keyboard flag next to your name.");
         p("Lietimas", "Touch");
@@ -752,8 +843,28 @@ final class S {
         p("Kamera ekrano kraštu", "Screen-edge scrolling");
         p("Klaviatūra + pelė: pelė prie ekrano krašto slenka kamerą.", "Keyboard + mouse: the pointer at a screen edge moves the camera.");
         p("Klavišai ir pelės mygtukai", "Keys and mouse buttons");
-        p("Komandų langeliai 1–9 — 3×3 kortelė (1–3 viršuje). Shift + komanda — į eilę; Ctrl + grupė — priskirti, Shift + grupė — pridėti, du kartus — kamera į grupę; Ctrl + kameros vieta — įsiminti.",
-          "Command slots 1–9 are the 3×3 card (1–3 on top). Shift + an order queues it; Ctrl + a group assigns, Shift + a group adds, twice moves the camera to it; Ctrl + a camera location stores it.");
+        p("Shift + komanda — į eilę; Ctrl + grupė — priskirti, Shift + grupė — pridėti, du kartus — kamera į grupę; Ctrl + kameros vieta — įsiminti.",
+          "Shift + an order queues it; Ctrl + a group assigns, Shift + a group adds, twice moves the camera to it; Ctrl + a camera location stores it.");
+        p("Tinklelis", "Grid");
+        p("Tinklelis — 3×3 kortelė pagal klavišų vietą (Q W E / A S D / Z X C). Klasikinis — kiekviena komanda turi savo raidę kaip originale (M — Marine, A — Attack); jas galima perkelti kortelėje žemiau.",
+          "Grid — the 3×3 card by key position (Q W E / A S D / Z X C). Classic — every command has its own letter as in the original (M — Marine, A — Attack); move them in the card below.");
+        p("Kortelei reikia žaidimo failų (StarDat.mpq).", "The card needs the game files (StarDat.mpq).");
+        p("Zergai", "Zerg");
+        p("Terranai", "Terran");
+        p("Protosai", "Protoss");
+        p("Komandos", "Commands");
+        p("Pažangūs pastatai", "Advanced buildings");
+        p("Bakstelėkite mygtuką ir paspauskite naują klavišą — komanda persikels visiems vienetams, kurie ją turi. Ilgas paspaudimas grąžina originalią raidę.",
+          "Tap a button and press a new key — the command moves for every unit that has it. A long press puts the original letter back.");
+        p("be klavišo", "no key");
+        p("originaliai", "originally");
+        p("suveiks pirmasis", "the first one fires");
+        p("taip pat", "is also");
+        p("kol pažymėtas šis vienetas, pirmenybė komandai", "the command wins while this unit is selected");
+        p("Atšaukimo klavišas keičiamas eilutėje „Atšaukti“.", "The cancel key is set in the “Cancel” row.");
+        p("Ši komanda originale neturi klavišo.", "This command has no key in the original.");
+        p("Paspauskite klavišą.", "Press a key.");
+        p("Čia tinka tik klavišas.", "Only a key fits here.");
         p("Atstatyti numatytus", "Reset to defaults");
         p("Klavišai atstatyti.", "Keys reset.");
         p("Jau naudojama: ", "Already used by: ");
@@ -875,6 +986,31 @@ final class S {
         p("Diegimas atšauktas.", "Installation cancelled.");
         // v1.0.26 updater: resumable download, signer check, release page
         p("Atnaujinimas jau atsisiunčiamas.", "The update is already downloading.");
+        // v1.0.28 race / colour pickers
+        p("Rasė", "Race");
+        p("Raudona", "Red");
+        p("Mėlyna", "Blue");
+        p("Žalsvai mėlyna", "Teal");
+        p("Violetinė", "Purple");
+        p("Oranžinė", "Orange");
+        p("Ruda", "Brown");
+        p("Balta", "White");
+        p("Geltona", "Yellow");
+        p("Žalia", "Green");
+        p("Šviesiai geltona", "Pale Yellow");
+        p("Smėlio", "Tan");
+        p("Dangaus mėlyna", "Azure");
+        p("Šviesiai žalia", "Pale Green");
+        p("Melsvai pilka", "Blue Grey");
+        p("Žydra", "Cyan");
+        // v1.0.28 updater panels
+        p("Įdiegta", "Installed");
+        p("Nauja", "New");
+        p("Kas naujo", "What's new");
+        p("Jungiamasi…", "Connecting…");
+        p("Atsisiunčiama", "Downloading");
+        p("Tęsiama nuo ", "Resuming from ");
+        p("liko ", "left ");
         p("jau atsisiųsta", "already downloaded");
         p("Šiame leidime nėra APK — atsisiųsk jį iš leidimo puslapio.", "This release has no APK — download it from the release page.");
         p("Atidaryti leidimo puslapį", "Open the release page");
@@ -891,6 +1027,10 @@ final class S {
           "The update is downloaded. To install it the app needs permission to install apps. Turn it on in the next screen and come back — the installation starts by itself.");
         p("Diegimas atšauktas. Atsisiųstas failas liko — „Tikrinti dabar“ įdiegs jį be naujo atsisiuntimo.",
           "Installation cancelled. The downloaded file is kept — \"Check now\" installs it without downloading again.");
+        p("Autorius", "Author");
+        p("Originalus projektas:", "Original project at");
+        p("Atidaryti", "Open");
+        p("Neoficiali versija — pasirašyta ne autoriaus raktu. Originalas:", "Unofficial build — not signed with the author's key. Original:");
         p("Tikrinti atnaujinimus", "Check for updates");
         p("Paleidus launcherį klausia GitHub, ar išleista nauja versija.", "When the launcher starts, asks GitHub whether a new version is out.");
         p("Ši kūrimo versija automatiškai netikrina.", "This development build does not check automatically.");
@@ -904,6 +1044,8 @@ final class S {
         p("Kinematinis atspalvis", "Cinematic color grade");
         p("Švelnus spalvų koregavimas (kontrastas, sodrumas, šiluma) — kino atspalvis. 0 = išjungta.",
           "Gentle color grade (contrast, saturation, warmth) — cinematic tint. 0 = off.");
+        p("SC:R žaidimo šriftas", "SC:R in-game font");
+        p("HUD tekstas SC:R šriftu. Tik HD; išdėstymas nekinta.", "HUD text in the SC:R font. HD only; the layout stays the same.");
         p("Dinaminės šviesos", "Dynamic lights");
         p("Dinaminių šviesų ryškumas ir spindulys.", "Dynamic light brightness and radius.");
         p("Šviesų stiprumas", "Light strength");
@@ -917,5 +1059,50 @@ final class S {
           "Spells, weapon fire and explosions light the surroundings (SC:R glow layer). ");
         p("KAIP PASILEISTI SAVO MODŲ SĄRAŠĄ IŠ SAVO GIT\n",
           "HOW TO LOAD YOUR OWN MOD LIST FROM YOUR GIT\n");
+        // --- v1.0.27: game controller ---
+        p("Žaidimų pultas", "Game controller");
+        p("Prijungtas pultas: kairė lazdelė — žymeklis, dešinė — kamera. A žymi (laikant — rėmelis), B — komanda, X — ataka, Y — į laisvą grupę, R3 — stop, Back — atšaukti, Start — meniu. RT laikant — komandų ratas (dešine lazdele pasirink, atleisk). LT laikant — komandų kortelė pulto mygtukais. Kryžmė ←/→ — grupės (du kartus — kamera), ↑ — į pažymėtus, ↓ — visa armija. LB — laisvas darbininkas, RB — bazės, L3 laikant — tikslus žymeklis.",
+                "A connected controller: left stick moves the cursor, right stick the camera. A selects (hold for a box), B orders, X attacks, Y puts the selection into a free group, R3 stops, Back cancels, Start opens the menu. Hold RT for the command wheel (aim with the right stick, let go). Hold LT to press the command card with the pad buttons. D-pad left/right steps through groups (twice centres the camera), up centres on the selection, down selects the army. LB finds an idle worker, RB cycles bases, hold L3 for a precise cursor.");
+        p("Lazdelių mirties zona", "Stick dead zone");
+        p("Kiek palenkti lazdelę, kol ji pradeda veikti (18 = įprasta; didink, jei žymeklis slenka pats).", "How far a stick must tilt before it acts (18 = normal; raise it if the cursor drifts on its own).");
+        p("Sukeisti lazdeles", "Swap sticks");
+        p("Dešinė lazdelė — žymeklis, kairė — kamera ir ratas.", "Right stick moves the cursor, left one the camera and the wheel.");
+        p("Pulto žymeklio greitis", "Controller cursor speed");
+        p("Kairės lazdelės žymeklio greitis (100 = įprastas).", "Left-stick cursor speed (100 = normal).");
+        // --- v1.0.27: import from ZIP / 7z / RAR archives ---
+        p("Atšaukta.", "Cancelled.");
+        p("Skaitomas archyvas:\n", "Reading archive:\n");
+        p("Išskleidžiama:\n", "Extracting:\n");
+        p("Iš archyvo", "From archive");
+        p("Tinka ir ZIP / 7z / RAR archyvas (taip pat padalytas RAR) — MPQ failai ir SC:R aplankas išskleidžiami automatiškai.",
+          "A ZIP / 7z / RAR archive works too (split RAR included) — the MPQ files and the SC:R folder are unpacked automatically.");
+        p("RAR / 7z biblioteka neįkelta.", "the RAR / 7z library did not load.");
+        p("SC:R aplankas archyve nepilnas (trūksta „data/data“ arba „.build.info“).",
+          "the SC:R folder in the archive is incomplete (no “data/data” or “.build.info”).");
+        p("archyvas apsaugotas slaptažodžiu — tokie nepalaikomi.", "the archive is password-protected — not supported.");
+        p("archyvas pažeistas arba neatsisiųstas iki galo.", "the archive is damaged or not fully downloaded.");
+        p("archyve nerasta nei StarCraft 1.16.1 MPQ failų, nei SC:R aplanko.",
+          "no StarCraft 1.16.1 MPQ files and no SC:R folder in the archive.");
+        p("archyve yra SC:R „Data“ aplankas, bet nėra „.build.info“. Pasirink ir „.build.info“ failą kartu su archyvu.",
+          "the archive has an SC:R “Data” folder but no “.build.info”. Pick the “.build.info” file together with the archive.");
+        p("archyvo žodynas per didelis šiam įrenginiui (> 256 MB). Perpakuok mažesniu žodynu arba ZIP.",
+          "the archive's dictionary is too large for this device (> 256 MB). Repack it with a smaller dictionary or as ZIP.");
+        p("importas nepavyko: ", "import failed: ");
+        p("nepakanka vietos: reikia ", "not enough space: needs ");
+        p(", laisva ", ", free ");
+        p("nepalaikomas glaudinimo būdas arba archyvas apsaugotas slaptažodžiu.",
+          "unsupported compression method, or the archive is password-protected.");
+        p("nepavyko atidaryti", "could not open");
+        p("nepavyko atidaryti archyvo.", "could not open the archive.");
+        p("nepavyko perrašyti ", "could not replace ");
+        p("nepavyko pervadinti ", "could not rename ");
+        p("nepavyko įrašyti (ar pakanka vietos?).", "could not write (is there enough space?).");
+        p("per mažai atminties archyvui išskleisti.", "not enough memory to unpack the archive.");
+        p("praleista failų su netinkamais vardais: ", "files skipped for unsafe names: ");
+        p("trūksta archyvo dalies. Pasirink visas dalis (.partN.rar arba .rar + .r00…).",
+          "a part of the archive is missing. Pick every part (.partN.rar, or .rar + .r00…).");
+        p("trūksta pirmosios archyvo dalies (.part1.rar arba .rar).", "the first part of the archive is missing (.part1.rar or .rar).");
+        p("trūksta tarpinės archyvo dalies — pasirink visas dalis.", "a middle part of the archive is missing — pick every part.");
+        p("ši archyvo dalis pasirinkta du kartus.", "this part of the archive was picked twice.");
     }
 }

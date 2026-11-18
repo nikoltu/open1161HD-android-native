@@ -193,6 +193,16 @@ void field(V& v, creep_life_t& c) {
 	for (auto& b : c.table.buckets) creep_list(v, b, c);
 }
 
+inline void field(writer_t& v, oescript::runtime& x) {
+	a_vector<uint8_t> b = x.serialize();
+	field(v, b);
+}
+inline void field(reader_t& v, oescript::runtime& x) {
+	a_vector<uint8_t> b;
+	field(v, b);
+	if (!v.failed && !x.deserialize(b.data(), b.size())) v.failed = true;
+}
+
 // --- the value half --------------------------------------------------
 //
 // The order here is the declaration order of state_base_copyable. Keeping the
@@ -294,6 +304,19 @@ void visit_copyable(state& st, V& v) {
 		field(v, ai.attack_target_rr);
 		field(v, ai.last_attack_frame);
 	}
+	// Only a map with a script has this, so a classic save stays byte-identical.
+	if (st.game && st.game->oescript.loaded) field(v, st.oes);
+	// Only a game with Extended heroes has this.
+	if (st.game && !st.game->ext_heroes.empty()) field(v, st.ext_hero_respawns);
+	if (st.game && !st.game->ext_abilities.empty()) field(v, st.ext_casts);
+	// Only an EUD map has this, so other saves stay byte-identical.
+	if (st.game && st.game->eud_triggers) {
+		field(v, st.eud_dat_journal);
+		field(v, st.eud_str);
+		field(v, st.eud_str_delta);
+		field(v, st.eud_req);
+		field(v, st.eud_req_idx);
+	}
 }
 
 // --- the object half -------------------------------------------------
@@ -384,7 +407,8 @@ struct object_io {
 	void type_vec(static_vector<const unit_type_t*, N>& q) {
 		if (V::reading) {
 			uint32_t n = u32(0);
-			q.clear();
+			// q's end pointer is the writer's (raw copy): clear() would walk from it, possibly forever
+			new (&q) static_vector<const unit_type_t*, N>();
 			for (uint32_t i = 0; i != n; ++i) { const unit_type_t* t = nullptr; ut_ref(t); q.push_back(t); }
 		} else {
 			u32((uint32_t)q.size());
@@ -787,6 +811,7 @@ inline load_result load(state& st, action_state& as, const uint8_t* data, size_t
 	if (r.u32() != engine_version) return load_result::bad_engine;
 	if (r.u32() != map_id) return load_result::wrong_map;
 	visit_copyable(st, r);
+	if (st.game && st.game->eud_triggers) state_functions(st).eud_sync_dat_tables();
 	visit_objects(st, r);
 	visit_action_state(as, st, r);
 	if (r.failed) return load_result::truncated;

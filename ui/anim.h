@@ -125,6 +125,24 @@ static inline bool decode_dds(const uint8_t* data, size_t size, std::vector<uint
 	uint32_t fourcc = rd32(data + 84);
 	bool bc3 = fourcc == 0x35545844u; // 'DXT5'
 	bool bc1 = fourcc == 0x31545844u; // 'DXT1'
+	if (!bc1 && !bc3 && (rd32(data + 80) & 0x40) && rd32(data + 88) == 32) {
+		// uncompressed 32-bit by channel masks (SC:R cursor/*.dds.grp)
+		uint32_t m[4] = {rd32(data + 92), rd32(data + 96), rd32(data + 100), rd32(data + 104)};
+		if (!(rd32(data + 80) & 0x1)) m[3] = 0;
+		if (w <= 0 || h <= 0 || 128 + (size_t)w * h * 4 > size) return false;
+		int sh[4];
+		for (int c = 0; c != 4; ++c) { sh[c] = 0; if (m[c]) while (!((m[c] >> sh[c]) & 1)) ++sh[c]; }
+		out.assign((size_t)w * h, 0);
+		out_w = w; out_h = h;
+		const uint8_t* src = data + 128;
+		for (size_t i = 0; i != (size_t)w * h; ++i) {
+			uint32_t v = rd32(src + i * 4);
+			uint32_t r = m[0] ? (v & m[0]) >> sh[0] : 0, g = m[1] ? (v & m[1]) >> sh[1] : 0, bl = m[2] ? (v & m[2]) >> sh[2] : 0;
+			uint32_t al = m[3] ? (v & m[3]) >> sh[3] : 255;
+			out[i] = (al & 0xff) << 24 | (r & 0xff) << 16 | (g & 0xff) << 8 | (bl & 0xff);
+		}
+		return true;
+	}
 	if (!bc1 && !bc3) return false;
 	int bw = (w + 3) / 4, bh = (h + 3) / 4;
 	size_t block_size = bc3 ? 16 : 8;

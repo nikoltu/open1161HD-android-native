@@ -17,8 +17,19 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
+import android.graphics.Typeface;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
+import android.text.TextUtils;
+import android.text.style.ForegroundColorSpan;
+import android.text.style.LeadingMarginSpan;
+import android.text.style.RelativeSizeSpan;
+import android.text.style.StyleSpan;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
 import android.widget.LinearLayout;
-import android.widget.ProgressBar;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -97,7 +108,7 @@ final class Updater {
         new Thread(() -> {
             Release r = null;
             String err = null;
-            try { r = fetchLatest(); } catch (Exception e) { err = e.getMessage(); }
+            try { r = fetchLatest(testBase(a)); } catch (Exception e) { err = e.getMessage(); }
             final Release rel = r;
             final String error = err;
             a.runOnUiThread(() -> {
@@ -120,8 +131,16 @@ final class Updater {
         }, "update-check").start();
     }
 
-    static Release fetchLatest() throws Exception {
-        HttpURLConnection c = open(LATEST, 8000, 10000);
+    /** Debuggable builds only: pref "updTestBase" (e.g. http://127.0.0.1:8765 over adb reverse)
+     *  serves latest.json and the APK in GitHub's place, to exercise the panels offline. */
+    static String testBase(Context c) {
+        boolean dbg = (c.getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+        return dbg ? prefs(c).getString("updTestBase", "") : "";
+    }
+
+    static Release fetchLatest(String testBase) throws Exception {
+        final String allowed = testBase.isEmpty() ? "https://github.com/" + REPO + "/" : testBase + "/";
+        HttpURLConnection c = open(testBase.isEmpty() ? LATEST : testBase + "/latest.json", 8000, 10000);
         try {
             c.setRequestProperty("Accept", "application/vnd.github+json");
             int code = c.getResponseCode();
@@ -134,14 +153,14 @@ final class Updater {
             r.version = stripV(r.tag);
             r.notes = o.optString("body", "");
             r.pageUrl = o.optString("html_url", "");
-            if (!r.pageUrl.startsWith("https://github.com/" + REPO + "/")) r.pageUrl = RELEASES_PAGE;
+            if (!r.pageUrl.startsWith(allowed)) r.pageUrl = RELEASES_PAGE;
             JSONArray as = o.optJSONArray("assets");
             if (as != null) {
                 for (int i = 0; i < as.length(); ++i) {
                     JSONObject x = as.getJSONObject(i);
                     String n = x.optString("name", "");
                     String u = x.optString("browser_download_url", "");
-                    if (!n.toLowerCase(Locale.ROOT).endsWith(".apk") || !u.startsWith("https://github.com/" + REPO + "/")) continue;
+                    if (!n.toLowerCase(Locale.ROOT).endsWith(".apk") || !u.startsWith(allowed)) continue;
                     // The name becomes a cache file name: keep it to a plain file name.
                     r.apkName = n.replaceAll("[^A-Za-z0-9._-]", "_");
                     r.apkUrl = u;
@@ -240,6 +259,14 @@ final class Updater {
         return Build.VERSION.SDK_INT >= 28 ? PackageManager.GET_SIGNING_CERTIFICATES : PackageManager.GET_SIGNATURES;
     }
 
+    static String[] ownSignerDigests(Context c) {
+        try {
+            return signerDigests(c.getPackageManager().getPackageInfo(c.getPackageName(), signingFlags())).toArray(new String[0]);
+        } catch (Exception e) {
+            return new String[0];
+        }
+    }
+
     static boolean isReleaseSigned(Context c) {
         try {
             return signerDigests(c.getPackageManager().getPackageInfo(c.getPackageName(), signingFlags()))
@@ -279,22 +306,67 @@ final class Updater {
     }
 
     // ---- UI ----
+    /** The offer, in the launcher's design: installed -> new version strip, size and
+     *  "already downloaded" chip, the release notes as formatted text, then warnings. */
     static void offer(final Activity a, final Release r, String cur) {
-        // Release notes are Markdown; show them as plain text.
-        String notes = r.notes == null ? "" : r.notes.trim()
-                .replace("**", "").replace("__", "").replace("`", "")
-                .replaceAll("(?m)^#{1,6}\\s*", "").replaceAll("(?m)^\\s*[-*]\\s+", "• ")
-                .replaceAll("\\[([^\\]]+)\\]\\([^)]+\\)", "$1").replace("\r", "");
-        if (notes.length() > 1500) notes = notes.substring(0, 1500) + "…";
-        String size = r.hasApk() ? "  (" + mb(r.apkSize) + ")" : "";
+        final Kit kit = new Kit(a);
+        final boolean c = kit.compact;
         File done = new File(folder(a), r.apkName == null ? "-" : r.apkName);
         boolean ready = r.hasApk() && done.length() == r.apkSize;
-        String msg = S.t("Įdiegta: ") + cur + "\n" + S.t("Nauja: ") + r.version + size
-                + (ready ? "  — " + S.t("jau atsisiųsta") : "")
-                + (notes.isEmpty() ? "" : "\n\n" + notes)
-                + (r.hasApk() ? "" : "\n\n" + S.t("Šiame leidime nėra APK — atsisiųsk jį iš leidimo puslapio."))
-                + (isReleaseSigned(a) ? "" : "\n\n" + S.t("Ši kopija pasirašyta kitu raktu (kūrimo versija) — Android jos neatnaujins; reikės ištrinti ir įdiegti iš naujo."));
-        KitDialog d = new KitDialog(a).setTitle(S.t("Yra atnaujinimas")).setMessage(msg);
+
+        LinearLayout body = new LinearLayout(a);
+        body.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout strip = new LinearLayout(a);
+        strip.setOrientation(LinearLayout.HORIZONTAL);
+        strip.setGravity(Gravity.CENTER_VERTICAL);
+        strip.setBackground(kit.box(0xFF0B1114, Kit.LINE));
+        strip.setPadding(kit.dp(c ? 12 : 16), kit.dp(c ? 8 : 12), kit.dp(c ? 12 : 16), kit.dp(c ? 8 : 12));
+        strip.addView(versionCell(kit, S.t("Įdiegta"), cur, Kit.TEXT2));
+        TextView arrow = kit.text("›", Kit.LABEL, c ? 26 : 32);
+        arrow.setPadding(kit.dp(c ? 12 : 18), 0, kit.dp(c ? 12 : 18), 0);
+        strip.addView(arrow);
+        strip.addView(versionCell(kit, S.t("Nauja"), r.version, Kit.ACCENT));
+        strip.addView(new View(a), new LinearLayout.LayoutParams(0, 1, 1f));
+        LinearLayout side = new LinearLayout(a);
+        side.setOrientation(LinearLayout.VERTICAL);
+        side.setGravity(Gravity.END);
+        if (r.hasApk()) {
+            TextView sz = kit.text(mb(r.apkSize), Kit.TEXT, c ? 13 : 14);
+            sz.setGravity(Gravity.END);
+            side.addView(sz);
+        }
+        if (ready) {
+            TextView chip = kit.text(S.t("jau atsisiųsta").toUpperCase(Locale.ROOT), Kit.LABEL, c ? 10 : 11);
+            chip.setLetterSpacing(0.1f);
+            chip.setBackground(kit.box(Kit.SEL_BG, Kit.LABEL));
+            chip.setPadding(kit.dp(8), kit.dp(3), kit.dp(8), kit.dp(3));
+            LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            clp.topMargin = kit.dp(4);
+            side.addView(chip, clp);
+        }
+        strip.addView(side);
+        body.addView(strip, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        CharSequence notes = formatNotes(r.notes);
+        if (notes.length() > 0) {
+            body.addView(kit.label(S.t("Kas naujo")));
+            TextView nt = kit.text("", Kit.TEXT, c ? 13 : 14);
+            nt.setText(notes);
+            nt.setLineSpacing(0, 1.15f);
+            ScrollView sv = new ScrollView(a);
+            sv.setBackground(kit.box(0xFF070B0D, 0xFF1E272B));
+            sv.setPadding(kit.dp(c ? 10 : 14), kit.dp(c ? 8 : 10), kit.dp(c ? 10 : 14), kit.dp(c ? 8 : 10));
+            sv.setScrollbarFadingEnabled(false);
+            sv.addView(nt);
+            body.addView(sv, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        }
+        if (!r.hasApk())
+            body.addView(warning(kit, S.t("Šiame leidime nėra APK — atsisiųsk jį iš leidimo puslapio."), Kit.ACCENT));
+        if (!isReleaseSigned(a))
+            body.addView(warning(kit, S.t("Ši kopija pasirašyta kitu raktu (kūrimo versija) — Android jos neatnaujins; reikės ištrinti ir įdiegti iš naujo."), Kit.DANGER));
+
+        KitDialog d = new KitDialog(a).setTitle(S.t("Yra atnaujinimas")).setView(body).setWidth(640);
         if (r.hasApk()) d.setPositiveButton(S.t("Atnaujinti"), (x, w) -> startDownload(a, r));
         else d.setPositiveButton(S.t("Atidaryti leidimo puslapį"), (x, w) -> openPage(a, r));
         d.setNegativeButton(S.t("Vėliau"), null)
@@ -302,8 +374,66 @@ final class Updater {
          .show();
     }
 
-    private static String mb(long bytes) {
-        return String.format(Locale.ROOT, "%.1f MB", bytes / 1048576.0);
+    private static String mb(long bytes) { return Kit.ProgressPanel.mb(bytes); }
+
+    private static View versionCell(Kit kit, String label, String version, int color) {
+        LinearLayout cell = new LinearLayout(kit.a);
+        cell.setOrientation(LinearLayout.VERTICAL);
+        TextView l = kit.text(label.toUpperCase(Locale.ROOT), Kit.TEXT2, kit.compact ? 10 : 11);
+        l.setLetterSpacing(0.12f);
+        cell.addView(l);
+        TextView v = kit.text(version, color, kit.compact ? 18 : 22);
+        v.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        cell.addView(v);
+        return cell;
+    }
+
+    private static View warning(Kit kit, String msg, int color) {
+        TextView t = kit.text(msg, Kit.TEXT, kit.compact ? 12 : 13);
+        t.setBackground(kit.box(color == Kit.DANGER ? 0xFF2A0E0C : 0xFF2A2208, color));
+        t.setPadding(kit.dp(12), kit.dp(8), kit.dp(12), kit.dp(8));
+        t.setLineSpacing(0, 1.1f);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = kit.dp(10);
+        t.setLayoutParams(lp);
+        return t;
+    }
+
+    /** Release notes are Markdown: headings in the launcher's green, bullets with a
+     *  hanging indent, links and inline marks reduced to their text. */
+    static CharSequence formatNotes(String md) {
+        SpannableStringBuilder sb = new SpannableStringBuilder();
+        if (md == null) return sb;
+        boolean blank = false;
+        for (String raw : md.replace("\r", "").split("\n")) {
+            String line = raw.replaceAll("\\s+$", "");
+            if (line.trim().isEmpty()) { blank = sb.length() > 0; continue; }
+            line = line.replace("**", "").replace("__", "").replace("`", "")
+                    .replaceAll("!?\\[([^\\]]*)\\]\\([^)]*\\)", "$1").replaceAll("<[^>]+>", "");
+            if (sb.length() > 0) sb.append(blank ? "\n\n" : "\n");
+            blank = false;
+            int at = sb.length();
+            java.util.regex.Matcher h = java.util.regex.Pattern.compile("^\\s*#{1,6}\\s*(.*)$").matcher(line);
+            java.util.regex.Matcher b = java.util.regex.Pattern.compile("^(\\s*)[-*+]\\s+(.*)$").matcher(line);
+            if (h.matches()) {
+                if (at > 0 && sb.charAt(at - 1) == '\n' && (at < 2 || sb.charAt(at - 2) != '\n')) { sb.insert(at, "\n"); ++at; }
+                sb.append(h.group(1).toUpperCase(Locale.ROOT));
+                sb.setSpan(new ForegroundColorSpan(Kit.LABEL), at, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                sb.setSpan(new StyleSpan(Typeface.BOLD), at, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                sb.setSpan(new RelativeSizeSpan(0.9f), at, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            } else if (b.matches()) {
+                int depth = Math.min(3, b.group(1).replace("\t", "  ").length() / 2);
+                sb.append(depth > 0 ? "◦  " : "•  ");
+                sb.setSpan(new ForegroundColorSpan(Kit.LABEL), at, at + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                sb.append(b.group(2));
+                int ind = Math.round(16 * android.content.res.Resources.getSystem().getDisplayMetrics().density);
+                sb.setSpan(new LeadingMarginSpan.Standard(depth * ind, depth * ind + ind), at, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            } else {
+                sb.append(line.trim());
+            }
+            if (sb.length() > 6000) { sb.append(" …"); break; }
+        }
+        return sb;
     }
 
     static void openPage(Activity a, Release r) {
@@ -320,22 +450,17 @@ final class Updater {
         final File target = new File(folder(a), r.apkName);
         if (target.length() == r.apkSize) { afterDownload(a, r, target); return; }
         downloading = true;
-        LinearLayout box = new LinearLayout(a);
-        box.setOrientation(LinearLayout.VERTICAL);
-        int pad = (int) (20 * a.getResources().getDisplayMetrics().density);
-        box.setPadding(pad, pad, pad, pad / 2);
-        final TextView label = new TextView(a);
-        label.setText(r.apkName);
-        final ProgressBar bar = new ProgressBar(a, null, android.R.attr.progressBarStyleHorizontal);
-        bar.setMax(1000);
-        final TextView amount = new TextView(a);
-        box.addView(label);
-        box.addView(bar);
-        box.addView(amount);
+        final Kit.ProgressPanel pp = new Kit(a).progressPanel("v" + r.version + "  ·  " + r.apkName);
+        final long already = new File(target.getPath() + ".part").length();
+        if (already > 0 && already < r.apkSize) {
+            pp.busy(S.t("Tęsiama nuo ") + mb(already) + "…");
+            pp.meter.setFraction(already / (float) r.apkSize);
+        } else pp.busy(S.t("Jungiamasi…"));
         final boolean[] cancelled = {false};
         final Dialog dlg = new KitDialog(a)
                 .setTitle(S.t("Atsisiunčiamas atnaujinimas"))
-                .setView(box)
+                .setView(pp.view)
+                .setWidth(520)
                 .setCancelable(false)
                 .setNegativeButton(S.t("Atšaukti"), (d, w) -> cancelled[0] = true)
                 .show();
@@ -354,6 +479,11 @@ final class Updater {
                     int code = c.getResponseCode();
                     if (code != 200 && code != 206) throw new java.io.IOException("HTTP " + code);
                     if (code == 200) have = 0;   // the server ignored the range: start over
+                    final long from = have;
+                    ui.post(() -> {
+                        pp.status.setText(from > 0 ? S.t("Tęsiama nuo ") + mb(from) : S.t("Atsisiunčiama"));
+                        pp.update(from, r.apkSize);
+                    });
                     try (InputStream in = c.getInputStream(); RandomAccessFile out = new RandomAccessFile(part, "rw")) {
                         out.setLength(have);
                         out.seek(have);
@@ -367,11 +497,12 @@ final class Updater {
                             if (p != lastP) {
                                 lastP = p;
                                 final long got = have;
-                                ui.post(() -> { bar.setProgress(p); amount.setText(mb(got) + " / " + mb(r.apkSize)); });
+                                ui.post(() -> pp.update(got, r.apkSize));
                             }
                         }
                     }
                 }
+                ui.post(() -> pp.busy(S.t("Tikrinama…")));
                 if (part.length() != r.apkSize) { part.delete(); throw new java.io.IOException(S.t("failas nepilnas")); }
                 if (target.exists() && !target.delete()) throw new java.io.IOException(S.t("nepavyko pakeisti seno failo"));
                 if (!part.renameTo(target)) throw new java.io.IOException(S.t("nepavyko išsaugoti failo"));

@@ -22,58 +22,71 @@ import java.util.Map;
 /**
  * Keyboard + mouse bindings (Settings > Valdymas). Codes are what the engine sees:
  * SDL scancodes for keys, MOUSE + SDL button (1 left, 2 middle, 3 right, 4 / 5 side)
- * for mouse buttons. The ids and defaults mirror ui/kbm.h; the engine gets the whole
- * table as --key-binds "id=code,...".
+ * for mouse buttons. The defaults come from the game (ui/kbm_defaults.h); only the
+ * changed keys are stored and sent as --key-binds "id=code,...,cmd<N>=code", where
+ * cmd<N> moves the command whose rez\stat_txt.tbl entry is N (Classic layout).
  */
 final class Keybinds {
     static final int MOUSE = 1000;
     static final String PREF = "keyBinds";
+    static final String LAYOUT = "keyLayout";
+
+    private static Map<String, Integer> defaults;
+    static synchronized Map<String, Integer> defaults() {
+        if (defaults == null) {
+            Map<String, Integer> d = new HashMap<>();
+            for (String item : PortraitStore.keyDefaults().split(",")) {
+                int eq = item.indexOf('=');
+                if (eq <= 0) continue;
+                try { d.put(item.substring(0, eq), Integer.parseInt(item.substring(eq + 1))); } catch (NumberFormatException ignored) {}
+            }
+            defaults = d;
+        }
+        return defaults;
+    }
 
     static final class Action {
         final String id, label;
-        final int def;
         final boolean mouseOnly;
-        Action(String id, String label, int def, boolean mouseOnly) {
-            this.id = id; this.label = label; this.def = def; this.mouseOnly = mouseOnly;
+        Action(String id, String label, boolean mouseOnly) {
+            this.id = id; this.label = label; this.mouseOnly = mouseOnly;
         }
+        int def() { Integer d = defaults().get(id); return d == null ? 0 : d; }
     }
 
     static final Action[] ACTIONS;
     static {
         java.util.List<Action> a = new java.util.ArrayList<>();
-        a.add(new Action("mouse_select", "Žymėjimas", MOUSE + 1, true));
-        a.add(new Action("mouse_command", "Komanda", MOUSE + 3, true));
-        a.add(new Action("mouse_pan", "Kameros tempimas", MOUSE + 2, true));
-        a.add(new Action("cam_up", "Kamera aukštyn", 82, false));
-        a.add(new Action("cam_down", "Kamera žemyn", 81, false));
-        a.add(new Action("cam_left", "Kamera kairėn", 80, false));
-        a.add(new Action("cam_right", "Kamera dešinėn", 79, false));
-        int[] card = {20, 26, 8, 4, 22, 7, 29, 27, 6};
-        for (int i = 0; i < 9; i++) a.add(new Action("card" + (i + 1), "Komandos langelis " + (i + 1), card[i], false));
-        a.add(new Action("cancel", "Atšaukti", 41, false));
-        a.add(new Action("menu", "Meniu", 67, false));
-        a.add(new Action("chat", "Pokalbis", 40, false));
-        a.add(new Action("alert", "Į paskutinį pavojų", 44, false));
-        a.add(new Action("idle", "Laisvas darbininkas", 58, false));
-        a.add(new Action("army", "Kariuomenė", 59, false));
-        a.add(new Action("center", "Centruoti į pažymėtus", 9, false));
-        a.add(new Action("zoom_in", "Priartinti", 46, false));
-        a.add(new Action("zoom_out", "Atitolinti", 45, false));
-        for (int g = 1; g <= 10; g++) {
-            int n = g % 10;
-            a.add(new Action("group" + n, "Grupė " + n, n == 0 ? 39 : 29 + n, false));
-        }
-        for (int i = 1; i <= 3; i++) a.add(new Action("camloc" + i, "Kameros vieta " + i, 61 + i, false));
+        a.add(new Action("mouse_select", "Žymėjimas", true));
+        a.add(new Action("mouse_command", "Komanda", true));
+        a.add(new Action("mouse_pan", "Kameros tempimas", true));
+        a.add(new Action("cam_up", "Kamera aukštyn", false));
+        a.add(new Action("cam_down", "Kamera žemyn", false));
+        a.add(new Action("cam_left", "Kamera kairėn", false));
+        a.add(new Action("cam_right", "Kamera dešinėn", false));
+        for (int i = 0; i < 9; i++) a.add(new Action("card" + (i + 1), "Komandos langelis " + (i + 1), false));
+        a.add(new Action("cancel", "Atšaukti", false));
+        a.add(new Action("menu", "Meniu", false));
+        a.add(new Action("chat", "Pokalbis", false));
+        a.add(new Action("alert", "Į paskutinį pavojų", false));
+        a.add(new Action("idle", "Laisvas darbininkas", false));
+        a.add(new Action("army", "Kariuomenė", false));
+        a.add(new Action("center", "Centruoti į pažymėtus", false));
+        a.add(new Action("zoom_in", "Priartinti", false));
+        a.add(new Action("zoom_out", "Atitolinti", false));
+        for (int g = 1; g <= 10; g++) a.add(new Action("group" + (g % 10), "Grupė " + (g % 10), false));
+        for (int i = 1; i <= 3; i++) a.add(new Action("camloc" + i, "Kameros vieta " + i, false));
         ACTIONS = a.toArray(new Action[0]);
     }
 
     private Keybinds() {}
 
+    static boolean classic(SharedPreferences p) { return "classic".equals(p.getString(LAYOUT, "grid")); }
+
     static Map<String, Integer> load(SharedPreferences p) {
         Map<String, Integer> m = new HashMap<>();
-        for (Action a : ACTIONS) m.put(a.id, a.def);
-        String s = p.getString(PREF, "");
-        for (String item : s.split(",")) {
+        for (Action a : ACTIONS) m.put(a.id, a.def());
+        for (String item : p.getString(PREF, "").split(",")) {
             int eq = item.indexOf('=');
             if (eq <= 0) continue;
             try { if (m.containsKey(item.substring(0, eq))) m.put(item.substring(0, eq), Integer.parseInt(item.substring(eq + 1))); }
@@ -82,23 +95,44 @@ final class Keybinds {
         return m;
     }
 
-    static String arg(SharedPreferences p) {
-        Map<String, Integer> m = load(p);
+    /** Classic layout: stat_txt entry -> key, for the commands moved off their original letter. */
+    static Map<Integer, Integer> loadCmd(SharedPreferences p) {
+        Map<Integer, Integer> m = new java.util.TreeMap<>();
+        for (String item : p.getString(PREF, "").split(",")) {
+            int eq = item.indexOf('=');
+            if (eq <= 3 || !item.startsWith("cmd")) continue;
+            try {
+                int t = Integer.parseInt(item.substring(3, eq)), code = Integer.parseInt(item.substring(eq + 1));
+                if (t > 0 && code > 0) m.put(t, code);
+            } catch (NumberFormatException ignored) {}
+        }
+        return m;
+    }
+
+    // Only what differs from the game's defaults, then the moved commands.
+    private static String encode(Map<String, Integer> m, Map<Integer, Integer> cmd) {
         StringBuilder b = new StringBuilder();
         for (Action a : ACTIONS) {
+            int v = m.get(a.id);
+            if (v == a.def()) continue;
             if (b.length() > 0) b.append(',');
-            b.append(a.id).append('=').append(m.get(a.id));
+            b.append(a.id).append('=').append(v);
+        }
+        for (Map.Entry<Integer, Integer> e : cmd.entrySet()) {
+            if (b.length() > 0) b.append(',');
+            b.append("cmd").append(e.getKey()).append('=').append(e.getValue());
         }
         return b.toString();
     }
 
+    static String arg(SharedPreferences p) { return encode(load(p), loadCmd(p)); }
+
     private static void save(SharedPreferences p, Map<String, Integer> m) {
-        StringBuilder b = new StringBuilder();
-        for (Action a : ACTIONS) {
-            if (b.length() > 0) b.append(',');
-            b.append(a.id).append('=').append(m.get(a.id));
-        }
-        p.edit().putString(PREF, b.toString()).apply();
+        p.edit().putString(PREF, encode(m, loadCmd(p))).apply();
+    }
+
+    static void saveCmd(SharedPreferences p, Map<Integer, Integer> cmd) {
+        p.edit().putString(PREF, encode(load(p), cmd)).apply();
     }
 
     // Android key code -> SDL scancode (the table SDL's Android backend uses). 0 = not bindable.
@@ -240,7 +274,7 @@ final class Keybinds {
         return null;
     }
 
-    private static int dp(Activity act, float v) {
+    static int dp(Activity act, float v) {
         return Math.round(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, act.getResources().getDisplayMetrics()));
     }
 
@@ -254,7 +288,7 @@ final class Keybinds {
     }
 
     /** The bindings table for Settings > Valdymas: icon, action, key (tap to rebind), reset. */
-    static LinearLayout table(final Activity act, final Kit kit, final SharedPreferences p) {
+    static LinearLayout table(final Activity act, final Kit kit, final SharedPreferences p, final java.io.File gameDir) {
         final Map<String, Integer> m = load(p);
         final LinearLayout list = new LinearLayout(act);
         list.setOrientation(LinearLayout.VERTICAL);
@@ -263,7 +297,7 @@ final class Keybinds {
         final Runnable refresh = () -> {
             for (Action o : ACTIONS) {
                 keyViews.get(o.id).setText(name(m.get(o.id)));
-                resets.get(o.id).setVisibility(m.get(o.id) == o.def ? View.INVISIBLE : View.VISIBLE);
+                resets.get(o.id).setVisibility(m.get(o.id) == o.def() ? View.INVISIBLE : View.VISIBLE);
             }
         };
 
@@ -271,14 +305,16 @@ final class Keybinds {
         head.setOrientation(LinearLayout.HORIZONTAL);
         head.setGravity(Gravity.CENTER_VERTICAL);
         head.setPadding(0, dp(act, 6), 0, dp(act, 6));
-        TextView hint = kit.text(S.t("Komandų langeliai 1–9 — 3×3 kortelė (1–3 viršuje). Shift + komanda — į eilę; Ctrl + grupė — priskirti, Shift + grupė — pridėti, du kartus — kamera į grupę; Ctrl + kameros vieta — įsiminti."), Kit.TEXT2, 11);
+        TextView hint = kit.text(S.t("Shift + komanda — į eilę; Ctrl + grupė — priskirti, Shift + grupė — pridėti, du kartus — kamera į grupę; Ctrl + kameros vieta — įsiminti."), Kit.TEXT2, 11);
         hint.setPadding(0, 0, dp(act, 12), 0);
         head.addView(hint, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        final KeyCardEditor[] editor = new KeyCardEditor[1];
         head.addView(kit.smallButton(S.t("Atstatyti visus"), () -> {
             p.edit().remove(PREF).apply();
             m.clear();
             m.putAll(load(p));
             refresh.run();
+            if (editor[0] != null) editor[0].reload();
             Kit.toast(act, S.t("Klavišai atstatyti."), Toast.LENGTH_SHORT);
         }), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, kit.hdp(40)));
         list.addView(head);
@@ -299,13 +335,30 @@ final class Keybinds {
                 : new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         list.addView(cols);
 
+        // The command card: grid slots (Q W E / A S D / Z X C) or the original letters,
+        // which can be moved per command in a 3x3 card.
+        final java.util.List<View> gridRows = new java.util.ArrayList<>();
+        final boolean classic0 = classic(p);
+        right.addView(kit.label(S.t("Komandų kortelė")));
+        right.addView(kit.segmented(new String[]{S.t("Tinklelis"), S.t("Klasikinis")}, classic0 ? 1 : 0, idx -> {
+            p.edit().putString(LAYOUT, idx == 1 ? "classic" : "grid").apply();
+            for (View v : gridRows) v.setVisibility(idx == 1 ? View.GONE : View.VISIBLE);
+            editor[0].setVisibility(idx == 1 ? View.VISIBLE : View.GONE);
+        }), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        TextView layoutHint = kit.text(S.t("Tinklelis — 3×3 kortelė pagal klavišų vietą (Q W E / A S D / Z X C). Klasikinis — kiekviena komanda turi savo raidę kaip originale (M — Marine, A — Attack); jas galima perkelti kortelėje žemiau."), Kit.TEXT2, 11);
+        layoutHint.setPadding(0, dp(act, 4), 0, dp(act, 4));
+        right.addView(layoutHint);
+        editor[0] = new KeyCardEditor(act, kit, p, gameDir, () -> m.get("cancel"));
+        editor[0].setVisibility(classic0 ? View.VISIBLE : View.GONE);
+        right.addView(editor[0]);
+
         String sec = null;
         LinearLayout col = left;
         for (final Action a : ACTIONS) {
             if (!section(a).equals(sec)) {
                 sec = section(a);
                 col = sec.equals("Komandų kortelė") || sec.equals("Grupės") ? right : left;
-                col.addView(kit.label(S.t(sec)));
+                if (!sec.equals("Komandų kortelė")) col.addView(kit.label(S.t(sec)));
             }
             LinearLayout row = new LinearLayout(act);
             row.setOrientation(LinearLayout.HORIZONTAL);
@@ -322,17 +375,18 @@ final class Keybinds {
             key.setMinWidth(dp(act, 120));
             key.setOnClickListener(v -> {
                 MenuAudio.play(MenuAudio.CLICK);
-                capture(act, kit, a, code -> {
+                capture(act, kit, label(a), a.mouseOnly ? 1 : 0, code -> {
                     String err = assign(m, a, code);
                     if (err != null) { Kit.toast(act, err, Toast.LENGTH_SHORT); return; }
                     save(p, m);
                     refresh.run();
+                    if (editor[0] != null) editor[0].invalidateCard();
                 });
             });
             keyViews.put(a.id, key);
             row.addView(key, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, kit.hdp(36)));
             TextView reset = kit.smallButton("↺", () -> {
-                String err = assign(m, a, a.def);
+                String err = assign(m, a, a.def());
                 if (err != null) { Kit.toast(act, err, Toast.LENGTH_SHORT); return; }
                 save(p, m);
                 refresh.run();
@@ -345,6 +399,7 @@ final class Keybinds {
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             lp.topMargin = dp(act, 2);
             col.addView(row, lp);
+            if (a.id.startsWith("card")) { gridRows.add(row); if (classic0) row.setVisibility(View.GONE); }
         }
         refresh.run();
         return list;
@@ -352,7 +407,8 @@ final class Keybinds {
 
     interface CodeSink { void put(int code); }
 
-    private static void capture(Activity act, Kit kit, Action a, CodeSink sink) {
+    /** mode: 0 key or mouse button, 1 mouse button only, 2 key only. */
+    static void capture(Activity act, Kit kit, String title, int mode, CodeSink sink) {
         final android.app.Dialog[] dlg = new android.app.Dialog[1];
         final View pad = new View(act) {
             @Override public boolean onTouchEvent(MotionEvent ev) { return mouse(ev); }
@@ -363,6 +419,7 @@ final class Keybinds {
                 if (ev.getActionMasked() == MotionEvent.ACTION_BUTTON_PRESS) b = sdlMouseButton(ev.getActionButton());
                 else if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) b = sdlMouseButton(Integer.lowestOneBit(ev.getButtonState()));
                 if (b == 0) return ev.getActionMasked() != MotionEvent.ACTION_HOVER_MOVE;
+                if (mode == 2) { Kit.toast(act, S.t("Čia tinka tik klavišas."), Toast.LENGTH_SHORT); return true; }
                 if (dlg[0] != null) dlg[0].dismiss();
                 sink.put(MOUSE + b);
                 return true;
@@ -373,12 +430,13 @@ final class Keybinds {
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(act, 20), dp(act, 12), dp(act, 20), dp(act, 16));
         box.setBackground(kit.box(Kit.PANEL, Kit.LINE));
-        box.addView(kit.label(label(a)));
-        TextView t = kit.text(a.mouseOnly ? S.t("Spustelėkite pelės mygtuku žemiau esančiame lauke.")
+        box.addView(kit.label(title));
+        TextView t = kit.text(mode == 1 ? S.t("Spustelėkite pelės mygtuku žemiau esančiame lauke.")
+                : mode == 2 ? S.t("Paspauskite klavišą.")
                 : S.t("Paspauskite klavišą arba spustelėkite pelės mygtuku žemiau esančiame lauke."), Kit.TEXT, 13);
         t.setPadding(0, 0, 0, dp(act, 10));
         box.addView(t);
-        box.addView(pad, new LinearLayout.LayoutParams(dp(act, 360), dp(act, 130)));
+        if (mode != 2) box.addView(pad, new LinearLayout.LayoutParams(dp(act, 360), dp(act, 130)));
         LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         blp.gravity = Gravity.END;
         blp.topMargin = dp(act, 12);
@@ -389,8 +447,8 @@ final class Keybinds {
             if (ev.getAction() != KeyEvent.ACTION_DOWN) return false;
             if (keyCode == KeyEvent.KEYCODE_BACK) return false;
             int code = sdlScancode(keyCode);
-            if (code == 0 || a.mouseOnly) {
-                Kit.toast(act, a.mouseOnly ? S.t("Čia tinka tik pelės mygtukas.") : S.t("Šio klavišo priskirti negalima."), Toast.LENGTH_SHORT);
+            if (code == 0 || mode == 1) {
+                Kit.toast(act, mode == 1 ? S.t("Čia tinka tik pelės mygtukas.") : S.t("Šio klavišo priskirti negalima."), Toast.LENGTH_SHORT);
                 return true;
             }
             d.dismiss();
@@ -398,8 +456,10 @@ final class Keybinds {
             return true;
         });
         dlg[0].show();
-        pad.setFocusable(true);
-        pad.requestFocus();
+        if (mode != 2) {
+            pad.setFocusable(true);
+            pad.requestFocus();
+        }
     }
 
     /** A small stroke glyph per action, in the RailIcon manner (24 x 24 box). */

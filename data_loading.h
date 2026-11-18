@@ -453,8 +453,9 @@ auto make_bit_reader(base_reader_T& reader) {
 	return bit_reader<base_reader_T, little_endian>(reader);
 }
 
-template<bool little_endian = true>
-void decompress(uint8_t* input, size_t input_size, uint8_t* output, size_t output_size) {
+// stop_at_eof: an inner layer of a multi-codec sector ends at its end marker, short of output_size.
+template<bool little_endian = true, bool stop_at_eof = false>
+size_t decompress(uint8_t* input, size_t input_size, uint8_t* output, size_t output_size) {
 	data_reader<little_endian> source_r(input, input + input_size);
 	auto r = make_bit_reader(source_r);
 	int type = r.template get<uint8_t>();
@@ -641,7 +642,10 @@ void decompress(uint8_t* input, size_t input_size, uint8_t* output, size_t outpu
 				size_t len = 2 + get_length();
 				size_t distance = 0;
 
-				if (len == 519) error("decompress: eof marker found too early");
+				if (len == 519) {
+					if (stop_at_eof) return out_pos;
+					error("decompress: eof marker found too early");
+				}
 
 				if (len == 2) {
 					distance = get_distance() << 2;
@@ -679,6 +683,7 @@ void decompress(uint8_t* input, size_t input_size, uint8_t* output, size_t outpu
 		}
 
 	} else error("decompress: type %d not supported", type);
+	return out_pos;
 }
 
 static const uint8_t huffman_weight_tables[9][256 + 2] = {
@@ -981,6 +986,7 @@ size_t decompress_adpcm(uint8_t* input, size_t input_size, uint8_t* output, size
 	
 	while (r.left()) {
 		for (size_t channel = 0; channel != channels; ++channel) {
+			if (!r.left()) break; // a stereo stream may end mid-pair (Storm reads byte by byte)
 			auto in_value = r.template get<uint8_t>();
 			if (~in_value & 0x80) {
 				int index = step_index[channel];
@@ -1032,10 +1038,161 @@ size_t decompress_adpcm(uint8_t* input, size_t input_size, uint8_t* output, size
 	return out_pos;
 }
 
+// zlib (RFC 1950/1951) for MPQ compression mask 0x02. Returns the output size;
+// a bad stream, an overflow or an Adler32 mismatch is an error.
+static size_t decompress_zlib(const uint8_t* input, size_t input_size, uint8_t* output, size_t output_size) {
+	struct huffman {
+		uint16_t count[16];
+		uint16_t symbol[288];
+	};
+	const uint8_t* in = input;
+	const uint8_t* in_end = input + input_size;
+	uint32_t bitbuf = 0;
+	int bitcnt = 0;
+	size_t out_pos = 0;
+	auto bits = [&](int need) -> uint32_t {
+		uint32_t v = bitbuf;
+		while (bitcnt < need) {
+			if (in == in_end) error("zlib: unexpected end of stream");
+			v |= (uint32_t)*in++ << bitcnt;
+			bitcnt += 8;
+		}
+		bitbuf = v >> need;
+		bitcnt -= need;
+		return v & ((1u << need) - 1);
+	};
+	auto build = [&](huffman& h, const uint8_t* lengths, int n) {
+		uint16_t offs[16];
+		for (int len = 0; len != 16; ++len) h.count[len] = 0;
+		for (int i = 0; i != n; ++i) ++h.count[lengths[i]];
+		if (h.count[0] == n) return;
+		int left = 1;
+		for (int len = 1; len != 16; ++len) {
+			left <<= 1;
+			left -= h.count[len];
+			if (left < 0) error("zlib: over-subscribed code");
+		}
+		offs[1] = 0;
+		for (int len = 1; len != 15; ++len) offs[len + 1] = offs[len] + h.count[len];
+		for (int i = 0; i != n; ++i) if (lengths[i]) h.symbol[offs[lengths[i]]++] = (uint16_t)i;
+	};
+	auto decode = [&](const huffman& h) -> int {
+		int code = 0, first = 0, index = 0;
+		for (int len = 1; len != 16; ++len) {
+			code |= (int)bits(1);
+			int count = h.count[len];
+			if (code - count < first) return h.symbol[index + (code - first)];
+			index += count;
+			first += count;
+			first <<= 1;
+			code <<= 1;
+		}
+		error("zlib: invalid code");
+		return -1;
+	};
+	static const uint16_t len_base[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+	static const uint8_t len_extra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+	static const uint16_t dist_base[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+	static const uint8_t dist_extra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+
+	if (input_size < 6) error("zlib: stream too short");
+	if ((input[0] & 0x0f) != 8 || (input[0] >> 4) > 7 || ((input[0] << 8) | input[1]) % 31 || (input[1] & 0x20)) error("zlib: bad header");
+	in += 2;
+	huffman lencode, distcode;
+	bool last = false;
+	while (!last) {
+		last = bits(1) != 0;
+		uint32_t type = bits(2);
+		if (type == 0) {
+			bitbuf = 0;
+			bitcnt = 0;
+			if (in_end - in < 4) error("zlib: unexpected end of stream");
+			size_t len = in[0] | in[1] << 8;
+			if ((in[2] | in[3] << 8) != (~len & 0xffff)) error("zlib: stored block length mismatch");
+			in += 4;
+			if ((size_t)(in_end - in) < len) error("zlib: unexpected end of stream");
+			if (output_size - out_pos < len) error("zlib: output overflow");
+			memcpy(output + out_pos, in, len);
+			in += len;
+			out_pos += len;
+			continue;
+		}
+		if (type == 3) error("zlib: invalid block type");
+		uint8_t lengths[320];
+		if (type == 1) {
+			int i = 0;
+			for (; i < 144; ++i) lengths[i] = 8;
+			for (; i < 256; ++i) lengths[i] = 9;
+			for (; i < 280; ++i) lengths[i] = 7;
+			for (; i < 288; ++i) lengths[i] = 8;
+			build(lencode, lengths, 288);
+			for (i = 0; i < 30; ++i) lengths[i] = 5;
+			build(distcode, lengths, 30);
+		} else {
+			int nlen = (int)bits(5) + 257, ndist = (int)bits(5) + 1, ncode = (int)bits(4) + 4;
+			if (nlen > 286 || ndist > 30) error("zlib: bad code counts");
+			static const uint8_t order[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+			for (int i = 0; i != 19; ++i) lengths[order[i]] = i < ncode ? (uint8_t)bits(3) : 0;
+			build(lencode, lengths, 19);
+			int index = 0;
+			while (index < nlen + ndist) {
+				int symbol = decode(lencode);
+				if (symbol < 16) {
+					lengths[index++] = (uint8_t)symbol;
+					continue;
+				}
+				uint8_t value = 0;
+				int rep;
+				if (symbol == 16) {
+					if (index == 0) error("zlib: repeat with no previous length");
+					value = lengths[index - 1];
+					rep = 3 + (int)bits(2);
+				} else if (symbol == 17) rep = 3 + (int)bits(3);
+				else rep = 11 + (int)bits(7);
+				if (index + rep > nlen + ndist) error("zlib: too many lengths");
+				while (rep--) lengths[index++] = value;
+			}
+			if (lengths[256] == 0) error("zlib: no end-of-block code");
+			build(lencode, lengths, nlen);
+			build(distcode, lengths + nlen, ndist);
+		}
+		while (true) {
+			int symbol = decode(lencode);
+			if (symbol < 256) {
+				if (out_pos == output_size) error("zlib: output overflow");
+				output[out_pos++] = (uint8_t)symbol;
+				continue;
+			}
+			if (symbol == 256) break;
+			symbol -= 257;
+			if (symbol >= 29) error("zlib: invalid length symbol");
+			size_t len = len_base[symbol] + bits(len_extra[symbol]);
+			int dsym = decode(distcode);
+			if (dsym >= 30) error("zlib: invalid distance symbol");
+			size_t dist = dist_base[dsym] + bits(dist_extra[dsym]);
+			if (dist > out_pos) error("zlib: distance too far back");
+			if (output_size - out_pos < len) error("zlib: output overflow");
+			for (size_t i = 0; i != len; ++i, ++out_pos) output[out_pos] = output[out_pos - dist];
+		}
+	}
+	// the Adler32 trailer starts at the next byte boundary
+	in -= bitcnt / 8;
+	if (in_end - in < 4) error("zlib: missing adler32");
+	uint32_t a = 1, b = 0;
+	for (size_t i = 0; i != out_pos; ++i) {
+		a = (a + output[i]) % 65521;
+		b = (b + a) % 65521;
+	}
+	uint32_t want = (uint32_t)in[0] << 24 | (uint32_t)in[1] << 16 | (uint32_t)in[2] << 8 | in[3];
+	if (((b << 16) | a) != want) error("zlib: adler32 mismatch");
+	return out_pos;
+}
+
 struct hash_table_entry {
 	uint32_t hash1;
 	uint32_t hash2;
 	size_t block_index;
+	uint16_t locale = 0;
 };
 struct block_table_entry {
 	uint32_t data_offset;
@@ -1057,10 +1214,27 @@ struct mpq_archive_file_reader {
 	a_vector<uint8_t> compressed_data;
 	a_vector<uint8_t> sector_data;
 	size_t file_position = 0;
-	mpq_archive_file_reader(a_string arg_filename, base_reader_T& r, size_t sector_size, block_table_entry be, uint32_t key, const crypt_table_t& crypt_table) : filename(std::move(arg_filename)), r(r), sector_size(sector_size), be(be), key(key), crypt_table(crypt_table) {
+	// single-unit file whose compressed size a protector replaced by 0xFFFFFFFF:
+	// the unit runs to the end of the archive, so its length says nothing about compression
+	bool unit_length_unknown = false;
+	mpq_archive_file_reader(a_string arg_filename, base_reader_T& r, size_t sector_size, block_table_entry be, uint32_t key, const crypt_table_t& crypt_table, size_t archive_end = ~(size_t)0) : filename(std::move(arg_filename)), r(r), sector_size(sector_size), be(be), key(key), crypt_table(crypt_table) {
 
-		sector_data.resize(sector_size);
-		r.seek(be.data_offset);
+		if (be.data_offset > archive_end) error("mpq: %s: data offset past end of archive", filename);
+		const size_t avail = archive_end - be.data_offset;
+
+		if (be.flags & 0x01000000) {
+			// Single unit: no sector table, the whole file is one sector.
+			this->sector_size = be.size ? (size_t)be.size : 1;
+			size_t unit_size = be.size;
+			if (be.flags & 0x300) {
+				unit_size = be.compressed_size;
+				if (be.compressed_size == 0xffffffff) unit_length_unknown = true;
+				if (unit_size > avail) unit_size = avail;
+			}
+			compressed_sectors.push_back(0);
+			compressed_sectors.push_back(unit_size);
+			return;
+		}
 
 		if (~be.flags & 0x200 && ~be.flags & 0x100) {
 			// Stored (uncompressed) file: there is no sector-offset table in
@@ -1073,26 +1247,47 @@ struct mpq_archive_file_reader {
 			return;
 		}
 
-		auto read_sectors = [&](auto&& sectors_r) {
-			while (true) {
-				size_t offset = sectors_r.template get<uint32_t>();
-				compressed_sectors.push_back(offset);
-				if (offset == be.compressed_size) break;
-				if (compressed_sectors.size() > (be.size + sector_size - 1) / sector_size) error("mpq: %s: too many compressed sectors in file", filename);
-			}
-		};
+		if (be.size == 0) {
+			compressed_sectors.push_back(0);
+			compressed_sectors.push_back(0);
+			return;
+		}
 
+		// Exactly n + 1 offsets. A sector-CRC entry (0x04000000) or protector
+		// padding after them is not part of the file data and is never read.
+		const size_t entries = ((size_t)be.size + sector_size - 1) / sector_size + 1;
+		if (entries > avail / 4) error("mpq: %s: sector table past end of archive", filename);
+		r.seek(be.data_offset);
+		auto read_sectors = [&](auto&& sectors_r) {
+			compressed_sectors.resize(entries);
+			for (size_t i = 0; i != entries; ++i) compressed_sectors[i] = sectors_r.template get<uint32_t>();
+		};
 		if (be.flags & 0x10000) {
-			read_sectors(make_encrypted_reader(r, 4 * ((be.size + sector_size - 1) / sector_size + 1), key - 1, crypt_table));
+			read_sectors(make_encrypted_reader(r, 4 * entries, key - 1, crypt_table));
 		} else {
 			read_sectors(r);
 		}
+		if (compressed_sectors[0] < 4 * entries) error("mpq: %s: sector overlaps the sector table", filename);
+		for (size_t i = 0; i + 1 != entries; ++i) {
+			if (compressed_sectors[i + 1] < compressed_sectors[i]) error("mpq: %s: sector offsets out of order", filename);
+		}
+		if (compressed_sectors.back() > avail) error("mpq: %s: sector past end of archive", filename);
 	}
 	void read_sector() {
 		current_sector = file_position / sector_size;
 		if (current_sector >= compressed_sectors.size() - 1) error("mpq: %s: attempt to read past end", filename);
 
 		size_t sector_data_size = compressed_sectors[current_sector + 1] - compressed_sectors[current_sector];
+
+		size_t current_sector_size = sector_size;
+		if (current_sector == compressed_sectors.size() - 2) current_sector_size = (size_t)be.size - current_sector * sector_size;
+		if (sector_data.size() < current_sector_size) sector_data.resize(current_sector_size);
+
+		if (sector_data_size == 0) {
+			// empty sector (two equal offsets): zeros, no compression byte
+			memset(sector_data.data(), 0, current_sector_size);
+			return;
+		}
 		r.seek(be.data_offset + compressed_sectors[current_sector]);
 
 		int compression_flags;
@@ -1118,13 +1313,11 @@ struct mpq_archive_file_reader {
 			}
 		};
 
-		size_t current_sector_size = sector_data.size();
-		if (current_sector == compressed_sectors.size() - 2) current_sector_size = be.size % sector_size;
-		if (current_sector_size == 0) current_sector_size = sector_size; // size an exact multiple of sector_size
-
-		if (sector_data_size == current_sector_size && sector_data_size <= sector_size) {
-			if (be.flags & 0x10000) make_encrypted_reader(r, sector_data_size, key + (uint32_t)current_sector, crypt_table).get_bytes(sector_data.data(), sector_data_size);
-			else r.get_bytes(sector_data.data(), sector_data_size);
+		// A sector no shorter than its data is stored raw; protectors pad raw
+		// (encrypted) final and single-unit sectors past the logical size.
+		if (sector_data_size >= current_sector_size && !unit_length_unknown) {
+			if (be.flags & 0x10000) make_encrypted_reader(r, sector_data_size, key + (uint32_t)current_sector, crypt_table).get_bytes(sector_data.data(), current_sector_size);
+			else r.get_bytes(sector_data.data(), current_sector_size);
 		} else {
 			if (be.flags & 0x10000) get_data(make_encrypted_reader(r, sector_data_size, key + (uint32_t)current_sector, crypt_table));
 			else get_data(r);
@@ -1137,14 +1330,21 @@ struct mpq_archive_file_reader {
 					if (compressed_data.size() < sector_data_size) compressed_data.resize(sector_data_size);
 					if (sector_data.size() < current_sector_size) sector_data.resize(current_sector_size);
 				};
+				// Storm's decompression order: PKWARE, zlib, huffman, ADPCM stereo, ADPCM mono.
+				if (compression_flags & ~0xcb) error("mpq: %s: unsupported compression flags %d", filename, compression_flags);
+				if (compression_flags & 8) {
+					compression_flags &= ~8;
+					size_t out_size = decompress<true, true>(compressed_data.data(), input_size, sector_data.data(), current_sector_size);
+					if (compression_flags) swap_buffers(out_size);
+				}
+				if (compression_flags & 2) {
+					compression_flags &= ~2;
+					size_t out_size = decompress_zlib(compressed_data.data(), input_size, sector_data.data(), current_sector_size);
+					if (compression_flags) swap_buffers(out_size);
+				}
 				if (compression_flags & 1) {
 					compression_flags &= ~1;
 					size_t out_size = decompress_huffman(compressed_data.data(), input_size, sector_data.data(), current_sector_size);
-					if (compression_flags) swap_buffers(out_size);
-				}
-				if (compression_flags & 0x40) {
-					compression_flags &= ~0x40;
-					size_t out_size = decompress_adpcm(compressed_data.data(), input_size, sector_data.data(), current_sector_size, 1);
 					if (compression_flags) swap_buffers(out_size);
 				}
 				if (compression_flags & 0x80) {
@@ -1152,7 +1352,10 @@ struct mpq_archive_file_reader {
 					size_t out_size = decompress_adpcm(compressed_data.data(), input_size, sector_data.data(), current_sector_size, 2);
 					if (compression_flags) swap_buffers(out_size);
 				}
-				if (compression_flags != 0) error("mpq: %s: unsupported compression flags %d", filename, compression_flags);
+				if (compression_flags & 0x40) {
+					compression_flags &= ~0x40;
+					decompress_adpcm(compressed_data.data(), input_size, sector_data.data(), current_sector_size, 1);
+				}
 			}
 		}
 
@@ -1197,57 +1400,83 @@ struct mpq_archive_reader {
 	size_t base_offset = 0; // MPQ header position within the file (MZ-stub archives)
 	a_vector<hash_table_entry> hash_table;
 	a_vector<block_table_entry> block_table;
+	// Declared hash table size when it runs far past the file (protected maps): only the part in
+	// the file is kept, the rest probes as occupied, non-matching entries. 0 = hash_table.size().
+	size_t hash_table_virtual_size = 0;
+	size_t archive_end = 0;
 	explicit mpq_archive_reader(base_reader_T& r) : r(r) {
-		auto mpq_signature = r.template get<uint32_t>();
 		// Self-executing archives (e.g. the CD StarCraft.mpq / BroodWar.mpq,
-		// which carry the game music) have an MZ stub before the MPQ data.
-		// Like Storm, scan for the header at 512-byte boundaries; all archive
-		// offsets are then relative to the header, so record the base.
-		size_t base = 0;
-		if (mpq_signature != 0x1a51504d) {
-			size_t limit = r.size();
+		// which carry the game music) have an MZ stub before the MPQ data, and
+		// protected maps put decoy headers (header size < 32) in front of the
+		// real one. Like Storm, take the first header at a 512-byte boundary
+		// whose header size is at least 32; archive offsets are relative to it.
+		archive_end = r.size();
+		size_t base = ~(size_t)0;
+		{
+			size_t first_signature = ~(size_t)0;
+			size_t limit = archive_end;
 			if (limit > 16 * 1024 * 1024) limit = 16 * 1024 * 1024;
-			for (size_t pos = 512; pos + 4 <= limit; pos += 512) {
+			for (size_t pos = 0; pos + 32 <= limit; pos += 512) {
 				r.seek(pos);
-				if (r.template get<uint32_t>() == 0x1a51504d) { base = pos; break; }
+				if (r.template get<uint32_t>() != 0x1a51504d) continue;
+				if (first_signature == ~(size_t)0) first_signature = pos;
+				if (r.template get<uint32_t>() >= 32) { base = pos; break; }
 			}
-			if (base == 0) error("signature mismatch; file is not an mpq archive");
+			if (base == ~(size_t)0) base = first_signature; // only short headers: take the first, as before
+			if (base == ~(size_t)0) error("signature mismatch; file is not an mpq archive");
 		}
 		base_offset = base;
+		r.seek(base + 8);
 
-		r.template get<uint32_t>();
-		r.template get<uint32_t>();
+		r.template get<uint32_t>(); // archive size (protectors lie; the physical size is used)
 		r.template get<uint16_t>(); // version
 
-		auto block_size = r.template get<uint16_t>();
+		size_t block_size = r.template get<uint16_t>() & 0xff;
+		if (block_size > 22) error("mpq: bad sector size exponent %d", block_size);
+		sector_size = (size_t)512 << block_size;
 
-		sector_size = (size_t)512 * 1<<block_size;
+		// Storm adds these in 32 bits: protectors store "negative" offsets that wrap back.
+		size_t hash_table_offset = (uint32_t)(base + r.template get<uint32_t>());
+		size_t block_table_offset = (uint32_t)(base + r.template get<uint32_t>());
 
-		size_t hash_table_offset = base + (size_t)r.template get<uint32_t>();
-		size_t block_table_offset = base + (size_t)r.template get<uint32_t>();
+		size_t hash_table_size = r.template get<uint32_t>() & 0x0fffffff;
+		size_t block_table_size = r.template get<uint32_t>() & 0x0fffffff;
 
-		size_t hash_table_size = (size_t)(r.template get<uint32_t>() * 16 / 16);
-		size_t block_table_size = (size_t)(r.template get<uint32_t>() * 16 / 16);
+		// Tables are checked against the file before anything is allocated. A
+		// hash table cut short by the end of the file reads as free entries; a
+		// block table is cut to the entries that exist (Storm does the same).
+		if (hash_table_offset > archive_end || block_table_offset > archive_end) error("mpq: tables past end of archive");
+		size_t hash_table_avail = (archive_end - hash_table_offset) / 16;
+		if (hash_table_size > hash_table_avail && hash_table_size > 0x100000) {
+			if (hash_table_size & (hash_table_size - 1)) error("mpq: hash table past end of archive");
+			hash_table_virtual_size = hash_table_size;
+			hash_table_size = hash_table_avail;
+		}
+		if (block_table_size > (archive_end - block_table_offset) / 16) block_table_size = (archive_end - block_table_offset) / 16;
 
 		r.seek(hash_table_offset);
 
-		auto hash_table_r = make_encrypted_reader(r, 16 * hash_table_size, string_hash("(hash table)", 3, crypt_table), crypt_table);
+		size_t hash_table_read = std::min(hash_table_size, hash_table_avail);
+		auto hash_table_r = make_encrypted_reader(r, 16 * hash_table_read, string_hash("(hash table)", 3, crypt_table), crypt_table);
 
-		for (size_t i = 0; i != hash_table_size; ++i) {
+		hash_table.reserve(hash_table_size);
+		for (size_t i = 0; i != hash_table_read; ++i) {
 			auto hash1 = hash_table_r.template get<uint32_t>();
 			auto hash2 = hash_table_r.template get<uint32_t>();
 
-			hash_table_r.template get<uint16_t>(); // locale
+			auto locale = hash_table_r.template get<uint16_t>();
 			hash_table_r.template get<uint16_t>(); // platform
 			auto block_index = hash_table_r.template get<uint32_t>();
 
-			hash_table.push_back({hash1, hash2, (size_t)block_index});
+			hash_table.push_back({hash1, hash2, (size_t)block_index, locale});
 		}
+		for (size_t i = hash_table_read; i != hash_table_size; ++i) hash_table.push_back({0xffffffff, 0xffffffff, (size_t)0xffffffff});
 
+		r.seek(block_table_offset);
 		auto block_table_r = make_encrypted_reader(r, 16 * block_table_size, string_hash("(block table)", 3, crypt_table), crypt_table);
 
+		block_table.reserve(block_table_size);
 		for (size_t i = 0; i != block_table_size; ++i) {
-			r.seek(block_table_offset + i * 16);
 			auto data_offset = block_table_r.template get<uint32_t>();
 			auto compressed_size = block_table_r.template get<uint32_t>();
 			auto size = block_table_r.template get<uint32_t>();
@@ -1258,7 +1487,14 @@ struct mpq_archive_reader {
 		}
 	}
 
-	const hash_table_entry* find_hash_table_entry(const a_string& filename) const {
+	// Decoy entries of protected maps name blocks that lie past the end of the file.
+	bool block_in_archive(const block_table_entry& be) const {
+		return be.data_offset <= archive_end && be.compressed_size <= archive_end - be.data_offset;
+	}
+
+	// Every live entry for the name, best first (see below); open() falls back along the list.
+	a_vector<const hash_table_entry*> find_hash_table_entries(const a_string& filename) const {
+		a_vector<const hash_table_entry*> out;
 		auto hash0 = string_hash(filename.c_str(), 0, crypt_table);
 		auto hash1 = string_hash(filename.c_str(), 1, crypt_table);
 		auto hash2 = string_hash(filename.c_str(), 2, crypt_table);
@@ -1267,18 +1503,37 @@ struct mpq_archive_reader {
 		// The same as `% size` for every power-of-two table; a protected map with a
 		// 1000-entry table ("(2)Jacobs Ladder.scm") is only readable this way. An
 		// entry naming a block past the block table is skipped, as Storm does.
-		if (hash_table.empty()) return nullptr;
-		const size_t mask = hash_table.size() - 1;
+		if (hash_table.empty()) return out;
+		const size_t table_size = hash_table_virtual_size ? hash_table_virtual_size : hash_table.size();
+		const size_t mask = table_size - 1;
 		const size_t initial_index = hash0 & mask;
+		// Several entries can share a name with different locales (protected maps put an empty
+		// neutral decoy next to the real file): like Storm in an English client, 0x409 wins, then
+		// the neutral locale, then the first match.
 		size_t index = initial_index;
-		for (size_t steps = 0; steps != hash_table.size(); ++steps) {
+		for (size_t steps = 0; steps <= hash_table.size(); ++steps) {
+			if (index >= hash_table.size()) {
+				// past the file: occupied entries up to the wrap
+				if (initial_index >= hash_table.size() && steps) break;
+				index = 0;
+				if (index == initial_index) break;
+			}
 			auto& he = hash_table[index];
 			if (he.block_index == 0xffffffff) break;
-			if (he.hash1 == hash1 && he.hash2 == hash2 && he.block_index < block_table.size()) return &he;
+			if (he.hash1 == hash1 && he.hash2 == hash2 && he.block_index < block_table.size() && block_in_archive(block_table[he.block_index])) {
+				out.push_back(&he);
+			}
 			index = (index + 1) & mask;
 			if (index == initial_index) break;
 		}
-		return nullptr;
+		auto rank = [](const hash_table_entry* e) { return e->locale == 0x409 ? 0 : e->locale == 0 ? 1 : 2; };
+		std::stable_sort(out.begin(), out.end(), [&](auto* a, auto* b) { return rank(a) < rank(b); });
+		return out;
+	}
+
+	const hash_table_entry* find_hash_table_entry(const a_string& filename) const {
+		auto v = find_hash_table_entries(filename);
+		return v.empty() ? nullptr : v.front();
 	}
 
 	bool file_exists(const a_string& filename) {
@@ -1286,8 +1541,19 @@ struct mpq_archive_reader {
 	}
 
 	auto open(a_string filename) {
-		auto* he = find_hash_table_entry(filename);
-		if (!he) error("mpq: %s: no such file", filename);
+		auto candidates = find_hash_table_entries(filename);
+		if (candidates.empty()) error("mpq: %s: no such file", filename);
+		// A protected map can list a decoy first whose sector table is garbage: take the next one.
+		for (size_t i = 0; i + 1 < candidates.size(); ++i) {
+			try {
+				return open_entry(filename, candidates[i]);
+			} catch (const std::exception&) {
+			}
+		}
+		return open_entry(std::move(filename), candidates.back());
+	}
+
+	auto open_entry(a_string filename, const hash_table_entry* he) {
 
 		const char* c = filename.data() + filename.size();
 		while (c != filename.data()) {
@@ -1305,7 +1571,7 @@ struct mpq_archive_reader {
 			file_key = (file_key + (uint32_t)(be.data_offset - base_offset)) ^ be.size;
 		}
 
-		return mpq_archive_file_reader<base_reader_T, default_little_endian>(std::move(filename), r, sector_size, be, file_key, crypt_table);
+		return mpq_archive_file_reader<base_reader_T, default_little_endian>(std::move(filename), r, sector_size, be, file_key, crypt_table, archive_end);
 	}
 
 };
@@ -1502,6 +1768,7 @@ unit_types_t load_units_dat(const data_T& data) {
 		auto& v = unit_types.vec[i];
 		memset(&v, 0, sizeof(v));
 		v.id = (UnitTypes)i;
+		v.behaves_as = (UnitTypes)i;
 	}
 
 	data_reader_le r(data.data(), data.data() + data.size());

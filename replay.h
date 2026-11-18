@@ -125,6 +125,10 @@ inline void replay_enter_scr(reader_T&) {
 struct scr_limits_t {
 	bool present = false;
 	uint32_t images = 5000, sprites = 2500, thingies = 500, units = 1700, bullets = 100, orders = 2000, fog_sprites = 500;
+	// BFIX: the game's bug-fix level (every replay measured: 4, 0); GCFG: the game build
+	bool bfix_present = false;
+	uint32_t bfix_level = 0;
+	uint32_t game_build = 0;
 };
 template<typename base_reader_T, bool le>
 inline scr_limits_t replay_read_scr_limits(replay_file_reader<base_reader_T, le>& r) {
@@ -138,7 +142,7 @@ inline scr_limits_t replay_read_scr_limits(replay_file_reader<base_reader_T, le>
 			r.r.seek(pos);
 			uint8_t t[4];
 			r.r.get_bytes(t, 4);
-			for (uint8_t c : t) if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) return false;
+			for (uint8_t c : t) if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) return false;
 			size_t size = r.r.template get<uint32_t>();
 			if (pos + 8 + size > end) return false;
 			pos += 8 + size;
@@ -182,6 +186,15 @@ inline scr_limits_t replay_read_scr_limits(replay_file_reader<base_reader_T, le>
 				auto v = [&](size_t i) { return (uint32_t)b[i * 4] | ((uint32_t)b[i * 4 + 1] << 8) | ((uint32_t)b[i * 4 + 2] << 16) | ((uint32_t)b[i * 4 + 3] << 24); };
 				l.images = v(0); l.sprites = v(1); l.thingies = v(2); l.units = v(3); l.bullets = v(4); l.orders = v(5); l.fog_sprites = v(6);
 				l.present = true;
+			} else if (tag == 0x58494642u && size == 20) {   // "BFIX"
+				std::array<uint8_t, 8> b;
+				r.get_bytes(b.data(), b.size());
+				l.bfix_present = true;
+				l.bfix_level = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+			} else if (tag == 0x47464347u && size == 37) {   // "GCFG"
+				std::array<uint8_t, 25> b;
+				r.get_bytes(b.data(), b.size());
+				l.game_build = (uint32_t)b[4] | ((uint32_t)b[5] << 8) | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
 			} else {
 				a_vector<uint8_t> skip(size);
 				if (size) r.r.get_bytes(skip.data(), size);
@@ -211,6 +224,8 @@ struct replay_trailer_t {
 	std::array<uint32_t, 8> ai_script{};
 	std::array<std::array<uint8_t, 12>, 12> alliances{};
 	std::array<uint32_t, 12> shared_vision{};
+	uint64_t mod_fp = 0;   // G10: "OBMD" after OBQL (0 = recorded without data mods)
+	a_string mods_csv;
 };
 template<typename base_reader_T, bool le>
 inline replay_trailer_t replay_read_qol_trailer(replay_file_reader<base_reader_T, le>& r) {
@@ -226,6 +241,13 @@ inline replay_trailer_t replay_read_qol_trailer(replay_file_reader<base_reader_T
 		for (size_t i = 0; i != 12; ++i) for (size_t j = 0; j != 12; ++j) t.alliances[i][j] = r.r.template get<uint8_t>();
 		for (size_t i = 0; i != 12; ++i) t.shared_vision[i] = r.r.template get<uint32_t>();
 		t.has_setup = true;
+	}
+	if (r.r.left() >= 20 && r.r.template get<uint32_t>() == 0x444D424Fu && r.r.template get<uint32_t>() == 1) {
+		uint64_t lo = r.r.template get<uint32_t>();
+		uint64_t hi = r.r.template get<uint32_t>();
+		uint32_t n = r.r.template get<uint32_t>();
+		t.mod_fp = lo | (hi << 32);
+		if (n <= 4096 && r.r.left() >= n) for (uint32_t i = 0; i != n; ++i) t.mods_csv += (char)r.r.template get<uint8_t>();
 	}
 	return t;
 }
@@ -253,6 +275,8 @@ struct replay_state {
 	// v1.0.2: set-up restored from a version 2 trailer (own recordings)
 	bool has_setup = false;
 	std::array<uint32_t, 8> ai_script{};
+	uint64_t mod_fp = 0;   // G10: from the OBMD trailer
+	a_string mods_csv;
 };
 
 struct replay_functions: action_functions {
@@ -401,6 +425,8 @@ struct replay_functions: action_functions {
 		replay_st.qol_bits = qol_bits;
 		replay_st.has_setup = trailer.has_setup;
 		replay_st.ai_script = trailer.ai_script;
+		replay_st.mod_fp = trailer.mod_fp;
+		replay_st.mods_csv = trailer.mods_csv;
 		// An OpenBW recording made before the version 2 trailer stored the engine's
 		// own 0-based force in the header (see the use-map-settings note below).
 		const bool own_old_recording = !trailer.has_setup && arr_str(game_name) == "OpenBW Android";
@@ -410,11 +436,20 @@ struct replay_functions: action_functions {
 			st.game->qol.multi_building_select = (qol_bits >> 0) & 1;
 			st.game->qol.worker_rally_split    = (qol_bits >> 6) & 1;
 			st.game->qol.smart_rally           = (qol_bits >> 7) & 1;
-			// An SC:R game with larger pools: the two thresholds move with them (the
-			// original keeps 20 bullets and 200 orders in reserve). Never below 1.16.1's.
+			st.game->qol.skip_oescript         = !((qol_bits >> 9) & 1);
+			st.game->qol.trigger_pause         = (qol_bits >> 10) & 1;
+			st.game->qol.eud_requirements      = (qol_bits >> 12) & 1;
+			st.game->qol.legacy_trigger_seconds = (trailer.version != 0 || own_old_recording) && !((qol_bits >> 11) & 1);
+			// bit8; a foreign replay comes from the original, which always applies it
+			st.game->qol.ums_unit_properties   = ((qol_bits >> 8) & 1) || (trailer.version == 0 && arr_str(game_name) != "OpenBW Android");
+			// An SC:R game with larger pools: the thresholds move with them. Never below 1.16.1's.
 			if (scr_limits.present) {
-				if (scr_limits.bullets > 100) st.game->halo_rocket_bullet_cap = (int)scr_limits.bullets - 20;
-				if (scr_limits.orders > 2000) st.game->order_queue_cap = (int)scr_limits.orders - 200;
+				// v1.0.27: the thresholds are proportional (80% bullets, 90% orders), the thingy pool grows too
+				if (scr_limits.bullets > 100) st.game->halo_rocket_bullet_cap = (int)(scr_limits.bullets * 8 / 10);
+				if (scr_limits.orders > 2000) st.game->order_queue_cap = (int)(scr_limits.orders * 9 / 10);
+				if (scr_limits.thingies > 500) st.game->thingy_cap = (int)scr_limits.thingies;
+				st.game->scr_order_alloc_guard = scr_limits.bfix_present && scr_limits.bfix_level >= 4;
+				st.game->scr_scv_reset_exception = st.game->scr_order_alloc_guard && scr_limits.game_build >= 9713;
 				// v1.0.15: and the pools themselves grow. With 1.16.1's 100 bullets a late
 				// fight ran out of them where the recorded game (400) did not: a worker's
 				// mining spark was not created, its sound did not draw a random number, and

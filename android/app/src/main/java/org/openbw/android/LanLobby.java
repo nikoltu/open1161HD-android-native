@@ -55,7 +55,32 @@ public class LanLobby {
         public int speed = 100;
         public int target = 2;
         public boolean started;
+        // Use Map Settings (the host's map is a scenario): the map's OWNR / SIDE per slot, as
+        // 8 hex digits each. Lobby player k plays the k-th human (OWNR 6) slot of the map.
+        public boolean ums;
+        public String ownr = "", side = "";
         public final List<Slot> slots = new ArrayList<>();
+
+        /** The map slot lobby player {@code index} plays in a UMS game, else -1. */
+        public int mapSlot(int index) {
+            if (!ums || ownr.length() < 8) return -1;
+            for (int s = 0; s < 8; s++) if (Character.digit(ownr.charAt(s), 16) == 6 && index-- == 0) return s;
+            return -1;
+        }
+        /** The race the map fixes for lobby player {@code index} (SIDE 0-2), else -1. */
+        public int fixedRace(int index) {
+            int s = mapSlot(index);
+            if (s < 0 || side.length() < 8) return -1;
+            int r = Character.digit(side.charAt(s), 16);
+            return r >= 0 && r <= 2 ? r : -1;
+        }
+        /** How many players a UMS map seats (its human slots); 8 otherwise. */
+        public int humanSlots() {
+            if (!ums || ownr.length() < 8) return 8;
+            int n = 0;
+            for (int s = 0; s < 8; s++) if (Character.digit(ownr.charAt(s), 16) == 6) n++;
+            return n;
+        }
 
         JSONObject toJson() {
             try {
@@ -64,6 +89,7 @@ public class LanLobby {
                 o.put("speed", speed);
                 o.put("target", target);
                 o.put("started", started);
+                if (ums) { o.put("ums", true); o.put("ownr", ownr); o.put("side", side); }
                 JSONArray arr = new JSONArray();
                 for (Slot s : slots) {
                     JSONObject j = new JSONObject();
@@ -89,6 +115,9 @@ public class LanLobby {
             s.speed = o.optInt("speed", 100);
             s.target = o.optInt("target", 2);
             s.started = o.optBoolean("started", false);
+            s.ums = o.optBoolean("ums", false);
+            s.ownr = o.optString("ownr", "");
+            s.side = o.optString("side", "");
             JSONArray arr = o.optJSONArray("slots");
             if (arr != null) {
                 for (int i = 0; i < arr.length(); i++) {
@@ -165,12 +194,19 @@ public class LanLobby {
         Slot slot;
     }
 
+    /** Host, before {@link #startHost}: the map plays by its own settings (UMS). */
+    public synchronized void setUmsMap(String ownr, String side) {
+        state.ums = true;
+        state.ownr = ownr;
+        state.side = side;
+    }
+
     public synchronized void startHost(String userId, int race, String map, int players, int speed) {
         isHost = true;
         myUserId = userId;
         hostIp = "127.0.0.1";
         state.map = map;
-        state.target = Math.max(2, Math.min(8, players));
+        state.target = Math.max(2, Math.min(Math.min(8, state.humanSlots()), players));
         state.speed = speed;
         Slot h = new Slot();
         h.userId = userId;

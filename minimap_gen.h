@@ -11,6 +11,7 @@
 #include "containers.h"
 #include "strf.h"
 #include "data_loading.h"
+#include "oescript.h"
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -284,8 +285,69 @@ inline void parse_map_info(const a_vector<uint8_t>& chk, a_string& name, a_strin
 	desc = get_str(desc_idx);
 }
 
+// OEScript API a bytecode blob asks for (its "OEBC" header), 0 = not bytecode.
+inline int oes_blob_api(const uint8_t* p, size_t n) {
+	if (n < 8 || memcmp(p, "OEBC", 4)) return 0;
+	return (p[6] << 8) | p[7]; // big-endian, like the rest of the bytecode
+}
+// ";<s>" for the launcher: 0 no script, 1 the script runs here, 2 it needs a newer game.
+inline a_string oes_state_field(int api) {
+	return !api ? ";0" : api > (int)oescript::api_version ? ";2" : ";1";
+}
+
+// UMS lobby facts for the launcher: "<u>;<ownr>;<side>;<oes>" -- u = 1 when the map is a
+// scenario: a trigger beyond what melee/ladder maps carry (default Command / Elapsed /
+// Always triggers, observer text, WAV and vision scripts); ownr/side = one hex digit per slot 0-7.
+inline a_string parse_map_slots(const a_vector<uint8_t>& chk) {
+	auto rd32 = [](const uint8_t* p) -> uint32_t { return (uint32_t)(p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24)); };
+	uint8_t ownr[8] = {}, side[8] = {};
+	bool scenario = false;
+	int oes_api = 0;
+	size_t pos = 0;
+	while (pos + 8 <= chk.size()) {
+		const uint8_t* tag = chk.data() + pos;
+		uint32_t len = rd32(chk.data() + pos + 4);
+		pos += 8;
+		if (len > chk.size() - pos) len = (uint32_t)(chk.size() - pos);
+		const uint8_t* body = chk.data() + pos;
+		if (!memcmp(tag, "OWNR", 4) && len >= 8) memcpy(ownr, body, 8);
+		else if (!memcmp(tag, "SIDE", 4) && len >= 8) memcpy(side, body, 8);
+		else if (!memcmp(tag, "OESC", 4)) oes_api = oes_blob_api(body, len);
+		else if (!memcmp(tag, "TRIG", 4)) {
+			for (size_t t = 0; t + 2400 <= len && !scenario; t += 2400) {
+				const uint8_t* tr = body + t;
+				for (int c = 0; c != 16; ++c) {
+					uint8_t type = tr[c * 20 + 15];
+					if (!type) break;
+					if (type != 2 && type != 12 && type != 22) scenario = true;
+				}
+				for (int a = 0; a != 64; ++a) {
+					uint8_t type = tr[320 + a * 32 + 26];
+					if (!type) break;
+					const uint8_t* ac = tr + 320 + a * 32;
+					if (type == 15 || type == 16) {
+						if (((rd32(ac + 20) >> 8) & 0xffff) != 0x6956) scenario = true; // not a "?Vi?" vision script
+						continue;
+					}
+					switch (type) {
+					case 1: case 2: case 3: case 4: case 8: case 9: case 12: case 26: case 47: case 57: break;
+					default: scenario = true;
+					}
+				}
+			}
+		}
+		pos += len;
+	}
+	const char* hex = "0123456789abcdef";
+	a_string r = scenario ? "1;" : "0;";
+	for (int i = 0; i != 8; ++i) r += hex[ownr[i] & 15];
+	r += ';';
+	for (int i = 0; i != 8; ++i) r += hex[side[i] & 15];
+	return r + oes_state_field(oes_api);
+}
+
 // Front-end: map info from a file on disk (.scm/.scx MPQ or raw .chk).
-inline bool get_map_info(const char* mapfile, a_string& name, a_string& desc, a_string& err) {
+inline bool get_map_info(const char* mapfile, a_string& name, a_string& desc, a_string& err, a_string* slots = nullptr) {
 	a_vector<uint8_t> chk;
 	FILE* mf = fopen(mapfile, "rb");
 	if (!mf) { err = "cannot open map file"; return false; }
@@ -303,6 +365,18 @@ inline bool get_map_info(const char* mapfile, a_string& name, a_string& desc, a_
 		fclose(mf);
 	}
 	parse_map_info(chk, name, desc);
+	if (slots) {
+		*slots = parse_map_slots(chk);
+		// the game also takes <map>.obc beside the file (android_main.cpp)
+		if (slots->size() >= 2 && (*slots)[slots->size() - 1] == '0') {
+			if (FILE* of = fopen((a_string(mapfile) + ".obc").c_str(), "rb")) {
+				uint8_t h[8];
+				size_t n = fread(h, 1, 8, of);
+				fclose(of);
+				if (int api = oes_blob_api(h, n)) *slots = slots->substr(0, slots->size() - 2) + oes_state_field(api);
+			}
+		}
+	}
 	return true;
 }
 
@@ -310,7 +384,7 @@ inline bool get_map_info(const char* mapfile, a_string& name, a_string& desc, a_
 // both a direct scenario.chk and a nested .scm/.scx (extracted via scratchpath).
 inline bool get_map_info_internal(const char* gamedir, const char* mappath,
                                   const char* scratchpath, a_string& name, a_string& desc,
-                                  a_string& err) {
+                                  a_string& err, a_string* slots = nullptr) {
 	auto loader = data_loading::data_files_directory(a_string(gamedir) + "/");
 	attach_cd_archives(loader, gamedir);
 	a_vector<uint8_t> bytes;
@@ -331,6 +405,7 @@ inline bool get_map_info_internal(const char* gamedir, const char* mappath,
 		chk = std::move(bytes);
 	}
 	parse_map_info(chk, name, desc);
+	if (slots) *slots = parse_map_slots(chk);
 	return true;
 }
 

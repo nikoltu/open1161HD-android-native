@@ -349,7 +349,7 @@ struct action_functions: state_functions {
 		if (!u) return false;
 		if (u->owner != owner) return false;
 		if (!unit_can_build(u, unit_type)) return false;
-		if (unit_type->id > UnitTypes::Spell_Disruption_Web) return false;
+		if (unit_type->id > UnitTypes::Spell_Disruption_Web && !is_ext_unit_type(unit_type->id)) return false;
 		if (!build_queue_push(u, unit_type)) return false;
 		set_secondary_order(u, get_order_type(Orders::Train));
 		return true;
@@ -810,7 +810,7 @@ struct action_functions: state_functions {
 		for (unit_t* u : selected_units(owner)) {
 			if (u->owner != owner) continue;
 			const tech_type_t* tech = nullptr;
-			if (unit_is_ghost(u)) tech = get_tech_type(TechTypes::Personnel_Cloaking);
+			if (unit_is_ghost(u) || unit_is(u, UnitTypes::Hero_Infested_Kerrigan)) tech = get_tech_type(TechTypes::Personnel_Cloaking);
 			else if (unit_is_wraith(u)) tech = get_tech_type(TechTypes::Cloaking_Field);
 			if (!tech) continue;
 			if (!unit_can_use_tech(u, tech)) continue;
@@ -827,7 +827,7 @@ struct action_functions: state_functions {
 		for (unit_t* u : selected_units(owner)) {
 			if (u->owner != owner) continue;
 			const tech_type_t* tech = nullptr;
-			if (unit_is_ghost(u)) tech = get_tech_type(TechTypes::Personnel_Cloaking);
+			if (unit_is_ghost(u) || unit_is(u, UnitTypes::Hero_Infested_Kerrigan)) tech = get_tech_type(TechTypes::Personnel_Cloaking);
 			else if (unit_is_wraith(u)) tech = get_tech_type(TechTypes::Cloaking_Field);
 			if (!tech) continue;
 			if (!unit_can_use_tech(u, tech)) continue;
@@ -1595,6 +1595,7 @@ struct action_functions: state_functions {
 		if (type == 0) {
 			int subtype = r.template get<uint8_t>();
 			unit_t* target = get_unit(unit_id(r.template get<uint16_t>()));
+			if (!target) return false;
 			if (subtype == 0) {
 				int value = r.template get<int32_t>();
 				set_unit_hp(target, fp8::integer(value));
@@ -1608,6 +1609,7 @@ struct action_functions: state_functions {
 		} else if (type == 1) {
 			int subtype = r.template get<uint8_t>();
 			int player = r.template get<uint8_t>();
+			if (player >= 12) return false;
 			if (subtype == 0) {
 				const upgrade_type_t* upgrade = get_upgrade_type((UpgradeTypes)r.template get<uint8_t>());
 				int level = r.template get<int8_t>();
@@ -1626,6 +1628,31 @@ struct action_functions: state_functions {
 			} else error("unknown ext cheat player subtype %d", subtype);
 		} else error("unknown ext cheat type %d", type);
 		return true;
+	}
+
+	// GE5: Extended abilities. [0][ability][target u16][x i16][y i16]: the first selected unit
+	// that can cast it does; [1][ability]: the first selected hero that can learn a rank does.
+	template<typename reader_T>
+	bool read_action_ext_ability(int owner, reader_T&& r) {
+		int type = r.template get<uint8_t>();
+		int ability = r.template get<uint8_t>();
+		if (type == 0) {
+			unit_t* target = get_unit(unit_id(r.template get<uint16_t>()));
+			int x = r.template get<int16_t>();
+			int y = r.template get<int16_t>();
+			for (unit_t* u : selected_units(owner)) {
+				if (u->owner != owner) continue;
+				int i = ext_ability_index(u, ability);
+				if (i >= 0 && ext_ability_castable(u, i) == ext_cast_ok) return ext_ability_cast(u, i, target, xy(x, y));
+			}
+		} else if (type == 1) {
+			for (unit_t* u : selected_units(owner)) {
+				if (u->owner != owner) continue;
+				int i = ext_ability_index(u, ability);
+				if (i >= 0 && ext_ability_learn(u, i)) return true;
+			}
+		}
+		return false;
 	}
 
 	virtual void on_action(int owner, int action) {
@@ -1757,6 +1784,8 @@ struct action_functions: state_functions {
 			return read_action_deselect_121(owner, r);
 		case 210:
 			return read_action_ext_cheat(owner, r);
+		case 211:
+			return read_action_ext_ability(owner, r);
 		default:
 			error("execute_action: unknown action %d", action_id);
 		}

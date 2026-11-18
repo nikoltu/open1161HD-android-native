@@ -10,10 +10,16 @@
 #include "font_unispace.h"
 #include "loading_screen.h" // standalone loading-screen renderer (host-verified via tools/loadscreen_check.cpp)
 #include "anim.h"
+#include "hd_rel.h"
 #include "ddsgrp.h"
+#include "parallax.h"
+#include "scr_font.h"
+#include "provenance.h"
 #include "webm.h"
 #include "vp9_inter_pixels.h"
 #include "diag.h"   // in-engine bug-catcher (DIAG); read-only, runtime-gated
+#include "kbm_defaults.h"
+#include "classic_objectives.h" // G12: Campaign Studio objective state (read-only)
 
 #include <thread>
 #include <mutex>
@@ -1491,7 +1497,7 @@ struct ui_functions: ui_util_functions {
 			bool want_talk = false;
 			// A trigger Transmission/Talking Portrait overrides the selection
 			// portrait until its duration elapses.
-			if (trigger_portrait_id >= 0 && (int)st.current_frame < trigger_portrait_until) {
+			if (trigger_portrait_id >= 0 && st.trigger_ticks < trigger_portrait_until) {
 				want = trigger_portrait_id;
 				want_talk = true;
 			} else {
@@ -1830,6 +1836,53 @@ struct ui_functions: ui_util_functions {
 		a_string t = trigger_sanitize(a_string(text));
 		trigger_texts.push_back({t, now, trigger_text_lifetime(t)});
 		while (trigger_texts.size() > 8) trigger_texts.erase(trigger_texts.begin());
+	}
+
+	// G3: an OEScript that failed to load or faulted at run time says so in the game,
+	// once per new fault; reads st.oes / game_st.oescript only.
+	int oes_faults_shown = 0;
+	int oes_fault_shown_frame = -1;
+	a_string oes_fault_shown_text;
+	bool oes_load_error_shown = false;
+	std::chrono::high_resolution_clock::time_point oes_first_tick{};
+	a_string script_status() const {
+		if (!game_st.oescript.loaded) {
+			if (game_st.oescript.error.empty()) return a_string();
+			return a_string(L("Script error: ")) + game_st.oescript.error + L(" (the script does not run)");
+		}
+		if (st.oes.faults <= 0) return a_string();
+		a_string r = a_string(L("Script error: ")) + st.oes.last_fault;
+		if (st.oes.faults > 1) r += format(L(" (%d errors)"), (int)st.oes.faults);
+		return r;
+	}
+	void script_error_tick() {
+		bool show = false;
+		if (!game_st.oescript.loaded) {
+			// wait 1.5 s of real play: the frames the game catches up after the loading
+			// screen would expire the line before anyone sees it
+			if (!oes_load_error_shown && !game_st.oescript.error.empty()) {
+				auto now = std::chrono::high_resolution_clock::now();
+				if (oes_first_tick == decltype(oes_first_tick)()) oes_first_tick = now;
+				if (now - oes_first_tick >= std::chrono::milliseconds(1500)) oes_load_error_shown = show = true;
+			}
+		} else if (st.oes.faults > oes_faults_shown) {
+			// a handler that faults every frame must not flood the screen: a new message
+			// shows at once, the same one again at most every ~30 s
+			int now = (int)st.current_frame;
+			oes_faults_shown = st.oes.faults;
+			if (st.oes.last_fault != oes_fault_shown_text || oes_fault_shown_frame < 0 || now - oes_fault_shown_frame >= 24 * 30) {
+				oes_fault_shown_text = st.oes.last_fault;
+				oes_fault_shown_frame = now;
+				show = true;
+			}
+		}
+		if (!show) return;
+		auto lines = split_and_wrap(script_status());
+		if (lines.empty()) return;
+		int now = (int)st.current_frame;
+		int life = std::max(trigger_text_lifetime(script_status()), 24 * 10);
+		for (auto& line : lines) trigger_texts.push_back({line, now, life});
+		while (trigger_texts.size() > 10) trigger_texts.erase(trigger_texts.begin());
 	}
 
 	// v0.28 action-error feedback: OpenBW leaves the "not enough ..." errors as a
@@ -2923,7 +2976,7 @@ struct ui_functions: ui_util_functions {
 		if (p < 0 || (size_t)p >= portrait_record_count()) return;
 		if (duration_ms <= 0) duration_ms = 3000;
 		trigger_portrait_id = p;
-		trigger_portrait_until = (int)st.current_frame + duration_ms / 42;
+		trigger_portrait_until = st.trigger_ticks + duration_ms / 42;
 		set_portrait(p, true);
 	}
 
@@ -3571,9 +3624,26 @@ struct ui_functions: ui_util_functions {
 	std::unordered_set<int> hd_pf_inflight;      // queued or decoding (render-thread-only; dedupe)
 	bool hd_pf_quit = false;
 	bool hd_pf_started = false;
+	// SC:R images.rel alias table + anim/main.lit authored lights. Loaded once on the
+	// main thread before the worker starts; read-only afterwards (worker reads hd_rel).
+	hdrel::rel_table hd_rel;
+	hdrel::lit_table hd_lit;
+	bool hd_meta_tried = false;
+	void hd_meta_load() {
+		if (hd_meta_tried) return;
+		hd_meta_tried = true;
+		if (!hd_casc || !load_hd_bytes) return;
+		std::vector<uint8_t> b;
+		if (load_hd_bytes("images.rel", b) && !b.empty()) hd_rel.parse(b.data(), b.size());
+		b.clear();
+		if (load_hd_bytes("anim/main.lit", b) && !b.empty()) hd_lit.parse(b.data(), b.size());
+		ui::log("hd meta: images.rel %s (%d), main.lit %s (%d)\n", hd_rel.ok ? "ok" : "absent", (int)hd_rel.size(),
+			hd_lit.ok ? "ok" : "absent", (int)hd_lit.images.size());
+	}
 
 	void hd_prefetch_start() {
 		if (hd_pf_started) return;
+		hd_meta_load();
 		hd_pf_started = true;
 		hd_pf_thread = std::thread([this] { hd_prefetch_loop(); });
 	}
@@ -3591,12 +3661,19 @@ struct ui_functions: ui_util_functions {
 			hd_pf_result_t r;
 			r.image_id = image_id;
 			int64_t t0 = std::chrono::duration_cast<std::chrono::microseconds>(prof_clock::now().time_since_epoch()).count();
-			// SC:R names HD anims anim/main_{image_id}.anim. Hero/alt ids (e.g.
-			// Terran Command Center image 275) have no own anim and resolve the
-			// canonical sibling sharing the same grp_filename_index (275 -> 63).
-			anim::sprite_t sp = load_hd_anim_num(image_id);
+			// SC:R names HD anims anim/main_{image_id}.anim; images.rel flag 0x200
+			// redirects alias ids (e.g. Command Center 275 -> 63) to the image whose
+			// anim draws them. Without the table (disk-mod anims) fall back to the
+			// canonical sibling sharing the same grp_filename_index.
 			int via_sibling = -1;
-			if (!sp.ok && grp_index >= 0) {
+			int anim_id = image_id;
+			if (hd_rel.ok) {
+				anim_id = hd_rel.resolve(image_id);
+				if (anim_id < 0) anim_id = image_id;
+				if (anim_id != image_id) via_sibling = anim_id;
+			}
+			anim::sprite_t sp = load_hd_anim_num(anim_id);
+			if (!sp.ok && !hd_rel.ok && grp_index >= 0) {
 				auto& iv = global_st.image_types.vec;
 				for (size_t sid = 0; sid < iv.size(); ++sid) {
 					if ((int)sid == image_id || (int)iv[sid].grp_filename_index != grp_index) continue;
@@ -3687,7 +3764,7 @@ struct ui_functions: ui_util_functions {
 		// (trim_hd_cache) instead of a full cache.clear() at the cap -- the full clear
 		// re-decoded the whole visible tile set on one frame (a visible hitch on large
 		// maps). Each entry carries its byte size + last-use tick/frame like the others.
-		struct tile_c { std::vector<uint32_t> rgba; size_t bytes = 0; uint64_t used = 0; int frame = -1; };
+		struct tile_c { std::vector<uint32_t> rgba; size_t bytes = 0; uint64_t used = 0; int frame = -1; bool alpha = false; };
 		std::unordered_map<size_t, tile_c> cache;   // A4: O(1) (per visible tile/frame)
 	};
 	hd_tiles_t hd_tiles;
@@ -3738,10 +3815,14 @@ struct ui_functions: ui_util_functions {
 	int camera_speed = 100;        // edge/key-scroll speed as a % of the classic curve
 	// Shadow pixel darken. keep = fraction of the underlying brightness retained,
 	// in /256 units: 128 (=50%) at softness 0, up to ~224 (=87%) at softness 100.
+	uint32_t shadow_keep() const {
+		if (hd_shadow_soft <= 0) return 128;
+		int s = hd_shadow_soft > 100 ? 100 : hd_shadow_soft;
+		return 128u + (uint32_t)(96 * s / 100); // 128..224
+	}
 	uint32_t shadow_darken(uint32_t old) const {
 		if (hd_shadow_soft <= 0) return 0xff000000u | ((old >> 1) & 0x7f7f7f);
-		int s = hd_shadow_soft > 100 ? 100 : hd_shadow_soft;
-		uint32_t keep = 128u + (uint32_t)(96 * s / 100); // 128..224
+		uint32_t keep = shadow_keep();
 		uint32_t r = (((old >> 16) & 0xff) * keep) >> 8;
 		uint32_t g = (((old >> 8) & 0xff) * keep) >> 8;
 		uint32_t b = ((old & 0xff) * keep) >> 8;
@@ -3977,6 +4058,8 @@ struct ui_functions: ui_util_functions {
 		// budget via the shared LRU (drops the LEAST-recently-used entries not touched
 		// this frame) -- no more full cache.clear() decode-storm at the cap.
 		auto& slot = hd_tiles.cache[megatile];
+		slot.alpha = false;
+		for (uint32_t c : small.rgba) if ((c >> 24) < 248) { slot.alpha = true; break; }
 		slot.bytes = small.rgba.size() * sizeof(uint32_t);
 		slot.rgba = std::move(small.rgba);
 		slot.used = ++hd_cache_tick;
@@ -3986,11 +4069,75 @@ struct ui_functions: ui_util_functions {
 		return &hd_tiles.cache[megatile].rgba; // just-inserted (frame==now) is protected from trim
 	}
 
+	// SC:R creep edges: tileset/<name>.dds.grp, the same 37 frames as the SD
+	// tileset grp at 4x (FULL) / 2x (hd2) size. Scaled once to the SD frame size
+	// x world_scale and kept; SD offsets place them.
+	ddsgrp::file_t hd_creep;
+	bool hd_creep_tried = false;
+	std::vector<ddsgrp::frame_t> hd_creep_frames;
+	const ddsgrp::frame_t* get_hd_creep_frame(size_t fi, int w, int h) {
+		if (!hd_creep_tried) {
+			hd_creep_tried = true;
+			static const char* names[8] = {"badlands", "platform", "install", "ashworld", "jungle", "desert", "ice", "twilight"};
+			size_t ti = (size_t)game_st.tileset_index;
+			if (ti < 8) {
+				if (!hd_tileset_dir.empty()) {
+					hd_creep = ddsgrp::load_file((hd_tileset_dir + "/" + names[ti] + ".dds.grp").c_str());
+				} else if (load_hd_bytes) {
+					std::vector<uint8_t> tmp;
+					if (load_hd_bytes(hd_casc_prefix + "tileset/" + names[ti] + ".dds.grp", tmp) && !tmp.empty())
+						hd_creep = ddsgrp::parse(tmp.data(), tmp.size());
+				}
+			}
+			ui::log("hd creep edges: %d frames (ok=%d)\n", (int)hd_creep.frame_count(), (int)hd_creep.ok);
+			if (hd_creep.ok && hd_creep.frame_count() != tileset_img.creep_grp.frames.size()) hd_creep = ddsgrp::file_t();
+			hd_creep_frames.resize(hd_creep.ok ? hd_creep.frame_count() : 0);
+		}
+		if (fi >= hd_creep_frames.size() || w <= 0 || h <= 0) return nullptr;
+		auto& f = hd_creep_frames[fi];
+		if (f.w != w || f.h != h) {
+			ddsgrp::frame_t src = hd_creep.decode(fi);
+			if (src.rgba.size() < (size_t)src.w * (size_t)src.h || src.w <= 0) return nullptr;
+			f = ddsgrp::scale_box(src, w, h);
+			if (f.rgba.size() < (size_t)w * (size_t)h) { f = ddsgrp::frame_t(); return nullptr; }
+		}
+		return &f;
+	}
+
 	// HD terrain overdraw on the RGBA surface (before sprites/fog). Mirrors
 	// draw_tiles incl. the creep megatile substitution and creep edges.
+	parallax::sd_t parallax_sd;
+	parallax::hd_t parallax_hd;
+	bool parallax_sd_tried = false, parallax_hd_tried = false;
+	bool space_map() const { return game_st.tileset_index == 1; }
+
+	void draw_parallax_sd(uint8_t* data, size_t pitch) {
+		if (!parallax_sd_tried) {
+			parallax_sd_tried = true;
+			a_vector<uint8_t> raw;
+			try { load_data_file(raw, "parallax\\star.spk"); } catch (const std::exception&) { raw.clear(); }
+			if (!raw.empty()) parallax_sd = parallax::parse_sd(raw.data(), raw.size());
+			ui::log("parallax sd: %d layers\n", (int)parallax_sd.layers.size());
+		}
+		parallax::draw_sd(parallax_sd, data, pitch, (int)screen_width, (int)screen_height, screen_pos.x, screen_pos.y);
+	}
+
+	void draw_parallax_hd(uint32_t* data, size_t pitch, int ws) {
+		if (!parallax_hd_tried) {
+			parallax_hd_tried = true;
+			std::vector<uint8_t> spk, grp;
+			if (load_hd_bytes && load_hd_bytes(hd_casc_prefix + "parallax/star.spk", spk) && load_hd_bytes(hd_casc_prefix + "parallax/star.dds.grp", grp))
+				parallax_hd = parallax::parse_hd(spk.data(), spk.size(), grp.data(), grp.size());
+			ui::log("parallax hd: %d layers\n", (int)parallax_hd.layers.size());
+		}
+		parallax::draw_hd(parallax_hd, data, pitch, (int)screen_width, (int)screen_height, screen_pos.x, screen_pos.y, ws);
+	}
+
 	void draw_tiles_hd(uint32_t* data, size_t data_pitch) {
 		load_hd_tiles();
 		if (!hd_tiles.ok) return;
+		const bool space = space_map();
+		if (space) draw_parallax_hd(data, data_pitch, world_scale < 1 ? 1 : world_scale);
 		auto screen_tile = screen_tile_bounds();
 		size_t tile_index = screen_tile.from.y * game_st.map_tile_width + screen_tile.from.x;
 		auto* megatile_index = &st.tiles_mega_tile_index[tile_index];
@@ -4015,7 +4162,21 @@ struct ui_functions: ui_util_functions {
 					// Faze 7: defensive width guard. w>x0 holds today (floor view_width
 					// keeps every visible tile on-screen), but a future ceil/+1 change
 					// would make (w-x0) negative -> a (size_t) multi-GB memcpy / heap smash.
-					if (w > x0) for (int y = y0; y < h; ++y) {
+					auto ci = space ? hd_tiles.cache.find(index) : hd_tiles.cache.end();
+					if (ci != hd_tiles.cache.end() && ci->second.alpha) {
+						for (int y = y0; y < h; ++y) {
+							uint32_t* drow = data + (size_t)(screen_y + y) * data_pitch + screen_x;
+							const uint32_t* srow = t->data() + (size_t)y * ts;
+							for (int x = x0; x < w; ++x) {
+								uint32_t c = srow[x], a = c >> 24;
+								if (a >= 248) { drow[x] = 0xff000000u | c; continue; }
+								if (a < 8) continue;
+								uint32_t old = drow[x], ia = 255 - a;
+								drow[x] = 0xff000000u | (div255(((c >> 16) & 0xff) * a + ((old >> 16) & 0xff) * ia) << 16)
+									| (div255(((c >> 8) & 0xff) * a + ((old >> 8) & 0xff) * ia) << 8) | div255((c & 0xff) * a + (old & 0xff) * ia);
+							}
+						}
+					} else if (w > x0) for (int y = y0; y < h; ++y) {
 						memcpy(data + (size_t)(screen_y + y) * data_pitch + screen_x + x0,
 						    t->data() + (size_t)y * ts + x0, (size_t)(w - x0) * 4);
 					}
@@ -4029,7 +4190,7 @@ struct ui_functions: ui_util_functions {
 					for (int y = y0; y < h; ++y) {
 						uint32_t* drow = data + (size_t)(screen_y + y) * data_pitch + screen_x;
 						const uint8_t* srow = scratch + (size_t)(y / ws) * 32;
-						for (int x = x0; x < w; ++x) drow[x] = pal_rgba(srow[x / ws]);
+						for (int x = x0; x < w; ++x) if (!space || srow[x / ws]) drow[x] = pal_rgba(srow[x / ws]);
 					}
 				}
 				if (~tile->flags & tile_t::flag_has_creep) {
@@ -4044,7 +4205,21 @@ struct ui_functions: ui_util_functions {
 					size_t creep_frame = img.creep_edge_frame_index[creep_index];
 					if (creep_frame) {
 						auto& frame = tileset_img.creep_grp.frames.at(creep_frame - 1);
-						if (ws > 1) {
+						if (const ddsgrp::frame_t* hf = get_hd_creep_frame(creep_frame - 1, (int)frame.size.x * ws, (int)frame.size.y * ws)) {
+							int cx = screen_x + frame.offset.x * ws, cy = screen_y + frame.offset.y * ws;
+							for (int y = cy < 0 ? -cy : 0; y < hf->h && cy + y < (int)screen_height; ++y) {
+								uint32_t* drow = data + (size_t)(cy + y) * data_pitch + cx;
+								const uint32_t* srow = &hf->rgba[(size_t)y * hf->w];
+								for (int x = cx < 0 ? -cx : 0; x < hf->w && cx + x < (int)screen_width; ++x) {
+									uint32_t c = srow[x], a = c >> 24;
+									if (a < 8) continue;
+									if (a >= 248) { drow[x] = 0xff000000u | c; continue; }
+									uint32_t old = drow[x], ia = 255 - a;
+									drow[x] = 0xff000000u | (div255(((c >> 16) & 0xff) * a + ((old >> 16) & 0xff) * ia) << 16)
+										| (div255(((c >> 8) & 0xff) * a + ((old >> 8) & 0xff) * ia) << 8) | div255((c & 0xff) * a + (old & 0xff) * ia);
+								}
+							}
+						} else if (ws > 1) {
 							// Faze 4.3: scale the soft creep edge to the x ws world,
 							// or zerg terrain shows hard creep tile borders. Anchor
 							// is LOGICAL (blit_grp_frame_ws multiplies by ws).
@@ -4251,11 +4426,19 @@ struct ui_functions: ui_util_functions {
 	// Draw one HD atlas frame. The HD canvas is anchored at the image center
 	// (sprite position + image offset); frame offsets are relative to the
 	// canvas top-left, so top-left = center - canvas/2 + frame offset.
-	void draw_image_hd(const image_t* image, anim::sprite_t& ha, uint32_t* data, size_t data_pitch, size_t color_index) {
-		auto& f = ha.frames[image->frame_index];
-		bool flipped = i_flag(image, image_t::flag_horizontally_flipped);
-
+	// Screen placement of one HD anim frame (physical px) plus its on-screen clip.
+	struct hd_geom_t {
+		const anim::frame_t* f;
+		bool flipped;
+		int screen_x, screen_y, offset_x, offset_y, width, height;
+	};
+	bool hd_frame_geom(const image_t* image, const anim::sprite_t& ha, hd_geom_t& g) {
 		xy center = image->sprite->position + image->offset + interp_off_for(image->sprite);
+		int frozen_y = i_flag(image, image_t::flag_y_frozen) ? image->frozen_y_value : INT_MIN;
+		return hd_frame_geom_at(center, ha, image->frame_index, i_flag(image, image_t::flag_horizontally_flipped), frozen_y, g);
+	}
+	bool hd_frame_geom_at(xy center, const anim::sprite_t& ha, size_t frame_index, bool flipped, int frozen_y, hd_geom_t& g) {
+		auto& f = ha.frames[frame_index];
 		// Anchor math in HD units, one floor-division at the end - per-field
 		// truncation made animated buildings jitter between frames.
 		int u = ha.hd_per_logical;
@@ -4266,18 +4449,64 @@ struct ui_functions: ui_util_functions {
 		int ws = world_scale < 1 ? 1 : world_scale;
 		int screen_x = (center.x + fdiv(x_off_hd) - screen_pos.x) * ws;
 		int screen_y = (center.y + fdiv(f.y_off_hd - ha.canvas_h_hd / 2) - screen_pos.y) * ws;
-		if (i_flag(image, image_t::flag_y_frozen)) screen_y = (image->frozen_y_value - screen_pos.y) * ws;
+		if (frozen_y != INT_MIN) screen_y = (frozen_y - screen_pos.y) * ws;
 		// f.w/f.h index the world_scale x logical atlas (the anim was parsed at
 		// world_scale), so the frame draws 1:1 at real detail - only the anchor
 		// position is x ws above.
 
-		if (screen_x >= (int)screen_width || screen_y >= (int)screen_height) return;
-		if (screen_x + f.w <= 0 || screen_y + f.h <= 0) return;
+		if (screen_x >= (int)screen_width || screen_y >= (int)screen_height) return false;
+		if (screen_x + f.w <= 0 || screen_y + f.h <= 0) return false;
 
-		int offset_x = screen_x < 0 ? -screen_x : 0;
-		int offset_y = screen_y < 0 ? -screen_y : 0;
-		int width = std::min(f.w, (int)screen_width - screen_x);
-		int height = std::min(f.h, (int)screen_height - screen_y);
+		g.f = &f;
+		g.flipped = flipped;
+		g.screen_x = screen_x;
+		g.screen_y = screen_y;
+		g.offset_x = screen_x < 0 ? -screen_x : 0;
+		g.offset_y = screen_y < 0 ? -screen_y : 0;
+		g.width = std::min(f.w, (int)screen_width - screen_x);
+		g.height = std::min(f.h, (int)screen_height - screen_y);
+		return true;
+	}
+
+	// SC:R anim/main.lit authored light for this image/frame (replaces the emissive
+	// guess when the table is loaded). Key x/y are frame units from the crop's top-left;
+	// radius is taken as world px and intensity ~64 as the nominal level (calibration
+	// inferred, not authoritative). Only lights on a tile the viewer currently sees.
+	void emit_authored_light(const image_t* image, const anim::sprite_t& ha, const hd_geom_t& g) {
+		if (!hd_point_lights || !hd_lit.ok || frame_lights.size() >= 64) return;
+		int id = (int)image->image_type->id;
+		if (!hd_lit.has(id) && hd_rel.ok) id = hd_rel.resolve(id);
+		const hdrel::light_key* k = hd_lit.get(id, image->frame_index);
+		if (!k) return;
+		int owner = fog_vision_owner();
+		if (owner >= 0) {
+			xy pos = image->sprite->position;
+			size_t tx = (size_t)pos.x / 32, ty = (size_t)pos.y / 32;
+			if (tx >= game_st.map_tile_width || ty >= game_st.map_tile_height) return;
+			if (st.tiles[ty * game_st.map_tile_width + tx].visible & (1u << owner)) return;
+		}
+		auto& f = *g.f;
+		int ws = world_scale < 1 ? 1 : world_scale;
+		int u = ha.hd_per_logical < 1 ? 1 : ha.hd_per_logical;
+		int kx = g.flipped ? f.w_hd - 1 - k->x : k->x;
+		light_source_t L;
+		L.x = g.screen_x + kx * ws / u;
+		L.y = g.screen_y + k->y * ws / u;
+		L.rgb = k->rgb888();
+		L.radius = (int)k->radius * ws * hd_light_strength / 100;
+		if (L.radius > 128) L.radius = 128;   // same perf cap as the emissive path
+		L.intensity = (int)k->intensity * 160 / 64 * hd_light_strength / 100;
+		if (L.intensity > 255) L.intensity = 255;
+		if (L.radius >= 4 && L.intensity > 0) frame_lights.push_back(L);
+	}
+
+	void draw_image_hd(const image_t* image, anim::sprite_t& ha, uint32_t* data, size_t data_pitch, size_t color_index) {
+		hd_geom_t g;
+		if (!hd_frame_geom(image, ha, g)) return;
+		auto& f = *g.f;
+		const bool flipped = g.flipped;
+		const int screen_x = g.screen_x, screen_y = g.screen_y;
+		const int offset_x = g.offset_x, offset_y = g.offset_y, width = g.width, height = g.height;
 
 		uint8_t* color_ptr = img.player_unit_colors.at(color_index).data();
 		uint32_t pc = game_palette[color_ptr[0]];
@@ -4286,7 +4515,8 @@ struct ui_functions: ui_util_functions {
 		bool has_em = hd_emissive && !ha.emissive.empty(); // Faze 7 self-glow
 		// SHADOWS Phase 2: aggregate this sprite's emissive energy into a point light
 		// (only when point lighting is on -- otherwise these accumulators cost nothing).
-		bool acc_light = hd_point_lights && has_em;
+		bool acc_light = hd_point_lights && has_em && !hd_lit.ok;
+		emit_authored_light(image, ha, g);
 		uint64_t li_sum = 0, li_cx = 0, li_cy = 0, li_r = 0, li_g = 0, li_b = 0;
 
 		uint32_t* dst = data + (size_t)screen_y * data_pitch + screen_x;
@@ -4367,16 +4597,206 @@ struct ui_functions: ui_util_functions {
 		}
 	}
 
+	// HD drawing of the effect modifiers the classic path remaps through palette tables.
+	enum hd_fx_t { hd_fx_alpha, hd_fx_add, hd_fx_cloud, hd_fx_warp, hd_fx_flash, hd_fx_shadow };
+
+	// Draw function 8 (EMP shockwave) in SC:R never reaches the screen: the anim goes to the
+	// effect buffer and the composite reads the scene shifted right by effect.r * 8 scene px,
+	// plus (effect.b + 1/16) * 8 where the effect continues at that spot. One SC:R scene px is
+	// half a pixel of ours in both HD tiers (HD2 2x / ws 1, FULL 4x / ws 2).
+	void draw_image_hd_distort(const image_t* image, anim::sprite_t& ha, uint32_t* data, size_t data_pitch) {
+		hd_geom_t g;
+		if (!hd_frame_geom(image, ha, g)) return;
+		auto& f = *g.f;
+		auto effect_at = [&](int x, int y) -> uint32_t {
+			if (x < 0 || x >= f.w || y < 0 || y >= f.h) return 0;
+			return ha.diffuse[(size_t)(f.y + y) * ha.atlas_w + f.x + (g.flipped ? f.w - 1 - x : x)];
+		};
+		uint32_t* dst = data + (size_t)g.screen_y * data_pitch + g.screen_x;
+		const int right = (int)screen_width - g.screen_x;
+		for (int y = g.offset_y; y < g.height; ++y) {
+			uint32_t* drow = dst + (size_t)y * data_pitch;
+			for (int x = g.offset_x; x < g.width; ++x) {
+				const uint32_t c = effect_at(x, y), a = c >> 24;
+				if (a < 8) continue;
+				const float er = (float)((c >> 16) & 0xff) * a / 65025.0f, eb = (float)(c & 0xff) * a / 65025.0f;
+				float shift = er * 8.0f;
+				if (eb > 0) {
+					const float step = (eb + 0.0625f) * 8.0f;
+					const uint32_t n = effect_at(x + (int)(step / 2.0f + 0.5f), y);
+					if ((n >> 24) >= 8 && (n & 0xff)) shift += step;
+				}
+				const int d = (int)(shift / 2.0f + 0.5f);
+				if (d > 0 && x + d < right) drow[x] = drow[x + d];   // left to right: x + d is still the scene
+			}
+		}
+	}
+
+	// Modifier 17 (warp flash) remaps the scene through ofire row data1-1 (data1 48..63).
+	// White strength per row = mean brightening of that row toward white over the palette,
+	// measured from the loaded tileset's table rather than assumed.
+	std::array<uint8_t, 256> warp_flash_level{};
+	const void* warp_flash_src = nullptr;
+	int warp_flash_strength(int data1) {
+		auto& tdata = tileset_img.light_pcx.at(0).data;
+		size_t rows = tdata.size() / 256;
+		if (warp_flash_src != tdata.data()) {
+			warp_flash_src = tdata.data();
+			warp_flash_level.fill(0);
+			for (size_t r = 0; r < rows && r < 256; ++r) {
+				uint64_t num = 0, den = 0;
+				for (int i = 1; i != 256; ++i) {
+					uint32_t a = game_palette[i], b = game_palette[tdata[256 * r + i]];
+					uint32_t la = (((a >> 16) & 0xff) * 77 + ((a >> 8) & 0xff) * 150 + (a & 0xff) * 29) >> 8;
+					uint32_t lb = (((b >> 16) & 0xff) * 77 + ((b >> 8) & 0xff) * 150 + (b & 0xff) * 29) >> 8;
+					if (la >= 224) continue;
+					num += lb > la ? (lb - la) * 255 / (255 - la) : 0;
+					++den;
+				}
+				warp_flash_level[r] = (uint8_t)(den ? num / den : 0);
+			}
+			if (hd_anim_diag) {
+				char buf[160]; int n = 0;
+				for (int r = 47; r < 63 && r < (int)rows; ++r) n += std::snprintf(buf + n, sizeof(buf) - n, " %d", (int)warp_flash_level[r]);
+				ui::log("hd warp flash levels (rows 47..62):%s\n", buf);
+			}
+		}
+		int r = data1 - 1;
+		if (r < 0 || (size_t)r >= rows || r >= 256) return 0;
+		return warp_flash_level[r];
+	}
+
+	// alpha: body at `op` opacity (cloak), team colour + emissive kept. add: additive
+	// glow (remap images). cloud: plain alpha blend, unlit (Dark Swarm, Disruption Web).
+	// warp: Warp_Texture frame `tex_frame` clipped by the silhouette. flash: white over
+	// the silhouette at strength `op`.
+	void draw_image_hd_fx(const image_t* image, anim::sprite_t& ha, uint32_t* data, size_t data_pitch, size_t color_index,
+	                      hd_fx_t kind, int op, const anim::sprite_t* tex = nullptr, int tex_frame = 0) {
+		hd_geom_t g;
+		if (!hd_frame_geom(image, ha, g)) return;
+		auto& f = *g.f;
+		uint8_t* color_ptr = img.player_unit_colors.at(color_index).data();
+		uint32_t pc = game_palette[color_ptr[0]];
+		uint32_t pr = (pc >> 16) & 0xff, pg = (pc >> 8) & 0xff, pb = pc & 0xff;
+		bool has_tc = kind == hd_fx_alpha && !ha.teamcolor.empty();
+		bool has_em = kind == hd_fx_alpha && hd_emissive && !ha.emissive.empty();
+		const anim::frame_t* tf = nullptr;
+		if (kind == hd_fx_warp) {
+			if (!tex || tex_frame < 0 || (size_t)tex_frame >= tex->frames.size()) return;
+			tf = &tex->frames[tex_frame];
+			if (tf->w <= 0 || tf->h <= 0) return;
+		}
+		if (op < 0) op = 0;
+		if (op > 255) op = 255;
+		uint32_t* dst = data + (size_t)g.screen_y * data_pitch + g.screen_x;
+		for (int y = g.offset_y; y < g.height; ++y) {
+			const size_t arow = (size_t)(f.y + y) * ha.atlas_w;
+			uint32_t* drow = dst + (size_t)y * data_pitch;
+			for (int x = g.offset_x; x < g.width; ++x) {
+				size_t ai = arow + f.x + (g.flipped ? f.w - 1 - x : x);
+				uint32_t c = ha.diffuse[ai];
+				uint32_t a = c >> 24;
+				if (a < 8) continue;
+				uint32_t r = (c >> 16) & 0xff, gg = (c >> 8) & 0xff, b = c & 0xff;
+				uint32_t old = drow[x];
+				uint32_t orr = (old >> 16) & 0xff, og = (old >> 8) & 0xff, ob = old & 0xff;
+				switch (kind) {
+				case hd_fx_add:
+					orr += div255(r * a); og += div255(gg * a); ob += div255(b * a);
+					break;
+				case hd_fx_shadow: {
+					// the authored soft silhouette darkens like shadow_darken: `op` = brightness kept at full cover (/256)
+					uint32_t keep = 256 - div255(a * (256 - (uint32_t)op));
+					orr = (orr * keep) >> 8; og = (og * keep) >> 8; ob = (ob * keep) >> 8;
+					break;
+				}
+				case hd_fx_flash: {
+					uint32_t w = div255(a * (uint32_t)op), iw = 255 - w;
+					orr = div255(orr * iw + 255 * w); og = div255(og * iw + 255 * w); ob = div255(ob * iw + 255 * w);
+					break;
+				}
+				case hd_fx_warp: {
+					// texture anchored at the frame's top-left, like the classic path
+					const uint32_t t = tex->diffuse[(size_t)(tf->y + y % tf->h) * tex->atlas_w + tf->x + x % tf->w];
+					uint32_t ta = div255(a * (t >> 24)), it = 255 - ta;
+					orr = div255(((t >> 16) & 0xff) * ta + orr * it);
+					og = div255(((t >> 8) & 0xff) * ta + og * it);
+					ob = div255((t & 0xff) * ta + ob * it);
+					break;
+				}
+				default: { // alpha / cloud
+					if (has_tc) {
+						uint32_t m = ha.teamcolor[ai];
+						if (m) {
+							uint32_t l = (r * 77 + gg * 150 + b * 29) >> 8;
+							uint32_t tr = pr * l / 128; if (tr > 255) tr = 255;
+							uint32_t tg = pg * l / 128; if (tg > 255) tg = 255;
+							uint32_t tb = pb * l / 128; if (tb > 255) tb = 255;
+							uint32_t im = 255 - m;
+							r = div255(r * im + tr * m); gg = div255(gg * im + tg * m); b = div255(b * im + tb * m);
+						}
+					}
+					if (has_em) {
+						uint32_t ec = ha.emissive[ai], ea = ec >> 24;
+						if (ea) {
+							r += div255(((ec >> 16) & 0xff) * ea); if (r > 255) r = 255;
+							gg += div255(((ec >> 8) & 0xff) * ea); if (gg > 255) gg = 255;
+							b += div255((ec & 0xff) * ea); if (b > 255) b = 255;
+						}
+					}
+					uint32_t ba = kind == hd_fx_alpha ? div255(a * (uint32_t)op) : a, ia = 255 - ba;
+					orr = div255(r * ba + orr * ia); og = div255(gg * ba + og * ia); ob = div255(b * ba + ob * ia);
+				}
+				}
+				if (orr > 255) orr = 255;
+				if (og > 255) og = 255;
+				if (ob > 255) ob = 255;
+				drow[x] = 0xff000000u | (orr << 16) | (og << 8) | ob;
+			}
+		}
+		if (kind == hd_fx_add || kind == hd_fx_flash) emit_authored_light(image, ha, g);
+	}
+
 	void draw_image_rgba(const image_t* image, uint32_t* data, size_t data_pitch, size_t color_index) {
 		// 14 = player colour override (the capture-the-flag flag): drawn like 0 / 1 in the
 		// colours of player modifier_data1, as the indexed pass (draw_image) does
 		if (image->modifier == 14 && image->modifier_data1 >= 0 && image->modifier_data1 < 12) color_index = st.players[image->modifier_data1].color;
-		// HD path: normal/player-color images with a matching HD sprite.
-		if ((!hd_anim_dir.empty() || hd_casc) && (image->modifier == 0 || image->modifier == 1 || image->modifier == 14)) {
-			auto* ha = get_hd_anim((int)image->image_type->id, (int)image->image_type->grp_filename_index);
+		// HD path: images with a matching HD sprite. Modifiers without an HD rule
+		// below keep the classic (SD) drawing.
+		if (!hd_anim_dir.empty() || hd_casc) {
+			const int m = image->modifier;
+			const bool hd_mod = m == 0 || m == 1 || m == 14 || (m >= 2 && m <= 9) || m == 12 || m == 17 || (m == 10 && !hd_shadow_dir);
+			auto* ha = hd_mod ? get_hd_anim((int)image->image_type->id, (int)image->image_type->grp_filename_index) : nullptr;
 			if (ha && image->frame_index < ha->frames.size()) {
-				draw_image_hd(image, *ha, data, data_pitch, color_index);
-				return;
+				if (m == 0 || m == 1 || m == 14) { draw_image_hd(image, *ha, data, data_pitch, color_index); return; }
+				if (m == 2 || m == 4 || m == 5 || m == 7) {
+					// cloaking / decloaking: modifier_data1 0..8 fades to the cloaked 50%
+					int d = image->modifier_data1 < 0 ? 0 : image->modifier_data1 > 8 ? 8 : image->modifier_data1;
+					draw_image_hd_fx(image, *ha, data, data_pitch, color_index, hd_fx_alpha, 255 - d * 127 / 8);
+					return;
+				}
+				if (m == 3 || m == 6) { draw_image_hd_fx(image, *ha, data, data_pitch, color_index, hd_fx_alpha, 128); return; }
+				if (m == 8) { draw_image_hd_distort(image, *ha, data, data_pitch); return; }
+				if (m == 10) { draw_image_hd_fx(image, *ha, data, data_pitch, color_index, hd_fx_shadow, (int)shadow_keep()); return; }
+				if (m == 9) {
+					// Dark Swarm / Disruption Web are authored clouds with their own alpha and
+					// dark detail: blending, not adding, keeps the smoke.
+					auto id = image->image_type->id;
+					bool cloud = id == ImageTypes::IMAGEID_Dark_Swarm || id == ImageTypes::IMAGEID_Disruption_Web;
+					draw_image_hd_fx(image, *ha, data, data_pitch, color_index, cloud ? hd_fx_cloud : hd_fx_add, 255);
+					return;
+				}
+				if (m == 12) {
+					auto* tex = get_hd_anim((int)ImageTypes::IMAGEID_Warp_Texture, -1);
+					if (tex && image->modifier_data1 >= 0 && (size_t)image->modifier_data1 < tex->frames.size()) {
+						draw_image_hd_fx(image, *ha, data, data_pitch, color_index, hd_fx_warp, 255, tex, image->modifier_data1);
+						return;
+					}
+				}
+				if (m == 17) {
+					draw_image_hd_fx(image, *ha, data, data_pitch, color_index, hd_fx_flash, warp_flash_strength(image->modifier_data1));
+					return;
+				}
 			}
 		}
 		int ws = world_scale < 1 ? 1 : world_scale;
@@ -4494,8 +4914,16 @@ struct ui_functions: ui_util_functions {
 				}
 				return;
 			}
-			// mod 8 (distortion) + anything else: draw opaque at x ws so it is at
-			// least correctly placed and sized (visual is approximate but rare).
+			if (m == 8) {
+				// EMP before its HD anim has loaded: the 1x shift (index = px right) at x ws, never colour.
+				blit_grp_frame_ws(frame, flipped, screen_x, screen_y, ws, data, data_pitch,
+					[&](uint8_t c, uint32_t& old) -> uint32_t {
+						const size_t off = (size_t)(&old - data), x = off % data_pitch, d = (size_t)c * ws;
+						return x + d < screen_width ? *(&old + d) : old;
+					});
+				return;
+			}
+			// anything else: draw opaque at x ws so it is at least correctly placed and sized.
 			blit_grp_frame_ws(frame, flipped, screen_x, screen_y, ws, data, data_pitch,
 				[&](uint8_t c, uint32_t&) { return pal_rgba(pcol(c)); });
 			return;
@@ -4552,8 +4980,8 @@ struct ui_functions: ui_util_functions {
 				return pal_rgba(t);
 			});
 		} else if (image->modifier == 17) {
-			// Fire/heat glow remaps destination palette indices in the 8-bit
-			// path; approximate with a warm additive boost.
+			// Warp flash: the 8-bit path remaps the scene under the silhouette
+			// through ofire row data1-1 (data1 48..63); approximated additively.
 			draw_frame_rgba(frame, flipped, dst, data_pitch, offset_x, offset_y, width, height, [&](uint8_t, uint32_t& old) {
 				return rgba_add_sat(old, 0x00583818);
 			});
@@ -4605,6 +5033,18 @@ struct ui_functions: ui_util_functions {
 		auto* image_type = get_image_type((ImageTypes)((int)ImageTypes::IMAGEID_Selection_Circle_22pixels + sprite->sprite_type->selection_circle));
 
 		xy map_pos = sprite->position + xy(0, sprite->sprite_type->selection_circle_vpos) + interp_off_for(sprite);
+		if (!hd_anim_dir.empty() || hd_casc) {
+			// SC:R art (anim/main_561..580): a grey ring, tinted with the colour the
+			// SD ring shows for this owner, so both tiers mark selections alike.
+			auto* ha = get_hd_anim((int)image_type->id, (int)image_type->grp_filename_index);
+			hd_geom_t g;
+			if (ha && !ha->frames.empty() && hd_frame_geom_at(map_pos, *ha, 0, false, INT_MIN, g)) {
+				uint8_t col = img.player_unit_colors.at(st.players[sprite->owner].color)[0];
+				if (unit_is_mineral_field(u) || unit_is(u, UnitTypes::Resource_Vespene_Geyser)) col = tileset_img.resource_minimap_color;
+				draw_hd_tinted(*ha, g, sd_ring_rgb((int)image_type->id, col), data, data_pitch);
+				return;
+			}
+		}
 
 		auto* grp = global_st.image_grp[(size_t)image_type->id];
 		auto& frame = grp->frames.at(0);
@@ -4649,6 +5089,53 @@ struct ui_functions: ui_util_functions {
 		draw_frame_rgba(frame, false, dst, data_pitch, offset_x, offset_y, width, height, [&](uint8_t c, uint32_t&) {
 			return pal_rgba(c < 8 ? color : c);
 		});
+	}
+
+	// The SD selection ring's dominant colour after the owner remap (index < 8 -> col).
+	std::unordered_map<int, uint32_t> sd_ring_colors;
+	uint32_t sd_ring_rgb(int image_id, uint8_t col) {
+		int key = image_id * 256 + col;
+		auto it = sd_ring_colors.find(key);
+		if (it != sd_ring_colors.end()) return it->second;
+		auto* grp = global_st.image_grp[(size_t)image_id];
+		auto& frame = grp->frames.at(0);
+		std::vector<uint8_t> buf((size_t)frame.size.x * frame.size.y, 0);
+		draw_frame(frame, false, buf.data(), frame.size.x, 0, 0, frame.size.x, frame.size.y);
+		std::array<int, 256> n{};
+		for (uint8_t c : buf) if (c) ++n[c < 8 ? col : c];
+		int best = 0;
+		for (int i = 1; i != 256; ++i) if (n[(size_t)i] > n[(size_t)best]) best = i;
+		uint32_t rgb = best ? game_palette[best] & 0xffffff : 0xffffff;
+		// the HD ring is mid grey; scale the colour so its brightest channel survives the multiply
+		uint32_t r = (rgb >> 16) & 0xff, gg = (rgb >> 8) & 0xff, b = rgb & 0xff, m = std::max(r, std::max(gg, b));
+		if (m) { r = r * 255 / m; gg = gg * 255 / m; b = b * 255 / m; }
+		rgb = (r << 16) | (gg << 8) | b;
+		sd_ring_colors[key] = rgb;
+		return rgb;
+	}
+
+	// A greyscale HD frame multiplied by `rgb` (luminance 128 = the colour itself), alpha blended.
+	void draw_hd_tinted(const anim::sprite_t& ha, const hd_geom_t& g, uint32_t rgb, uint32_t* data, size_t data_pitch) {
+		auto& f = *g.f;
+		uint32_t pr = (rgb >> 16) & 0xff, pg = (rgb >> 8) & 0xff, pb = rgb & 0xff;
+		uint32_t* dst = data + (size_t)g.screen_y * data_pitch + g.screen_x;
+		for (int y = g.offset_y; y < g.height; ++y) {
+			const size_t arow = (size_t)(f.y + y) * ha.atlas_w;
+			uint32_t* drow = dst + (size_t)y * data_pitch;
+			for (int x = g.offset_x; x < g.width; ++x) {
+				uint32_t c = ha.diffuse[arow + f.x + (g.flipped ? f.w - 1 - x : x)];
+				uint32_t a = c >> 24;
+				if (a < 8) continue;
+				uint32_t l = (((c >> 16) & 0xff) * 77 + ((c >> 8) & 0xff) * 150 + (c & 0xff) * 29) >> 8;
+				uint32_t r = pr * l / 128, gg = pg * l / 128, b = pb * l / 128;
+				if (r > 255) r = 255;
+				if (gg > 255) gg = 255;
+				if (b > 255) b = 255;
+				uint32_t old = drow[x], ia = 255 - a;
+				drow[x] = 0xff000000u | (div255(r * a + ((old >> 16) & 0xff) * ia) << 16)
+					| (div255(gg * a + ((old >> 8) & 0xff) * ia) << 8) | div255(b * a + (old & 0xff) * ia);
+			}
+		}
 	}
 
 	void draw_health_bars_rgba(const sprite_t* sprite, const unit_t* u, uint32_t* data, size_t data_pitch) {
@@ -5027,7 +5514,7 @@ struct ui_functions: ui_util_functions {
 				if (!u->sprite || u_invincible(u)) continue;
 				if (current_selection_sprites_set.at(u->sprite->index)) continue;
 				if (s_hidden(u->sprite)) continue;
-				bool damaged = u->hp < u->unit_type->hitpoints
+				bool damaged = u->hp < unit_max_hp(u)
 					|| (u->unit_type->has_shield && u->shield_points < fp8::integer(u->unit_type->shield_points));
 				if (damaged || hud_health_always) {
 					if (rgba_sprites) rgba_sprite_queue.push_back({nullptr, u->sprite, nullptr, u});
@@ -5683,8 +6170,8 @@ struct ui_functions: ui_util_functions {
 		void run() {
 			try {
 				funcs f(st, ast, rst);
-				a_vector<int> cost((size_t)UnitTypes::None, 0);
-				for (size_t i = 0; i != cost.size(); ++i) cost[i] = f.unit_value(f.get_unit_type((UnitTypes)i));
+				a_vector<int> cost(unit_type_capacity, 0);
+				f.for_each_unit_type_id([&](UnitTypes i) { cost[(size_t)i] = f.unit_value(f.get_unit_type(i)); });
 				struct depot_t { int x, y; };
 				std::array<std::vector<depot_t>, 8> ever;
 				int64_t prev_killed = 0;
@@ -6128,7 +6615,7 @@ struct ui_functions: ui_util_functions {
 						                            : u->remaining_build_time;
 						col = zerg ? 0xffc884ffu : 0xff90d090u;
 					} else if (!u_completed(u) && ut_building(u)) {
-						frame = (int)u->unit_type->id;
+						frame = (int)u->unit_type->behaves_as;
 						rem = u->remaining_build_time;
 						col = zerg ? 0xffc884ffu : 0xff90d090u;
 					}
@@ -7775,6 +8262,65 @@ struct ui_functions: ui_util_functions {
 		// Countdown is now drawn by draw_game_timer (replaces the elapsed clock in
 		// timed modes) so the two opposite clocks no longer overlap.
 		draw_trigger_leaderboard(data, pitch);
+		draw_script_objectives(data, pitch);
+	}
+
+	// G12: the map's Campaign Studio objectives (classic triggers), read once per map.
+	a_vector<classic_objectives::objective> classic_objs;
+	const void* classic_objs_key = nullptr;
+	const a_vector<classic_objectives::objective>& classic_objectives_list() {
+		const void* key = game_st.triggers.empty() ? nullptr : (const void*)&game_st.triggers.front();
+		if (key != classic_objs_key) {
+			classic_objs_key = key;
+			classic_objs = key ? classic_objectives::read(game_st, st, game_local_player >= 0 ? game_local_player : 0) : a_vector<classic_objectives::objective>();
+		}
+		return classic_objs;
+	}
+	// Rows as OEScript objectives show them: (text, 0 active / 1 done / 2 failed).
+	a_vector<std::pair<a_string, int>> classic_objective_rows() {
+		a_vector<std::pair<a_string, int>> r;
+		int p = game_local_player >= 0 ? game_local_player : 0;
+		for (auto& o : classic_objectives_list()) {
+			int k = (int)classic_objectives::state_of(o, st, p);
+			a_string t = trigger_sanitize(o.title);
+			if (t.size() > 40) t = t.substr(0, 40);
+			r.emplace_back((k == 1 ? "[x] " : k == 2 ? "[-] " : "[ ] ") + (o.optional ? a_string("Optional: ") : a_string()) + t, k);
+		}
+		return r;
+	}
+
+	static a_string script_objective_row(const std::pair<a_string, int>& o) {
+		a_string id = trigger_sanitize(o.first);
+		if (id.size() > 40) id = id.substr(0, 40);
+		return (o.second == 1 ? "[x] " : o.second == 2 ? "[-] " : "[ ] ") + id;
+	}
+
+	// OEScript objectives (objective.set / complete / fail), under the leaderboard.
+	void draw_script_objectives(uint32_t* data, size_t pitch) {
+		const bool script = game_st.oescript.loaded && !st.oes.objectives.empty();
+		if (!script && classic_objectives_list().empty()) return;
+		bool prev = hud_scale_text;
+		hud_scale_text = true;
+		const char* title = "Objectives";
+		const int lh = menu_text_h(2) + hud_h_px(6), in = hud_h_px(8);
+		int w = menu_text_w(title, 2);
+		a_vector<std::pair<a_string, int>> rows;
+		if (script) {
+			for (auto& o : st.oes.objectives) rows.emplace_back(script_objective_row(o), o.second);
+		} else rows = classic_objective_rows();
+		if (rows.size() > 8) rows.resize(8);
+		for (auto& r : rows) w = std::max(w, menu_text_w(r.first.c_str(), 2));
+		int x1 = (int)screen_width - hud_h_px(12), x0 = x1 - w - 2 * in;
+		int y = hud_h_px(40);
+		if (st.leaderboard.type) y += 18 + 16 * (int)leaderboard_cache.size() + hud_h_px(8);
+		rect box = {{x0, y}, {x1, y + lh * ((int)rows.size() + 1) + in}};
+		blend_rect_rgba(data, pitch, box, 0x05070au, 160);
+		draw_text_rgba(data, pitch, x0 + in, y + in / 2, title, 0xff00e0e0u, 2);
+		for (size_t i = 0; i != rows.size(); ++i) {
+			uint32_t c = rows[i].second == 1 ? 0xff60ff60u : rows[i].second == 2 ? 0xff4040ffu : 0xffffffffu;
+			draw_text_rgba(data, pitch, x0 + in, y + in / 2 + lh * (int)(i + 1), rows[i].first.c_str(), c, 2);
+		}
+		hud_scale_text = prev;
 	}
 
 	// Select all of the local player's combat units (not workers, not
@@ -7835,6 +8381,12 @@ struct ui_functions: ui_util_functions {
 			if (o == Orders::PlayerGuard || o == Orders::Guard || o == Orders::Nothing || o == Orders::Stop) ++n;
 		}
 		return n;
+	}
+
+	// IDLE button icon: the local race's worker (unit buttons use frame == unit id).
+	int idle_worker_icon() const {
+		const int r = game_local_player >= 0 ? (int)st.players[(size_t)game_local_player].race : 1;
+		return r == 0 ? (int)UnitTypes::Zerg_Drone : r == 2 ? (int)UnitTypes::Protoss_Probe : (int)UnitTypes::Terran_SCV;
 	}
 
 	// --- Unit clustering (v0.72) ---------------------------------------
@@ -7940,8 +8492,8 @@ struct ui_functions: ui_util_functions {
 		for (int i = 0; i < 2; ++i) {
 			rect r = util_button_area(i);
 			if (r.to.x <= r.from.x) continue;
-			// v0.64 item 8: IDLE is an icon-plus-count badge (the Repair
-			// cmdicon reads as "a worker with nothing to do"), dimmed rather
+			// v0.64 item 8: IDLE is an icon-plus-count badge (the race's
+			// worker), dimmed rather
 			// than hidden at zero so the toolbar never reflows under the
 			// player's thumb.
 			int n = i == 0 ? idle_worker_count() : (int)army_clusters().size();
@@ -7952,7 +8504,7 @@ struct ui_functions: ui_util_functions {
 			if (i == 0) {
 				int h = r.to.y - r.from.y;
 				rect icon = {{r.from.x + 2, r.from.y + 2}, {r.from.x + h - 2, r.to.y - 2}};
-				draw_cmdicon_fit(data, pitch, cmdicon_repair, icon);
+				draw_cmdicon_fit(data, pitch, idle_worker_icon(), icon);
 				char buf[16];
 				snprintf(buf, sizeof(buf), "%d", n);
 				draw_text_rgba(data, pitch, r.from.x + h + 4 * hud_us(),
@@ -8294,11 +8846,11 @@ struct ui_functions: ui_util_functions {
 					bwgame::diag::emit(cf, "unit", DSev::error, "UNIT_OFFMAP",
 						"unit position is outside the map", "\"unit\":" + std::to_string(id) +
 						",\"pos\":[" + std::to_string(u->position.x) + "," + std::to_string(u->position.y) + "]");
-				if (u->unit_type->hitpoints.integer_part() > 0
-				    && u->hp.integer_part() > u->unit_type->hitpoints.integer_part() + 1 && diag_once(5, id))
+				if (unit_max_hp(u).integer_part() > 0
+				    && u->hp.integer_part() > unit_max_hp(u).integer_part() + 1 && diag_once(5, id))
 					bwgame::diag::emit(cf, "unit", DSev::error, "UNIT_HP_OVER_MAX",
 						"unit hp exceeds its type maximum", "\"unit\":" + std::to_string(id) +
-						",\"hp\":" + std::to_string(u->hp.integer_part()) + ",\"max\":" + std::to_string(u->unit_type->hitpoints.integer_part()));
+						",\"hp\":" + std::to_string(u->hp.integer_part()) + ",\"max\":" + std::to_string(unit_max_hp(u).integer_part()));
 				if (u->energy.integer_part() > unit_max_energy(u).integer_part() + 1 && diag_once(6, id))
 					bwgame::diag::emit(cf, "unit", DSev::warn, "UNIT_ENERGY_OVER_MAX",
 						"unit energy exceeds its maximum", "\"unit\":" + std::to_string(id) +
@@ -8517,6 +9069,64 @@ struct ui_functions: ui_util_functions {
 		xy start = game_st.start_locations[game_local_player];
 		if (start == xy()) start = xy((int)game_st.map_width / 2, (int)game_st.map_height / 2);
 		current_selection.clear();
+		if (name == "fxshow") {
+			// A still-life of the HD draw modifiers for a visual check on the device (no detector):
+			// own permanently cloaked units (50%), a Wraith cloaking, Dark Swarm, Disruption Web,
+			// EMP, a Pylon warping in, creep around a Hatchery, selection circles and shadows.
+			const int p = game_local_player;
+			const int mw = (int)game_st.map_width, mh = (int)game_st.map_height;
+			xy c = start + xy(0, start.y < mh / 2 ? 320 : -320);
+			c.x = std::max(400, std::min(c.x, mw - 360));
+			c.y = std::max(160, std::min(c.y, mh - 260));
+			std::string failed;
+			auto mk = [&](UnitTypes t, xy at) {
+				unit_t* u = trigger_create_unit(get_unit_type(t), at, p);
+				if (u) u->energy = unit_max_energy(u);
+				else failed += " " + std::to_string((int)t);
+				return u;
+			};
+			auto cast = [&](unit_t* u, Orders o, xy at) {
+				if (!u) return;
+				submit_select_single(u);
+				game_action_writer w;
+				w.u8(21); w.i16((int16_t)at.x); w.i16((int16_t)at.y); w.u16(0);
+				w.u16((uint16_t)(int)UnitTypes::None); w.u8((uint8_t)(int)o); w.u8(0);
+				submit_game_action(w);
+			};
+			mk(UnitTypes::Protoss_Observer, c + xy(-300, -110));
+			mk(UnitTypes::Hero_Zeratul, c + xy(-300, -10));
+			unit_t* wraith = mk(UnitTypes::Hero_Tom_Kazansky, c + xy(-200, -60));
+			unit_t* defiler = mk(UnitTypes::Hero_Unclean_One, c + xy(-90, 60));
+			st.tech_researched[p][TechTypes::Disruption_Web] = true;   // Raszagal is not placeable
+			unit_t* corsair = mk(UnitTypes::Protoss_Corsair, c + xy(60, 60));
+			unit_t* vessel = mk(UnitTypes::Hero_Magellan, c + xy(200, 60));
+			unit_t* probe = mk(UnitTypes::Protoss_Probe, c + xy(-40, 100));
+			mk(UnitTypes::Zerg_Hatchery, c + xy(-210, 80));
+			st.current_minerals[p] += 1000;
+			if (wraith) {
+				submit_select_single(wraith);
+				game_action_writer w;
+				w.u8(33); w.u8(0);   // cloak
+				submit_game_action(w);
+			}
+			cast(defiler, Orders::CastDarkSwarm, c + xy(-90, -70));
+			cast(corsair, Orders::CastDisruptionWeb, c + xy(60, -70));
+			cast(vessel, Orders::CastEMPShockwave, c + xy(200, -70));
+			if (probe) {
+				submit_select_single(probe);
+				game_action_writer w;
+				w.u8(12); w.u8((uint8_t)(int)Orders::PlaceProtossBuilding);
+				w.u16((uint16_t)((c.x + 20 - 32) / 32)); w.u16((uint16_t)((c.y + 10 - 32) / 32));
+				w.u16((uint16_t)(int)UnitTypes::Protoss_Pylon);
+				submit_game_action(w);
+			}
+			current_selection.clear();
+			for (unit_t* u : {wraith, defiler, corsair, vessel}) if (u) current_selection_add(u);
+			center_camera_on(c);
+			bwgame::diag::emit((long)st.current_frame, "selftest", bwgame::diag::Sev::info, "SELFTEST_SETUP",
+				"fxshow scene at " + std::to_string(c.x) + "," + std::to_string(c.y) + (failed.empty() ? "" : ", not placed:" + failed), "\"scenario\":\"fxshow\"");
+			return;
+		}
 		if (name == "smartcast") {
 			// 3 hero Science Vessels (Magellan bypasses tech research, so it can EMP
 			// with no research building), full energy, selected; then cast EMP on a
@@ -8697,6 +9307,21 @@ struct ui_functions: ui_util_functions {
 	// rasterized offline). The atlas is sized for text_scale 2 (drawn 1:1);
 	// other scales nearest-neighbor upscale by text_scale/2. Coverage acts as
 	// alpha, blended over the game with a drop shadow for readability.
+	bool hd_scr_font = false;   // Settings: SC:R in-game font (HD tiers only)
+	scr_font::font_t scr_font_data;
+	bool scr_font_tried = false;
+	bool scr_font_ready() {
+		if (!hd_scr_font || !hd_casc) return false;
+		if (!scr_font_tried) {
+			scr_font_tried = true;
+			std::vector<uint8_t> fn, dds;
+			if (load_hd_bytes && load_hd_bytes("font/font16.fnt", fn) && load_hd_bytes("font/font16.dds", dds))
+				scr_font_data = scr_font::parse(fn.data(), fn.size(), dds.data(), dds.size());
+			ui::log("scr font: ok=%d glyphs=%d\n", (int)scr_font_data.ok, (int)scr_font_data.glyphs.size());
+		}
+		return scr_font_data.ok;
+	}
+
 	void draw_text_rgba(uint32_t* data, size_t pitch, int x, int y, const char* s, uint32_t color, int text_scale = 2) {
 		draw_text_rgba_scaled(data, pitch, x, y, s, color, text_scale * 50);
 	}
@@ -8726,6 +9351,20 @@ struct ui_functions: ui_util_functions {
 		const bool down = f < 0.95f;
 		if (down) { ow = std::max(1, (int)(W * f + 0.5f)); oh = std::max(1, (int)(H * f + 0.5f)); }
 		int cr = (color >> 16) & 0xff, cg = (color >> 8) & 0xff, cb = color & 0xff;
+		if (scr_font_ready()) {
+			// SC:R glyphs in the monospace box: same start and width, so the layout is unchanged.
+			int n = (int)strlen(s);
+			scr_font::draw(scr_font_data, x, y, s, n * adv - (adv - (int)(W * f + 0.5f)), std::max(1, (int)(H * f + 0.5f)),
+				[&](int px, int py, int cov) {
+					if (px < 0 || py < 0 || px + 1 >= (int)screen_width || py + 1 >= (int)screen_height) return;
+					if (cov >= 96) data[(size_t)(py + 1) * pitch + (px + 1)] = 0xff000000u;
+					uint32_t bg = data[(size_t)py * pitch + px];
+					int br = (bg >> 16) & 0xff, bgc = (bg >> 8) & 0xff, bb = bg & 0xff;
+					data[(size_t)py * pitch + px] = 0xff000000u | (uint32_t)((cr * cov + br * (255 - cov)) / 255) << 16
+						| (uint32_t)((cg * cov + bgc * (255 - cov)) / 255) << 8 | (uint32_t)((cb * cov + bb * (255 - cov)) / 255);
+				});
+			return;
+		}
 		int cx = x;
 		for (; *s; ++s) {
 			unsigned char ch = (unsigned char)*s;
@@ -8945,9 +9584,34 @@ struct ui_functions: ui_util_functions {
 	bool ui_backdrop_tried = false;
 	std::shared_ptr<const std::vector<uint32_t>> ui_backdrop_px;
 	int ui_backdrop_w = 0, ui_backdrop_h = 0;
+	// SC:R glue/palmm/backgnd.dds: plain 32-bit RGBA (A8B8G8R8 masks), 3412x1920 / hd2 1706x960.
+	static bool decode_plain_dds(const std::vector<uint8_t>& d, std::vector<uint32_t>& px, int& w, int& h) {
+		auto u32 = [&](size_t o) { return (uint32_t)d[o] | ((uint32_t)d[o + 1] << 8) | ((uint32_t)d[o + 2] << 16) | ((uint32_t)d[o + 3] << 24); };
+		if (d.size() <= 128 || memcmp(d.data(), "DDS ", 4) != 0) return false;
+		const size_t hh = u32(12), ww = u32(16);
+		const bool rgba = (u32(80) & 0x40) && u32(84) == 0 && u32(88) == 32 && u32(92) == 0xffu && u32(96) == 0xff00u && u32(100) == 0xff0000u;
+		if (!rgba || ww == 0 || hh == 0 || ww > 4096 || hh > 4096 || d.size() < 128 + ww * hh * 4) return false;
+		px.resize(ww * hh);
+		const uint8_t* s = d.data() + 128;
+		for (size_t i = 0, n = ww * hh; i != n; ++i, s += 4) px[i] = ((uint32_t)s[0] << 16) | ((uint32_t)s[1] << 8) | (uint32_t)s[2];
+		w = (int)ww; h = (int)hh;
+		return true;
+	}
 	void ui_backdrop_load() {
 		if (ui_backdrop_tried) return;
 		ui_backdrop_tried = true;
+		if (hd_casc && load_hd_bytes) {
+			try {
+				std::vector<uint8_t> bytes;
+				auto px = std::make_shared<std::vector<uint32_t>>();
+				int w = 0, h = 0;
+				if (load_hd_bytes(hd_casc_prefix + "glue/palmm/backgnd.dds", bytes) && decode_plain_dds(bytes, *px, w, h)) {
+					ui_backdrop_w = w; ui_backdrop_h = h;
+					ui_backdrop_px = std::move(px);
+					return;
+				}
+			} catch (...) {}
+		}
 		if (!load_data_file) return;
 		try {
 			a_string path = "glue\\palmm\\backgnd.pcx";
@@ -9319,7 +9983,7 @@ struct ui_functions: ui_util_functions {
 		a_vector<int> pids, utids;
 		for (unit_t* u : ptr(st.player_units[local_player])) {
 			if (!u->unit_type) continue;
-			int id = (int)u->unit_type->id;
+			int id = (int)u->unit_type->behaves_as;
 			bool huid = false; for (int q : utids) if (q == id) { huid = true; break; }
 			if (!huid && (int)utids.size() < 24) utids.push_back(id); // ALL starting unit types
 			int p = u->unit_type->portrait;
@@ -9715,6 +10379,7 @@ struct ui_functions: ui_util_functions {
 	// leading/trailing non-printable control bytes some .tbl entries carry.
 	a_string unit_name(const unit_type_t* ut) {
 		a_string out;
+		if (ut) if (const ext_unit_def* d = ext_def(ut->id)) return d->name.empty() ? d->id : d->name;
 		if (!unit_names_ok || !ut) return out;
 		a_string s;
 		try {
@@ -10519,7 +11184,7 @@ struct ui_functions: ui_util_functions {
 		// under FULL HD memory pressure -- now guarded in scale_box +
 		// get_hd_wireframe_cells, so the worst case is a one-frame SD fallback.
 		if (hd_casc || !hd_ui_dir.empty()) { blit_wireframe_unit(data, pitch, u, dstx, dsty, box); return; }
-		int fi = u->unit_type ? (int)u->unit_type->id : -1;
+		int fi = u->unit_type ? (int)u->unit_type->behaves_as : -1;
 		if (fi < 0 || fi >= (int)src.frames.size() || src.frames[fi].size.x == 0) {
 			blit_wireframe_unit(data, pitch, u, dstx, dsty, box);
 			return;
@@ -10531,7 +11196,7 @@ struct ui_functions: ui_util_functions {
 	void blit_wireframe_unit(uint32_t* data, size_t pitch, const unit_t* u, int dstx, int dsty, int box) {
 		int hpp = unit_hp_percent(u);
 		wire_colors_t wc = wire_palette(u);
-		auto* wf = get_hd_wireframe_cells((int)u->unit_type->id, box);
+		auto* wf = get_hd_wireframe_cells((int)u->unit_type->behaves_as, box);
 		// v0.82.026: layered path. The mask cells are drawn one at a time in
 		// their own colours; the artwork cell is NOT drawn, because it is the
 		// pre-composed picture and painting it under the layers is exactly what
@@ -10609,6 +11274,17 @@ struct ui_functions: ui_util_functions {
 	// blanking parts of the shape.
 	void blit_wireframe_type(uint32_t* data, size_t pitch, const unit_type_t* ut, int dstx, int dsty, int box, wire_colors_t wc) {
 		int fi = (int)ut->id;
+		// Zerg HD is layered: its tint is black at full health, so the tinted path drew a black silhouette.
+		if (hd_wireframe_t* wf = wc.hd_layered ? get_hd_wireframe_cells(fi, box) : nullptr) {
+			if (!wf->parts.empty()) {
+				blit_hd_wireframe_cell(data, pitch, wf->outline, dstx, dsty, 0xff000000u | wc.hd_fill, nullptr, 255);
+				for (size_t i = 0; i != wf->parts.size(); ++i) {
+					uint32_t col = i < 6 ? wc.hd_layer[i] : wc.hd_line;
+					if (col) blit_hd_wireframe_cell(data, pitch, wf->parts[i], dstx, dsty, 0xff000000u | col, nullptr, 255);
+				}
+				return;
+			}
+		}
 		if (ddsgrp::frame_t* hw = get_hd_wireframe(fi, box)) {
 			int tr = (wc.tint >> 16) & 0xff, tg = (wc.tint >> 8) & 0xff, tb = wc.tint & 0xff;
 			for (int y = 0; y != hw->h; ++y) {
@@ -10760,7 +11436,7 @@ struct ui_functions: ui_util_functions {
 					if ((hd_shape->rgba[(size_t)y * dw + x] >> 24) >= 16)
 						mask[(size_t)(y + pad) * mw + (x + pad)] = 1;
 		} else {
-			int fi = (int)u->unit_type->id;
+			int fi = (int)u->unit_type->behaves_as;
 			if (fi < 0 || fi >= (int)wireframe_grp.frames.size()) return;
 			auto& f = wireframe_grp.frames[fi];
 			size_t fw = f.size.x, fh = f.size.y;
@@ -10927,7 +11603,7 @@ struct ui_functions: ui_util_functions {
 		if (!u) return;
 		load_wireframe();
 		if (!wireframe_ok) return;
-		int fi = (int)u->unit_type->id;
+		int fi = (int)u->unit_type->behaves_as;
 		if (fi < 0 || fi >= (int)wireframe_grp.frames.size()) return;
 		auto& f = wireframe_grp.frames[fi];
 		size_t fw = f.size.x, fh = f.size.y;
@@ -10992,7 +11668,7 @@ struct ui_functions: ui_util_functions {
 			draw_text_rgba(data, pitch, wf_cx - tw / 2, ty, s, color);
 			ty += line_h;
 		};
-		snprintf(line, sizeof(line), "HP %d/%d", (int)u->hp.integer_part(), (int)u->unit_type->hitpoints.integer_part());
+		snprintf(line, sizeof(line), "HP %d/%d", (int)u->hp.integer_part(), (int)unit_max_hp(u).integer_part());
 		stat_line(line, tint | 0xff000000u);
 		if (u->unit_type->has_shield) {
 			snprintf(line, sizeof(line), "SH %d/%d", (int)u->shield_points.integer_part(), u->unit_type->shield_points);
@@ -11243,7 +11919,7 @@ struct ui_functions: ui_util_functions {
 			char lbl[2] = { (char)('0' + n), 0 };
 			int lw = ui::unispace_w + 1;
 			if (first && cmdicons_ok) {
-				draw_cmdicon_fit(data, pitch, (int)first->unit_type->id, r, false, 8);
+				draw_cmdicon_fit(data, pitch, (int)first->unit_type->behaves_as, r, false, 8);
 				// Number badge in the top-left corner over a dark chip.
 				rect badge = {{r.from.x + 1, r.from.y + 1}, {r.from.x + 1 + lw + 3, r.from.y + 2 + ui::unispace_h}};
 				fill_rect_rgba(data, pitch, badge, 0xc0000000u);
@@ -11477,6 +12153,28 @@ struct ui_functions: ui_util_functions {
 	// then the default melee text. Fixes the campaign F10 showing the melee
 	// objective (campaign audit, v0.30).
 	a_string current_objectives() {
+		a_string r = current_objectives_text();
+		a_string s = script_status();
+		if (!s.empty()) r += "\n\n" + s;
+		return r;
+	}
+	a_string current_objectives_text() {
+		if (game_st.oescript.loaded && !st.oes.objectives.empty()) {
+			a_string r;
+			for (auto& o : st.oes.objectives) {
+				const char* status = o.second == 1 ? " (done)" : o.second == 2 ? " (failed)" : "";
+				r += (r.empty() ? "" : "\n") + script_objective_row(o) + status;
+			}
+			return r;
+		}
+		if (!classic_objectives_list().empty()) {
+			a_string r;
+			for (auto& o : classic_objective_rows()) {
+				const char* status = o.second == 1 ? " (done)" : o.second == 2 ? " (failed)" : "";
+				r += (r.empty() ? "" : "\n") + o.first + status;
+			}
+			return r;
+		}
 		int p = game_local_player >= 0 ? game_local_player : 0;
 		if ((size_t)p < st.mission_objectives_string.size()) {
 			// CHK string refs are 1-based; map_strings is 0-based. The engine's
@@ -11830,6 +12528,11 @@ struct ui_functions: ui_util_functions {
 		pstr(save_args);
 		a_vector<uint8_t> blob = savegame::save(st, action_st, save_engine_version, save_map_id);
 		out.insert(out.end(), blob.begin(), blob.end());
+		// "OBAU" authorship after the blob; savegame::load ignores trailing bytes.
+		const std::string au = provenance::trailer_text();
+		pu32(provenance::trailer_magic);
+		pu32((uint32_t)au.size());
+		out.insert(out.end(), au.begin(), au.end());
 		FILE* f = fopen(save_slot_path(slot).c_str(), "wb");
 		if (!f) { save_feedback = "Save FAILED (no file)"; return false; }
 		bool ok = out.empty() || fwrite(out.data(), 1, out.size(), f) == out.size();
@@ -12346,11 +13049,30 @@ struct ui_functions: ui_util_functions {
 			const int kinds[] = {menu_btn_primary, menu_btn_normal, menu_btn_normal, menu_btn_normal,
 				menu_btn_normal, menu_btn_normal, menu_btn_danger};
 			const int hit = menu_modal(data, pitch, L("PAUSED"), labels, en, 7, hx, hy, kinds);
-			if (hx < 0 && hud_v3) {
-				// HUD v3 keeps the field clear, so the version is here (design 4.16)
+			if (hx < 0) {
 				menu_lay_t vl = menu_layout([&](const menu_lay_t& m) { return 7 * m.bh + 6 * m.gap; });
-				if (!hud_version_img.empty()) draw_hud_version_img(data, pitch, (vl.panel.from.x + vl.panel.to.x) / 2, vl.panel.to.y + hud_h_px(6));
-				else if (!hud_version.empty()) draw_text_rgba(data, pitch, (vl.panel.from.x + vl.panel.to.x) / 2 - menu_text_w(hud_version.c_str(), 2) / 2, vl.panel.to.y + hud_h_px(6), hud_version.c_str(), 0xff7f9486u);
+				const int cx = (vl.panel.from.x + vl.panel.to.x) / 2;
+				int y = vl.panel.to.y + hud_h_px(6);
+				std::string line = provenance::url();
+				if (hud_v3) {
+					// HUD v3 keeps the field clear, so the version is here (design 4.16). A phone has
+					// no room below the panel: the version then joins the link inside it.
+					const int vh = !hud_version_img.empty() ? hud_version_scaled_h : menu_text_h(2);
+					if (y + vh <= (int)screen_height) {
+						if (!hud_version_img.empty()) draw_hud_version_img(data, pitch, cx, y);
+						else if (!hud_version.empty()) draw_text_rgba(data, pitch, cx - menu_text_w(hud_version.c_str(), 2) / 2, y, hud_version.c_str(), 0xff7f9486u);
+					} else if (!hud_version.empty()) line = std::string(hud_version.c_str()) + "   " + line;
+				}
+				// In the panel's bottom padding, at the largest size that fits.
+				const int last = vl.y + 7 * vl.bh + 6 * vl.gap, room = vl.panel.to.y - last;
+				for (int pct : {100, 80, 60}) {
+					const float f = hud_text_pct(pct) / 100.0f;
+					const int h = f < 0.95f ? std::max(1, (int)(ui::unispace_h * f + 0.5f)) : ui::unispace_h * std::max(1, (int)(f + 0.5f));
+					const int w = (int)line.size() * std::max(1, (int)((ui::unispace_w + 1) * f + 0.5f));
+					if ((h > room - 4 || w > vl.x1 - vl.x0) && pct != 60) continue;
+					draw_text_rgba_scaled(data, pitch, cx - w / 2, last + (room - h) / 2, line.c_str(), 0xff7f9486u, pct);
+					break;
+				}
 			}
 			return hit;
 		}
@@ -12851,8 +13573,7 @@ struct ui_functions: ui_util_functions {
 		default: return -1;
 		}
 	}
-	// cmdicons frames referenced outside the card as well (the IDLE button
-	// borrows the Repair icon). Frame index = PyMS Icons.txt line - 1.
+	// cmdicons frames referenced outside the card as well. Frame index = PyMS Icons.txt line - 1.
 	static constexpr int cmdicon_repair = 232;
 	// Unit buttons use frame == unit id; Zerg Larva is unit 35 (stat_txt.tbl
 	// entry 36, 1-based). v0.66 guessed 261, which was simply wrong.
@@ -12891,6 +13612,12 @@ struct ui_functions: ui_util_functions {
 		case Orders::CastSpawnBroodlings: return 40; // Broodling unit icon
 		case Orders::CastRestoration: return 366;
 		case Orders::CastOpticalFlare: return 373;
+		case Orders::PlaceMine: return 243;       // techdata Spider Mines
+		case Orders::FireYamatoGun: return 251;
+		case Orders::CastScannerSweep: return 250;
+		case Orders::Harvest1: return 231;        // Gather
+		case Orders::PickupTransport: return 309; // Load
+		case Orders::RallyPointTile: return 286;  // Set Rally Point
 		default: return -1;
 		}
 	}
@@ -13364,6 +14091,9 @@ struct ui_functions: ui_util_functions {
 	static const char* ability_name(int action, int arg) {
 		if (action == cardact_ability_target) switch ((Orders)arg) {
 		case Orders::CastScannerSweep: return "Scanner Sweep";
+		case Orders::Harvest1: return "Gather";
+		case Orders::PickupTransport: return "Load";
+		case Orders::RallyPointTile: return "Set Rally Point";
 		case Orders::CastPsionicStorm: return "Psionic Storm";
 		case Orders::CastStasisField: return "Stasis Field";
 		case Orders::CastRecall: return "Recall";
@@ -13406,6 +14136,9 @@ struct ui_functions: ui_util_functions {
 	static const char* ability_desc(int action, int arg) {
 		if (action == cardact_ability_target) switch ((Orders)arg) {
 		case Orders::CastScannerSweep: return "Reveals an area; detects cloaked. No cost but energy.";
+		case Orders::Harvest1: return "Mine minerals or gas from the target.";
+		case Orders::PickupTransport: return "Pick up the target unit.";
+		case Orders::RallyPointTile: return "New units go to this spot or unit.";
 		case Orders::CastPsionicStorm: return "AOE damage over an area. Hits friend and foe.";
 		case Orders::CastStasisField: return "AOE: freezes units, invulnerable, can't act.";
 		case Orders::CastRecall: return "Teleports your units at target to the Arbiter.";
@@ -13453,7 +14186,8 @@ struct ui_functions: ui_util_functions {
 		case cardact_morph:
 		case cardact_morph_building:
 		case cardact_addon:
-			return arg; // unit/building icon frame == unit id
+			// unit/building icon frame == unit id; a mod type shows its parent's
+			return is_ext_unit_type((UnitTypes)arg) ? (int)get_unit_type((UnitTypes)arg)->behaves_as : arg;
 		case cardact_stop: return 229;
 		case cardact_attack: return cmdicon_attack;
 		case cardact_menu_build:
@@ -13473,7 +14207,8 @@ struct ui_functions: ui_util_functions {
 		case cardact_select_larva: return cmdicon_larva;
 		case cardact_cancel: return 236;
 		case cardact_ability: return ability_opcode_icon(arg);
-		case cardact_ability_target: return order_icon((Orders)arg);
+		case cardact_ability_target: return arg >= ext_target_base ? -1 : order_icon((Orders)arg);
+		case cardact_nydus_exit: return (int)UnitTypes::Zerg_Nydus_Canal;
 		case cardact_research: return tech_icon((TechTypes)arg);
 		case cardact_upgrade: return upgrade_icon((UpgradeTypes)arg);
 		default:
@@ -13964,14 +14699,35 @@ struct ui_functions: ui_util_functions {
 	// its own table in S.java). English is the source and the default; Lithuanian
 	// is the translation, so an unlisted string simply stays English.
 	bool lang_lt = false;
+	// GE4: "Level 2  120/250 XP" / "Level 4 (max)" for an Extended hero.
+	bool ext_hero_line(const unit_t* u, char* out, size_t n) const {
+		const ext_hero_def* hd = ext_hero(u);
+		if (!hd) return false;
+		if (u->hero_level >= hd->max_level) snprintf(out, n, "%s %d %s", L("Level"), u->hero_level, L("(max)"));
+		else snprintf(out, n, "%s %d  %d/%lld XP", L("Level"), u->hero_level, u->hero_xp, (long long)ext_hero_xp_for(*hd, u->hero_level + 1));
+		return true;
+	}
 	const char* L(const char* en) const {
 		if (!lang_lt) return en;
 		struct pair { const char* en; const char* lt; };
 		static const pair tbl[] = {
 			{"MISSION BRIEFING", "MISIJOS INSTRUKTAZAS"},
+			{"Level", "Lygis"},
+			{"(max)", "(maks.)"},
+			{"Skill points", "Igudziu taskai"},
+			{"Rank", "Rangas"},
+			{"Aura", "Aura"},
+			{"Passive", "Pasyvus"},
+			{"Energy", "Energija"},
+			{"Cooldown", "Atsistatymas"},
+			{"Need: level", "Reikia lygio"},
+			{"Ready in", "Paruosta po"},
 			{"This map uses StarCraft: Remastered terrain. Set the SC:R files in Settings.", "Siam zemelapiui reikia StarCraft: Remastered reljefo. Nurodyk SC:R failus Nustatymuose."},
 			{"Planned building dropped: the spot is blocked.", "Suplanuotas pastatas atsauktas: vieta uzstota."},
 			{"OBJECTIVES", "TIKSLAI"},
+			{"Script error: ", "Scenarijaus klaida: "},
+			{" (the script does not run)", " (scenarijus neveikia)"},
+			{" (%d errors)", " (klaidu: %d)"},
 			{"START MISSION", "PRADETI MISIJA"},
 			{"SKIP", "PRALEISTI"},
 			{"REPLAY", "KARTOTI"},
@@ -14719,7 +15475,9 @@ struct ui_functions: ui_util_functions {
 			const weapon_type_t* kaw = u->unit_type->air_weapon;
 			bool can_attack = (kgw && kgw->damage_amount > 0) || (kaw && kaw->damage_amount > 0);
 			const char* rank = unit_rank_name(u);
-			if (rank && !is_bldg) centred_small(rank, 0xffc8b878u);
+			char hbuf[48];
+			if (u->hero_level > 0 && ext_hero_line(u, hbuf, sizeof hbuf)) centred_small(hbuf, hud_theme().amber);
+			else if (rank && !is_bldg) centred_small(rank, 0xffc8b878u);
 			if (!is_bldg || can_attack) {
 				char kb[32];
 				snprintf(kb, sizeof(kb), "Kills: %d", (int)u->kill_count);
@@ -14747,7 +15505,7 @@ struct ui_functions: ui_util_functions {
 			draw_text_rgba_scaled(data, pitch, wcx - w / 2, ty, s, col, 80);
 			ty += small_lh;
 		};
-		snprintf(line, sizeof(line), "%d/%d", (int)u->hp.integer_part(), (int)u->unit_type->hitpoints.integer_part());
+		snprintf(line, sizeof(line), "%d/%d", (int)u->hp.integer_part(), (int)unit_max_hp(u).integer_part());
 		pool_line(line, hp_tint(hpp) | 0xff000000u);
 		if (u->unit_type->has_shield) {
 			snprintf(line, sizeof(line), "%d/%d", (int)u->shield_points.integer_part(), u->unit_type->shield_points);
@@ -14906,7 +15664,7 @@ struct ui_functions: ui_util_functions {
 			// A structure going up on its own: Protoss warp-in, or a Zerg
 			// building mid-morph. The progress is its own remaining_build_time.
 			load_cmdicons();
-			if (cmdicons_ok) draw_cmdicon_fit(data, pitch, (int)u->unit_type->id, a);
+			if (cmdicons_ok) draw_cmdicon_fit(data, pitch, (int)u->unit_type->behaves_as, a);
 			total = u->unit_type->build_time;
 			rem = u->remaining_build_time;
 			caption = prace == race_t::zerg ? "Evolving"
@@ -14917,7 +15675,7 @@ struct ui_functions: ui_util_functions {
 			// (we already did for research/upgrade -- unit training was the
 			// inconsistent one).
 			load_cmdicons();
-			if (cmdicons_ok) draw_cmdicon_fit(data, pitch, (int)act->id, a);
+			if (cmdicons_ok) draw_cmdicon_fit(data, pitch, (int)act->behaves_as, a);
 			else blit_wireframe_type(data, pitch, act, a.from.x + 2, a.from.y + 2, islot - 4, 0x30f030u);
 			total = act->build_time;
 			rem = u->current_build_unit ? u->current_build_unit->remaining_build_time : u->remaining_build_time;
@@ -15013,7 +15771,7 @@ struct ui_functions: ui_util_functions {
 			line_rectangle_rgba(data, pitch, slots[i], filled ? accent : hud_theme().slot_free_line);
 			if (!filled) continue;
 			const unit_type_t* qt = u->build_queue[i];
-			if (cmdicons_ok) draw_cmdicon_fit(data, pitch, (int)qt->id, slots[i]);
+			if (cmdicons_ok) draw_cmdicon_fit(data, pitch, (int)qt->behaves_as, slots[i]);
 			else blit_wireframe_type(data, pitch, qt, slots[i].from.x + 2, slots[i].from.y + 2, (slots[i].to.x - slots[i].from.x) - 4, 0x30f030u);
 		}
 	}
@@ -15154,7 +15912,7 @@ struct ui_functions: ui_util_functions {
 				|| (buttons[i].action == cardact_ability_target && ability_armed_order == buttons[i].arg);
 			fill_rect_rgba(data, pitch, r, armed ? cth.armed_fill : (hud_pressed(r) ? cth.btn_pressed : cth.btn_fill));
 			line_rectangle_rgba(data, pitch, r, armed ? cth.armed_line : cth.btn_line);
-			int icon = card_icon_frame(buttons[i].action, buttons[i].arg);
+			int icon = button_icon(buttons[i]);
 			if (icon >= 0 && cmdicons_ok) {
 				// v0.83.016: fit the icon to the (zoom-invariant) cell rather than
 				// blitting it at native cmdicons size. draw_cmdicon() draws a fixed
@@ -15196,7 +15954,7 @@ struct ui_functions: ui_util_functions {
 					draw_text_rgba(data, pitch, r.from.x + 3 * hud_us(), r.from.y + 3 * hud_us(), lv, cth.amber);
 				}
 			}
-			kbm_draw_card_key(data, pitch, r, (int)i, 85);
+			kbm_draw_card_key(data, pitch, r, buttons[i], (int)i, 85);
 		}
 	}
 
@@ -15240,7 +15998,9 @@ struct ui_functions: ui_util_functions {
 		const char* name = b.label;
 		const char* effect = nullptr; // what a research/upgrade does (SC wiki wording)
 		a_string nm;
-		switch (b.action) {
+		const int ext_ab = ext_card_ability(b);
+		if (ext_ab >= 0) ext_ability_tooltip(b, ext_ab, l1, l2, l3, effect);
+		else switch (b.action) {
 		case cardact_train: case cardact_build: case cardact_morph: case cardact_morph_building: case cardact_addon: {
 			auto* ut = get_unit_type((UnitTypes)b.arg);
 			if (ut) {
@@ -15293,7 +16053,8 @@ struct ui_functions: ui_util_functions {
 		}
 		default: break;
 		}
-		if (kbm_mode) { char k[8]; kbm_key_name(kbm_bind[kb_card0 + card_hover_index], k, sizeof k); snprintf(l0, sizeof l0, "%s  [%s]", name, k); }
+		const int kcode = kbm_mode ? kbm_card_code(b, card_hover_index) : -1;
+		if (kcode >= 0) { char k[8]; kbm_key_name(kcode, k, sizeof k); snprintf(l0, sizeof l0, "%s  [%s]", name, k); }
 		else snprintf(l0, sizeof l0, "%s", name);
 		if (mineral || gas) snprintf(l1, sizeof l1, "Min %d  Gas %d", mineral, gas);
 		if (supply && btime) snprintf(l2, sizeof l2, "Sup %d   %ds", supply, btime / 24);
@@ -15864,7 +16625,7 @@ struct ui_functions: ui_util_functions {
 				bool highlight = buttons[i].action == cardact_attack && attack_armed;
 				if (highlight) line_rectangle_rgba(data, pitch, r, 0xffffc040);
 				int cx = (r.from.x + r.to.x) / 2, cy = (r.from.y + r.to.y) / 2;
-				int icon = card_icon_frame(buttons[i].action, buttons[i].arg);
+				int icon = button_icon(buttons[i]);
 				if (icon >= 0) load_cmdicons();
 				if (icon >= 0 && cmdicons_ok) {
 					// Authentic unit/building icon, scaled to fill the (large)
@@ -16462,7 +17223,11 @@ struct ui_functions: ui_util_functions {
 		// apply_card_availability() after the grid is filled. Cost/supply is a
 		// separate concern (buttons stay lit but their cost text can go red).
 		bool available = true;
+		int icon = -1; // explicit cmdicons frame when action+arg alone is ambiguous
 	};
+	int button_icon(const card_button_t& b) {
+		return b.icon >= 0 ? b.icon : card_icon_frame(b.action, b.arg);
+	}
 	enum {
 		cardact_none, cardact_stop, cardact_attack, cardact_menu_build,
 		cardact_menu_adv, cardact_menu_back, cardact_train, cardact_build,
@@ -16477,10 +17242,17 @@ struct ui_functions: ui_util_functions {
 		cardact_cancel,         // arg = cancel opcode (24/25/32/46/49/51/52)
 		cardact_addon,          // arg = addon UnitTypes; auto-placed beside the building
 		cardact_land,           // enter placement mode to land a lifted building (opcode 12)
-		cardact_nydus_exit      // v0.83.034: place a Nydus Canal exit (opcode 12, BuildNydusExit)
+		cardact_nydus_exit,     // v0.83.034: place a Nydus Canal exit (opcode 12, BuildNydusExit)
+		cardact_menu_mods,      // GE3: the worker's page of Extended mod buildings (card_menu 3)
+		cardact_menu_abilities, // GE5: the unit's Extended abilities (card_menu 4)
+		cardact_ext_cast,       // arg = ability index; no target
+		cardact_ext_learn_menu, // the hero's learn page (card_menu 5)
+		cardact_ext_learn       // arg = ability index
 	};
+	// GE5: an armed targeted Extended ability is ability_armed_order = ext_target_base + ability index.
+	static constexpr int ext_target_base = 1000;
 
-	int card_menu = 0; // 0 = context, 1 = build basic, 2 = build advanced
+	int card_menu = 0; // 0 = context, 1 = build basic, 2 = build advanced, 3 = mod buildings, 4 / 5 = abilities / learn
 	// task 3: which build submenu (1/2) to reopen after a placement when QUEUE is
 	// on, so the player can compose a build order without re-navigating BUILD->list.
 	int build_menu_return = 0;
@@ -16612,9 +17384,86 @@ struct ui_functions: ui_util_functions {
 	// UI can dim the rest. The engine remains the authority — it silently
 	// rejects illegal orders — this only mirrors that state visually.
 	void card_buttons(static_vector<card_button_t, 9>& r) {
-		fill_card_buttons(r);
+		if (!ext_ability_card(r)) {
+			fill_card_buttons(r);
+			ext_ability_menu_button(r);
+		}
 		place_card_buttons(r);
 		apply_card_availability(r);
+	}
+
+	// GE5: Extended abilities. The ability of a card button, or -1.
+	int ext_card_ability(const card_button_t& b) const {
+		if (b.action == cardact_ext_cast || b.action == cardact_ext_learn) return b.arg;
+		if (b.action == cardact_ability_target && b.arg >= ext_target_base) return b.arg - ext_target_base;
+		return -1;
+	}
+	int ext_ability_icon(int ability) {
+		const ext_ability_def& d = game_st.ext_abilities[(size_t)ability];
+		switch (d.effect) {
+		case ext_ability_def::e_damage: return order_icon(Orders::CastPsionicStorm);
+		case ext_ability_def::e_heal: return 365;   // Medic Heal
+		case ext_ability_def::e_bonus: return 237;  // Stim Pack
+		case ext_ability_def::e_summon: return d.summon >= 0 ? (int)get_unit_type((UnitTypes)d.summon)->behaves_as : cmdicon_attack;
+		case ext_ability_def::e_teleport: return order_icon(Orders::CastRecall);
+		default: return order_icon(Orders::CastHallucination);
+		}
+	}
+	// GE5: rank, energy / cooldown and what is missing, for an Extended ability button.
+	void ext_ability_tooltip(const card_button_t& b, int ab, char (&l1)[40], char (&l2)[40], char (&l3)[48], const char*& effect) {
+		unit_t* u = focus_or_primary();
+		int i = u ? ext_ability_index(u, ab) : -1;
+		if (i < 0) return;
+		auto slots = ext_ability_slots(u);
+		const ext_ability_def& d = game_st.ext_abilities[(size_t)ab];
+		int rank = u->ab_rank[i], shown = std::max(rank, 1);
+		bool passive = d.target == ext_ability_def::t_passive || d.target == ext_ability_def::t_aura;
+		int cost = ext_ability_cost(d, shown), cd = ext_ability_cooldown(d, shown) / 16;
+		if (slots[(size_t)i].hero) snprintf(l1, sizeof l1, "%s %d/%d", L("Rank"), rank, d.ranks);
+		if (passive) snprintf(l2, sizeof l2, "%s", L(d.target == ext_ability_def::t_aura ? "Aura" : "Passive"));
+		else if (cost && cd) snprintf(l2, sizeof l2, "%s %d  %ds", L("Energy"), cost, cd);
+		else if (cost) snprintf(l2, sizeof l2, "%s %d", L("Energy"), cost);
+		else if (cd) snprintf(l2, sizeof l2, "%s %ds", L("Cooldown"), cd);
+		if (b.action == cardact_ext_learn && rank < d.ranks && u->hero_level < ext_ability_learn_level(d, rank + 1))
+			snprintf(l3, sizeof l3, "%s %d", L("Need: level"), ext_ability_learn_level(d, rank + 1));
+		else if (!passive && u->ab_ready[i] > (int)st.current_frame)
+			snprintf(l3, sizeof l3, "%s %ds", L("Ready in"), (u->ab_ready[i] - (int)st.current_frame + 15) / 16);
+		if (!d.tooltip.empty()) effect = d.tooltip.c_str();
+	}
+
+	// The abilities page (card_menu 4) or the learn page (5); false = not on one.
+	bool ext_ability_card(static_vector<card_button_t, 9>& r) {
+		if (card_menu != 4 && card_menu != 5) return false;
+		r.clear();
+		unit_t* u = placing_type || game_st.ext_abilities.empty() ? nullptr : focus_or_primary();
+		auto slots = u ? ext_ability_slots(u) : decltype(ext_ability_slots(u)){};
+		if (slots.empty()) { card_menu = 0; return false; }
+		bool learn = card_menu == 5;
+		for (size_t i = 0; i != slots.size() && r.size() < 7; ++i) {
+			int a = slots[i].ability;
+			const ext_ability_def& d = game_st.ext_abilities[(size_t)a];
+			const char* label = d.name.empty() ? d.id.c_str() : d.name.c_str();
+			int icon = ext_ability_icon(a);
+			bool ok = ext_ability_castable(u, (int)i) == ext_cast_ok;
+			if (learn) r.push_back({label, cardact_ext_learn, a, ext_ability_learnable(u, (int)i), icon});
+			else if (d.target == ext_ability_def::t_unit || d.target == ext_ability_def::t_point) r.push_back({label, cardact_ability_target, ext_target_base + a, ok, icon});
+			else r.push_back({label, cardact_ext_cast, a, ok, icon});
+		}
+		if (!learn && u->hero_points > 0) r.push_back({"LEARN", cardact_ext_learn_menu, 0, true, upgrade_icon(UpgradeTypes::Terran_Infantry_Weapons)});
+		r.push_back({"BACK", cardact_menu_back, 0});
+		return true;
+	}
+	// The ABILITIES button on a unit's own card (in Patrol's, else Hold's place when the card is full).
+	void ext_ability_menu_button(static_vector<card_button_t, 9>& r) {
+		if (game_st.ext_abilities.empty() || placing_type || card_menu != 0) return;
+		unit_t* u = focus_or_primary();
+		if (!u || u->owner != game_local_player) return;
+		auto slots = ext_ability_slots(u);
+		if (slots.empty()) return;
+		card_button_t b{"ABILITIES", cardact_menu_abilities, 0, true, ext_ability_icon(slots[0].ability)};
+		if (r.size() < 9) { r.push_back(b); return; }
+		for (auto& x : r) if (x.action == cardact_ability_target && x.arg == (int)Orders::Patrol) { x = b; return; }
+		for (auto& x : r) if (x.action == cardact_ability && x.arg == 43) { x = b; return; }
 	}
 
 	// v0.66 item 13: pin buttons to fixed grid slots.
@@ -16695,6 +17544,7 @@ struct ui_functions: ui_util_functions {
 		if (worker) {
 			// Return Cargo ahead of the abilities and of Hold / Patrol
 			std::stable_partition(rest.begin(), rest.end(), [&](const card_button_t& b) { return is(b, cardact_ability, 30); });
+			std::stable_partition(rest.begin(), rest.end(), [&](const card_button_t& b) { return is(b, cardact_ability_target, (int)Orders::Harvest1); });
 		}
 		int slot = mobile ? 3 : 0;
 		for (int pass = 0; pass != 2; ++pass) {
@@ -16803,8 +17653,17 @@ struct ui_functions: ui_util_functions {
 		}
 		unit_t* u = focus_or_primary();   // SCBW2 group-focus: a grid-tapped unit's card
 		if (!u) return;
-		auto ut = u->unit_type->id;
+		auto ut = u->unit_type->behaves_as;   // a mod type has its parent's card
+		const int real_id = (int)u->unit_type->id;
 		bool worker = ut == UnitTypes::Terran_SCV || ut == UnitTypes::Protoss_Probe || ut == UnitTypes::Zerg_Drone;
+		// GE3: Extended mod buildings this unit builds (builder == its real type)
+		auto mod_buildings = [&](a_vector<int>& out) {
+			out.clear();
+			for (size_t k = 0; k != game_st.ext_defs.size(); ++k)
+				if (game_st.ext_defs[k].building && game_st.ext_defs[k].builder == real_id) out.push_back((int)(ext_unit_type_first + k));
+		};
+		auto ext_label = [&](int type) { const ext_unit_def* d = ext_def((UnitTypes)type); return d ? (d->name.empty() ? d->id.c_str() : d->name.c_str()) : ""; };
+		auto ext_icon = [&](int type) { return (int)get_unit_type((UnitTypes)type)->behaves_as; };
 		// v0.83.033: fold a hero onto its base combat type so it presents that
 		// unit's abilities (see card_hero_base_type). Buildings are never heroes,
 		// so this leaves the build/train/upgrade switches below untouched.
@@ -16819,6 +17678,13 @@ struct ui_functions: ui_util_functions {
 			return;
 		}
 
+		if (card_menu == 3) {
+			a_vector<int> mods;
+			mod_buildings(mods);
+			for (int t : mods) if (r.size() < 8) r.push_back({ext_label(t), cardact_build, t, true, ext_icon(t)});
+			r.push_back({"BACK", cardact_menu_back, 0});
+			return;
+		}
 		if (card_menu != 0 && worker) {
 			// Build menus. The engine validates cost/tech, so unavailable
 			// buildings simply do nothing when tapped.
@@ -17006,6 +17872,33 @@ struct ui_functions: ui_util_functions {
 		default:
 			break;
 		}
+		if (game_st.oe_ext) {
+			// GE3: a mod building trains only what it lists; any producer also offers the
+			// mod units it makes (a Larva morphs them).
+			const ext_unit_def* maker = ext_def(u->unit_type->id);
+			const bool larva = ut == UnitTypes::Zerg_Larva;
+			auto has = [&](int t) { for (auto& b : r) if ((b.action == cardact_train || b.action == cardact_morph) && b.arg == t) return true; return false; };
+			auto offer = [&](int t) {
+				if (has(t) || r.size() >= 9) return;
+				const bool ext = is_ext_unit_type((UnitTypes)t);
+				int act = larva ? cardact_morph : cardact_train;
+				if (ext) r.push_back({ext_label(t), act, t, true, ext_icon(t)});
+				else r.push_back({"", act, t});
+			};
+			if (maker && maker->building) {
+				for (size_t i = 0; i < r.size();) {
+					bool listed = false;
+					for (int p : maker->produces) listed |= p == r[i].arg;
+					if ((r[i].action == cardact_train || r[i].action == cardact_morph) && !listed) r.erase(r.begin() + i);
+					else ++i;
+				}
+				for (int p : maker->produces) offer(p);
+			}
+			for (size_t k = 0; k != game_st.ext_defs.size(); ++k) {
+				const ext_unit_def& d = game_st.ext_defs[k];
+				if (!d.building && d.producer == real_id) offer((int)(ext_unit_type_first + k));
+			}
+		}
 
 		// Research / upgrade buttons per tech building. Composes with the train
 		// switch above (e.g. Lair keeps LARVA + adds overlord upgrades). The
@@ -17172,6 +18065,9 @@ struct ui_functions: ui_util_functions {
 			}
 		}
 
+		if (ut_building(u) && !u_flying(u) && u_completed(u) && unit_is_factory(u))
+			spell(ability_armed_order == (int)Orders::RallyPointTile ? "RALLY!" : "RALLY", Orders::RallyPointTile);
+
 		// Building-cast abilities (the per-unit ability switch below runs only for
 		// non-buildings, so addon buildings that cast need their own path).
 		if (ut == UnitTypes::Terran_Comsat_Station) spell("SCAN", Orders::CastScannerSweep);
@@ -17185,7 +18081,8 @@ struct ui_functions: ui_util_functions {
 			case UnitTypes::Terran_Factory:
 			case UnitTypes::Terran_Starport:
 			case UnitTypes::Terran_Science_Facility:
-				// (Engineering Bay cannot lift off in Brood War - removed.)
+			case UnitTypes::Terran_Engineering_Bay:     // units.dat flying_building (measured)
+			case UnitTypes::Zerg_Infested_Command_Center:
 				if (u_flying(u)) {
 					// Landing snaps a building preview to the tile grid and is
 					// confirmed by long-press (opcode 12/build with BuildingLand),
@@ -17283,8 +18180,15 @@ struct ui_functions: ui_util_functions {
 				break;
 			case UnitTypes::Terran_Dropship:
 			case UnitTypes::Protoss_Shuttle:
-			case UnitTypes::Zerg_Overlord:
+				spell(ability_armed_order == (int)Orders::PickupTransport ? "LOAD!" : "LOAD", Orders::PickupTransport);
 				ability("UNLOAD", 40);
+				break;
+			case UnitTypes::Zerg_Overlord:
+				// Overlords carry nothing without Ventral Sacs; the engine rejects load and unload.
+				if (player_has_upgrade(u->owner, UpgradeTypes::Ventral_Sacs)) {
+					spell(ability_armed_order == (int)Orders::PickupTransport ? "LOAD!" : "LOAD", Orders::PickupTransport);
+					ability("UNLOAD", 40);
+				}
 				break;
 			case UnitTypes::Protoss_High_Templar:
 				if (researched(TechTypes::Psionic_Storm)) spell("STORM", Orders::CastPsionicStorm);
@@ -17303,9 +18207,11 @@ struct ui_functions: ui_util_functions {
 				break;
 			case UnitTypes::Protoss_Carrier:
 				ability("INTER", 39); // build Interceptor (train_fighter)
+				if (!r.empty() && r.back().arg == 39) r.back().icon = (int)UnitTypes::Protoss_Interceptor;
 				break;
 			case UnitTypes::Protoss_Reaver:
 				ability("SCARAB", 39); // build Scarab (train_fighter)
+				if (!r.empty() && r.back().arg == 39) r.back().icon = (int)UnitTypes::Protoss_Scarab;
 				break;
 			case UnitTypes::Protoss_Dark_Archon:
 				if (researched(TechTypes::Mind_Control)) spell("MINDCTL", Orders::CastMindControl);
@@ -17329,10 +18235,9 @@ struct ui_functions: ui_util_functions {
 				// Infested Kerrigan's kit spans THREE base casters -- Psi Storm
 				// (Templar), Consume (Defiler), Ensnare (Queen) -- so card_hero_base_type
 				// cannot fold her onto a single base; she keeps her own unit id and is
-				// wired here directly. The engine authorises exactly these three
-				// (unit_can_use_tech: Psionic_Storm/Consume/Ensnare all include
-				// Hero_Infested_Kerrigan; she has NO cloak toggle -- she is passively
-				// cloaked, and unit_is_ghost is false for her, which is authentic).
+				// wired here directly. 1.16.1 also gives her Personnel Cloaking (cloak
+				// commands 0x4C0680 / 0x4C0750 list unit 0x33).
+				ability(u_cloaked(u) ? "DECLOAK" : "CLOAK", u_cloaked(u) ? 34 : 33);
 				spell("STORM", Orders::CastPsionicStorm);
 				spell("CONSUME", Orders::CastConsume);
 				spell("ENSNARE", Orders::CastEnsnare);
@@ -17367,22 +18272,29 @@ struct ui_functions: ui_util_functions {
 			if (r.size() < 9) r.push_back({ability_armed_order == (int)Orders::Move ? "MOVE!" : "MOVE",
 				cardact_ability_target, (int)Orders::Move});
 			if (r.size() < 9) r.push_back({"STOP", cardact_stop, 0});
-			if (r.size() < 9) r.push_back({attack_armed ? "ATTACK!" : "ATTACK", cardact_attack, 0});
-			if (r.size() < 9) r.push_back({"HOLD", cardact_ability, 43});
-			if (r.size() < 9) r.push_back({ability_armed_order == (int)Orders::Patrol ? "PATROL!" : "PATROL",
-				cardact_ability_target, (int)Orders::Patrol});
+			if (r.size() < 9) {
+				// The Medic's attack slot is Heal in the original (orders.dat MedicHeal icon 365).
+				if (ut == UnitTypes::Terran_Medic) r.push_back({attack_armed ? "HEAL!" : "HEAL", cardact_attack, 0, true, 365});
+				else r.push_back({attack_armed ? "ATTACK!" : "ATTACK", cardact_attack, 0});
+			}
 			if (worker) {
-				// v0.83: Return Cargo. Opcode 30 was already accepted by
-				// submit_ability() and already had its cmdicon (233) mapped --
-				// only the button was missing, so there was no way to issue it.
-				// The original shows it only while the worker is carrying, which
-				// is also the only time the engine does anything with it.
+				if (r.size() < 9) r.push_back({ability_armed_order == (int)Orders::Harvest1 ? "GATHER!" : "GATHER",
+					cardact_ability_target, (int)Orders::Harvest1});
+				// Return Cargo only while carrying, as in the original.
 				if (u->carrying_flags & 3) {
 					if (r.size() < 9) r.push_back({"RETURN", cardact_ability, 30});
 				}
 				if (r.size() < 9) r.push_back({"BUILD", cardact_menu_build, 0});
 				if (r.size() < 9) r.push_back({"ADVANCED", cardact_menu_adv, 0});
 			}
+			if (game_st.oe_ext) {
+				a_vector<int> mods;
+				mod_buildings(mods);
+				if (!mods.empty() && r.size() < 9) r.push_back({"MODS", cardact_menu_mods, 0, true, ext_icon(mods[0])});
+			}
+			if (r.size() < 9) r.push_back({"HOLD", cardact_ability, 43});
+			if (r.size() < 9) r.push_back({ability_armed_order == (int)Orders::Patrol ? "PATROL!" : "PATROL",
+				cardact_ability_target, (int)Orders::Patrol});
 		}
 	}
 
@@ -17429,6 +18341,33 @@ struct ui_functions: ui_util_functions {
 			break;
 		case cardact_menu_adv:
 			card_menu = 2;
+			break;
+		case cardact_menu_mods:
+			card_menu = 3;
+			break;
+		case cardact_menu_abilities:
+			card_menu = 4;
+			break;
+		case cardact_ext_learn_menu:
+			card_menu = 5;
+			break;
+		case cardact_ext_cast:
+			if (submit_select_action()) {
+				game_action_writer w;
+				w.u8(211); w.u8(0); w.u8((uint8_t)b.arg);
+				w.u16(0); w.i16(0); w.i16(0);
+				submit_game_action(w);
+			}
+			attack_armed = false;
+			ability_armed_order = -1;
+			break;
+		case cardact_ext_learn:
+			if (submit_select_action()) {
+				game_action_writer w;
+				w.u8(211); w.u8(1); w.u8((uint8_t)b.arg);
+				submit_game_action(w);
+			}
+			card_menu = 4;
 			break;
 		case cardact_menu_back:
 			card_menu = 0;
@@ -17764,6 +18703,19 @@ struct ui_functions: ui_util_functions {
 				pos = screen_to_world(mx, my);
 			}
 			unit_t* target = on_minimap ? nullptr : select_get_unit_at(pos);
+			if (order_id >= ext_target_base) {
+				if (!submit_select_action()) return true;
+				game_action_writer w;
+				w.u8(211); w.u8(0); w.u8((uint8_t)(order_id - ext_target_base));
+				w.u16(target ? get_unit_id(target).raw_value : 0);
+				w.i16((int16_t)pos.x); w.i16((int16_t)pos.y);
+				submit_game_action(w);
+				return true;
+			}
+			if (order_id == (int)Orders::RallyPointTile) {
+				if (try_group_rally(pos, target)) return true;
+				if (target) order_id = (int)Orders::RallyPointUnit;
+			}
 			// SCBW2 smart-cast: route an energy spell to the single best-energy caster.
 			if (try_smart_cast(order_id, pos, target)) return true;
 			if (!submit_select_action()) return true;
@@ -17783,6 +18735,7 @@ struct ui_functions: ui_util_functions {
 
 #include "hud3.h"   // HUD v3, the touch HUD (members of this class; after the card types it uses)
 #include "kbm.h"    // keyboard + mouse play (members of this class)
+#include "gamepad.h" // game controller play (members of this class)
 
 	bool is_moving_minimap = false;
 	xy minimap_drag_pos = xy(-1, -1);
@@ -18037,7 +18990,9 @@ struct ui_functions: ui_util_functions {
 
 		if (wnd) {
 			native_window::event_t e;
-			while ((mouse_click_up_pending && (e = mouse_click_up, mouse_click_up_pending = false, true)) || wnd.peek_message(e)) {
+			pad_tick();
+			while ((mouse_click_up_pending && (e = mouse_click_up, mouse_click_up_pending = false, true)) || pad_next(e) || wnd.peek_message(e)) {
+				if (pad_event(e)) continue;
 				if (e.type == native_window::event_t::type_command_click) {
 					if (mouse_command_click(e.mouse_x, e.mouse_y)) continue;
 					mouse_click_up = e;
@@ -18540,7 +19495,10 @@ struct ui_functions: ui_util_functions {
 			// memset every frame was pure waste (Faze 7 perf: skip it).
 			if (indexed_presented) std::memset(data, 0, indexed_surface->pitch * screen_height);
 			prof_t0 = prof_clock::now();
-			if (!hd_terrain_active) draw_tiles(data, indexed_surface->pitch);
+			if (!hd_terrain_active) {
+				draw_tiles(data, indexed_surface->pitch);
+				if (space_map()) draw_parallax_sd(data, indexed_surface->pitch);
+			}
 			prof_add(0);
 			draw_sprites(data, indexed_surface->pitch);
 			prof_add(1);
@@ -18627,12 +19585,14 @@ struct ui_functions: ui_util_functions {
 			draw_hud_rgba(data, rgba_surface->pitch / 4);
 			draw_replay_hud(data, rgba_surface->pitch / 4); // the replay player: bar, production, panel (no-op unless replaying)
 			if (briefing_active) draw_briefing_rgba(data, rgba_surface->pitch / 4);
+			pad_draw_cursor(data, rgba_surface->pitch / 4);
 			loading_cover_first_frame(data, rgba_surface->pitch / 4); // first SP frame only: loading screen, not a map flash
 			prof_add(5);
 			rgba_surface->unlock();
 		}
 		prof_frame_done();
 		diag_frame_tick(); // DIAG bug-catcher: read-only per-frame detectors
+		script_error_tick();
 
 		if (wnd) {
 			wnd.set_bloom(hd_bloom); // Faze 7: GPU bloom (0 = off, default)
