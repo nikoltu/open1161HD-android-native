@@ -9,7 +9,7 @@
 
 <p align="center">
   <img alt="Platform: Android 7.0+" src="https://img.shields.io/badge/platform-Android%207.0%2B%20(arm64%20%7C%20x86__64)-3DDC84?logo=android&logoColor=white">
-  <img alt="Version 1.1.2" src="https://img.shields.io/badge/version-1.1.2-blue">
+  <img alt="Version 1.1.3" src="https://img.shields.io/badge/version-1.1.3-blue">
   <img alt="Licence: MIT (own code)" src="https://img.shields.io/badge/licence-MIT%20(own%20code)-orange">
   <img alt="Core: OpenBW 1.16.1" src="https://img.shields.io/badge/core-OpenBW%201.16.1-8a2be2">
   <img alt="Code: C++14/17, Java, GLSL" src="https://img.shields.io/badge/code-C%2B%2B14%2F17%20%7C%20Java%20%7C%20GLSL-lightgrey">
@@ -99,16 +99,16 @@ Legend: **Working** — used in the regular test runs or played on real devices 
 | Game | Full 1.16.1 simulation, triggers, campaign AI scripts | Working | Determinism gates on every change to the core |
 | Game | Save and load | Working | In game and from the launcher; free-text save names |
 | Game | Use Map Settings (UMS) maps | Working | Lobby slots, preplaced unit properties, Set Next Scenario, player colours (`COLR` / `CRGB`) |
-| Game | EUD maps | In progress | Deaths, resources, unit and `.dat` tables, images / sprites, button sets; eudplib-generated maps not yet |
-| Game | Mod heroes, abilities and scripts | Working | Hero levels, custom abilities and OEScript from mod packages |
+| Game | EUD maps | In progress | Deaths, resources, unit and `.dat` tables, images / sprites; command buttons the map adds work in every HUD (and replay correctly); eudplib-generated maps not yet |
+| Game | Mod heroes, abilities and scripts | Working | Hero levels, custom abilities with game command icons or own PNG icons, and OEScript from mod packages |
 | Graphics | SD, HD and HD2 tiers | Working | HD sprites, terrain, portraits, cinematics, cursors, space parallax |
-| Graphics | Remastered effects in HD2/HD | Working | Shadows, selection circles, creep edges, EMP, lights; animated water is optional and approximate |
+| Graphics | Remastered effects in HD2/HD | Working | Shadows, selection circles, creep edges, EMP, lights; animated water is on by default and approximate |
 | Graphics | GPU post-processing: sharpen, bloom, colour grade, shadows | Working | All optional, off by default |
 | Controls | Touch HUD, S Pen, pinch zoom | Working | Touch HUD (v3, default), HUD v2 and the classic panel |
 | Controls | Keyboard and mouse | Working | Classic hotkeys or a per-command key editor; game cursor with a real mouse |
-| Controls | Game controller | Working | Button mapping editor in the launcher |
+| Controls | Game controller | Working | Button mapping editor in the launcher; trigger chords for subgroups of a mixed selection |
 | Replays | Classic `.rep` and Remastered replays, timeline, speed | Working | Recording of own games included |
-| Multiplayer | LAN (FFA and teams), optional house rules | Working | Up to 8 players; commands validated; players' portraits |
+| Multiplayer | LAN (FFA and teams), optional house rules | Working | Up to 8 players; commands validated; players' portraits; the host's rules and mod set are announced in the lobby |
 | Multiplayer | Online multiplayer | Not planned | |
 
 <a id="requirements"></a>
@@ -210,7 +210,7 @@ reference data are not part of this repository.
 <a id="status-and-roadmap"></a>
 <img src=".github/strips/09-status-and-roadmap.png" width="100%" alt="Status and roadmap">
 
-Current version: **v1.1.2**
+Current version: **v1.1.3**
 
 - **Campaigns:** all six episodes can be played through, with briefings, cinematics, a mission end window and a score
   screen that continues to the next mission; campaign AI scripts follow 1.16.1 more closely (allies and enemies set by

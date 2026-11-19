@@ -82,6 +82,8 @@ struct ext_ability_def {
 	int range = 0, radius = 0;                     // tiles; range 0 = no limit
 	int duration = 0, cast_time = 0;               // seconds; milliseconds
 	int summon = -1, slot = 1;
+	a_string icon_png;    // "icon": a mod-relative .png path, drawn when it loads
+	int cmdicon = -1;     // unit\cmdbtns\cmdicons.grp frame ("icon": "cmdicon:N"); -1 = by effect
 	a_string hotkey;
 	a_string event;       // e_script: the signal it raises
 };

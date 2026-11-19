@@ -533,7 +533,7 @@ public class OpenBWActivity extends SDLActivity {
         // present); Bloom>0 or Grade>0 also forces the GL stage on. adb hooks override.
         { int glBloom = getIntent().getIntExtra("bloomStrength", dev.getInt("bloomLevel", 0));
           int glGrade = getIntent().getIntExtra("gradeStrength", dev.getInt("gradeLevel", 0));
-          boolean water = getIntent().getBooleanExtra("hdWater", dev.getBoolean("hdWater", false));
+          boolean water = getIntent().getBooleanExtra("hdWater", dev.getBoolean("hdWater", true));
           if (water) { args.add("--hd-water"); args.add("1"); }
           boolean pipeOn = dev.getBoolean("sharpenFilter", true) || getIntent().getBooleanExtra("postGl", false) || glBloom > 0 || glGrade > 0;
           if (pipeOn) {

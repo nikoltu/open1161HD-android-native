@@ -45,6 +45,8 @@ struct sync_state {
 	uint64_t host_mod_fp = 0;
 	uint64_t lobby_mod_fp = 0;
 	bool lobby_info_seen = false;
+	// Set by the hosting peer: both sides run on_new_client, only the host announces game_info.
+	bool lobby_host = false;
 	bool game_started = false;
 
 	struct uid_t {
@@ -516,6 +518,7 @@ struct sync_functions: action_functions {
 						sync_st.sync_frame = 0;
 						if (client->h) {
 							server.allow_send(client->h, true);
+							if (sync_st.lobby_host) send_game_info(client->h);
 						}
 
 						sync_st.clients.sort([&](auto& a, auto& b) {
@@ -677,20 +680,10 @@ struct sync_functions: action_functions {
 			client->scheduled_actions.clear();
 		}
 
+		// Rules only, no client list: the slot snapshot would overwrite slots the joiner is still negotiating (measured: split lobbies).
 		void send_game_info(const void* h) {
 			dynamic_writer<> w(0x100);
 			w.put<uint8_t>(sync_messages::id_game_info);
-			for (sync_state::client_t* c : ptr(sync_st.clients)) {
-				if (c->uid == sync_state::uid_t{}) continue;
-				w.put<uint8_t>(1);
-				for (auto& v : c->uid.vals) w.put<uint32_t>(v);
-				w.put<int8_t>(c->player_slot);
-				if (c->player_slot == -1) w.put<int8_t>(-1);
-				else w.put<int8_t>((int)st.players.at(c->player_slot).race);
-				size_t n = std::min(c->name.size(), (size_t)0x20);
-				w.put<uint8_t>(n);
-				for (size_t i = 0; i != n; ++i) w.put<uint8_t>((uint8_t)*(c->name.data() + i));
-			}
 			w.put<uint8_t>(0);
 			w.put<uint32_t>(sync_st.host_qol); // P4: lobby badge on the joiner (after the 0 terminator)
 			if (sync_st.host_mod_fp) {

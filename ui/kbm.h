@@ -188,7 +188,7 @@
 			if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
 			return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ? c : 0;
 		}
-		const int t = kbm_button_tbl(b.action, b.arg, b.icon);
+		const int t = b.tbl > 0 ? b.tbl : kbm_button_tbl(b.action, b.arg, b.icon);
 		if (!t) return 0;
 		load_unit_names();
 		if (!unit_names_ok) return 0;
@@ -203,9 +203,30 @@
 	int kbm_card_code(const card_button_t& b, int i) {
 		if (b.action == cardact_none) return -1;
 		if (!kbm_classic) return i >= 0 && i <= 8 ? kbm_bind[kb_card0 + i] : -1;
+		if (eud_card_shown && !eud_key_busy && i >= 0 && i <= 8) {
+			static_vector<card_button_t, 9> c;
+			card_buttons(c);
+			eud_key_busy = true;
+			const int mine = kbm_card_code(b, i);
+			bool dup = false;
+			std::set<int> used;
+			for (int j = 0; j < (int)c.size(); ++j) if (j != i) used.insert(kbm_card_code(c[(size_t)j], j));
+			for (int j = 0; j < i && j < (int)c.size(); ++j) dup = dup || kbm_card_code(c[(size_t)j], j) == mine;
+			eud_key_busy = false;
+			if (!dup) return mine;
+			// a repeated letter moves to the first free letter of its label, then of the alphabet
+			std::string cand = b.label ? b.label : "";
+			cand += "abcdefghijklmnopqrstuvwxyz";
+			for (char ch : cand) {
+				const int lc = tolower((unsigned char)ch);
+				if (lc < 'a' || lc > 'z') continue;
+				if (!used.count(4 + (lc - 'a'))) return 4 + (lc - 'a');
+			}
+			return -1;
+		}
 		if (b.action == cardact_cancel || b.action == cardact_menu_back || b.action == cardact_place_cancel) return kbm_bind[kb_cancel];
 		if (!kbm_cmd_keys.empty()) {
-			auto it = kbm_cmd_keys.find(kbm_button_tbl(b.action, b.arg, b.icon));
+			auto it = kbm_cmd_keys.find(b.tbl > 0 ? b.tbl : kbm_button_tbl(b.action, b.arg, b.icon));
 			if (it != kbm_cmd_keys.end()) return it->second;
 		}
 		const int c = kbm_button_hotkey(b);

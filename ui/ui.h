@@ -19,6 +19,7 @@
 #include "vp9_inter_pixels.h"
 #include "diag.h"   // in-engine bug-catcher (DIAG); read-only, runtime-gated
 #include "kbm_defaults.h"
+#include "oe_extensions.h" // mod ability icon syntax and the modicon self-test registry
 #include "classic_objectives.h" // G12: Campaign Studio objective state (read-only)
 
 #include <thread>
@@ -4394,19 +4395,35 @@ struct ui_functions: ui_util_functions {
 		}
 	}
 
+	// Command-card icon ids from here up are mod ability PNGs: ext_png_icon_base + ability index.
+	static constexpr int ext_png_icon_base = 1000;
+	ddsgrp::frame_t load_ext_png_icon(int ability) {
+		ddsgrp::frame_t f;
+		if ((size_t)ability >= game_st.ext_abilities.size() || !load_data_file) return f;
+		const a_string& path = game_st.ext_abilities[(size_t)ability].icon_png;
+		if (path.empty() || (data_file_exists && !data_file_exists(path))) return f;
+		try {
+			a_vector<uint8_t> bytes;
+			load_data_file(bytes, path);
+			f = ddsgrp::load_png_memory(bytes.data(), bytes.size());
+		} catch (...) {}
+		return f;
+	}
 	ddsgrp::frame_t* get_icon_override(int frame_index) {
-		if (icons_png_dir.empty() && hd_ui_dir.empty() && !hd_casc) return nullptr;
+		const bool ext_png = frame_index >= ext_png_icon_base;
+		if (!ext_png && icons_png_dir.empty() && hd_ui_dir.empty() && !hd_casc) return nullptr;
 		auto it = icon_override_cache.find(frame_index);
 		if (it == icon_override_cache.end()) {
 			int bw = cmdicons_ok ? (int)cmdicons_grp.width : 36;
 			int bh = cmdicons_ok ? (int)cmdicons_grp.height : 34;
 			ddsgrp::frame_t f;
-			if (!icons_png_dir.empty()) {
+			if (ext_png) f = load_ext_png_icon(frame_index - ext_png_icon_base);
+			if (!ext_png && !icons_png_dir.empty()) {
 				char buf[32];
 				std::snprintf(buf, sizeof(buf), "/%03d.png", frame_index);
 				f = ddsgrp::load_png((icons_png_dir + buf).c_str());
 			}
-			if (!f.w && (!hd_ui_dir.empty() || hd_casc)) {
+			if (!ext_png && !f.w && (!hd_ui_dir.empty() || hd_casc)) {
 				if (!hd_cmdicons_dds_tried) {
 					hd_cmdicons_dds_tried = true;
 					if (!hd_ui_dir.empty()) {
@@ -9356,7 +9373,7 @@ struct ui_functions: ui_util_functions {
 				+ (ghost ? "" : " ghost") + ")"), "\"scenario\":\"" + name + "\"");
 			return;
 		}
-		if (name == "subgroup") {
+		if (name == "subgroup" || name == "subgroup_pad") {
 			// A mixed selection (Marines, Medics, a Ghost, an SCV) and one Tab: the card,
 			// portrait and grid highlight move to the next subgroup.
 			const int p = game_local_player;
@@ -9369,12 +9386,19 @@ struct ui_functions: ui_util_functions {
 				++i;
 			}
 			submit_select_action();
-			cycle_subgroup(1);
+			if (name == "subgroup_pad") {
+				// LT held + LB, as a controller sends them; LT stays down so the card legend shows.
+				pad_enabled = true;
+				pad_wake();
+				pad_lt_down = pad_trig_map[0] == ptrig_card;
+				pad_button(pad_l1, true);
+				pad_button(pad_l1, false);
+			} else cycle_subgroup(1);
 			center_camera_on(c);
 			const unit_type_t* a = active_subgroup();
 			bwgame::diag::emit((long)st.current_frame, "selftest", bwgame::diag::Sev::info, "SELFTEST_SETUP",
 				"subgroup: " + std::to_string(selection_subgroups().size()) + " subgroups, active type "
-				+ std::to_string(a ? (int)a->id : -1), "\"scenario\":\"subgroup\"");
+				+ std::to_string(a ? (int)a->id : -1), "\"scenario\":\"" + name + "\"");
 			return;
 		}
 		if (name == "savename") {
@@ -9386,6 +9410,63 @@ struct ui_functions: ui_util_functions {
 			if (wnd) wnd.stop_text_input();   // keep the field above the soft keyboard visible
 			bwgame::diag::emit((long)st.current_frame, "selftest", bwgame::diag::Sev::info, "SELFTEST_SETUP",
 				"savename prompt open", "\"scenario\":\"savename\"");
+			return;
+		}
+		if (name == "modicon") {
+			// A hero with six Extended abilities, loaded through the real registry: four icons by "cmdicon:N"
+			// (incl. the last frame), one out of range and one missing file (both fall back by effect), one PNG. Opens the
+			// abilities page for a screenshot; MODICON_OK / MODICON_FAIL compares what the card resolves.
+			static const char* js = "{\"format\":1,\"mod\":\"icontest\",\"definitions\":["
+				"{\"id\":\"icontest:ability:a\",\"kind\":\"ability\",\"name\":\"Lockdown\",\"icon\":\"cmdicon:240\"},"
+				"{\"id\":\"icontest:ability:b\",\"kind\":\"ability\",\"name\":\"Storm\",\"icon\":\"cmdicon:275\"},"
+				"{\"id\":\"icontest:ability:c\",\"kind\":\"ability\",\"name\":\"Yamato\",\"icon\":\"cmdicon:251\"},"
+				"{\"id\":\"icontest:ability:d\",\"kind\":\"ability\",\"name\":\"Last frame\",\"icon\":\"cmdicon:389\"},"
+				"{\"id\":\"icontest:ability:e\",\"kind\":\"ability\",\"name\":\"Out of range\",\"effect\":4,\"icon\":\"cmdicon:390\"},"
+				"{\"id\":\"icontest:ability:f\",\"kind\":\"ability\",\"name\":\"File path\",\"effect\":5,\"icon\":\"icons/f.png\"},"
+				"{\"id\":\"icontest:ability:g\",\"kind\":\"ability\",\"name\":\"PNG\",\"icon\":\"modicon/test.png\"},"
+				"{\"id\":\"icontest:hero:h\",\"kind\":\"hero\",\"name\":\"Tester\",\"unit\":\"base:0\",\"abilities\":["
+				"\"icontest:ability:a\",\"icontest:ability:b\",\"icontest:ability:c\",\"icontest:ability:d\",\"icontest:ability:e\",\"icontest:ability:f\",\"icontest:ability:g\"]}]}";
+			oeext::registry reg;
+			oeext::add_file(reg, "icontest", js, strlen(js));
+			oeext::finish(reg);
+			if (!reg.errors.empty()) {
+				bwgame::diag::emit((long)st.current_frame, "selftest", bwgame::diag::Sev::error, "MODICON_FAIL", "registry: " + reg.errors.front(), "");
+				return;
+			}
+			oeext::to_engine_abilities<ext_ability_def>(reg, const_cast<a_vector<ext_ability_def>&>(game_st.ext_abilities));
+			oeext::to_engine_heroes<ext_hero_def>(reg, const_cast<a_vector<ext_hero_def>&>(game_st.ext_heroes));
+			// diag-only: replaces the loaders and hero state; never in a saved or recorded game
+			// ability g's PNG is served from memory (the test file is not in the APK)
+			static const uint8_t png[] = {0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0x00,0x00,0x00,0x0d,0x49,0x48,0x44,0x52,0x00,0x00,0x00,0x10,0x00,0x00,0x00,0x10,0x08,0x06,0x00,0x00,0x00,0x1f,0xf3,0xff,0x61,0x00,0x00,0x00,0x70,0x49,0x44,0x41,0x54,0x78,0xda,0xa5,0x93,0x3b,0x0e,0xc0,0x20,0x0c,0x43,0x83,0xd5,0x3b,0x95,0xfb,0x4f,0xf4,0x54,0x74,0xa8,0xa8,0x28,0x75,0x3e,0x28,0x96,0x58,0x82,0x5f,0x42,0x24,0x23,0x92,0x54,0xd1,0x2e,0x7a,0x93,0xfe,0x31,0x56,0xee,0x2d,0x1e,0xf8,0x03,0x96,0x46,0xd8,0x81,0x99,0x07,0x3b,0x30,0xf3,0xc2,0x32,0x5e,0xf5,0x39,0x96,0xa0,0x4d,0x9f,0x41,0xd6,0x64,0x30,0xd0,0x26,0x47,0x6a,0xee,0x0a,0x11,0xd1,0x06,0x67,0x8b,0xd5,0xde,0x06,0x2c,0x24,0x33,0xc0,0xe0,0xc1,0x1c,0xd6,0xf3,0xb4,0xa9,0x74,0x05,0x2d,0xaa,0x5e,0x1a,0x11,0xc9,0xbb,0xe5,0x49,0x7f,0xa6,0xb4,0x6e,0x48,0x28,0x26,0x1d,0xbf,0x34,0x7e,0x7d,0x00,0x00,0x00,0x00,0x49,0x45,0x4e,0x44,0xae,0x42,0x60,0x82};
+			auto inner_load = load_data_file;
+			load_data_file = [inner_load](a_vector<uint8_t>& v, a_string fn) {
+				if (fn == "modicon/test.png") v.assign(png, png + sizeof png);
+				else inner_load(v, std::move(fn));
+			};
+			auto inner_exists = data_file_exists;
+			data_file_exists = [inner_exists](a_string fn) { return fn == "modicon/test.png" || (inner_exists && inner_exists(fn)); };
+			unit_t* u = trigger_create_unit(get_unit_type(UnitTypes::Terran_Marine), start + xy(0, 160), game_local_player);
+			if (!u) return;
+			u->hero = 0;
+			current_selection_add(u);
+			center_camera_on(start + xy(0, 160));
+			card_menu = 4;
+			static_vector<card_button_t, 9> b;
+			card_buttons(b);
+			static const int want[7] = {240, 275, 251, 389, 280, 277, ext_png_icon_base + 6};
+			std::string got;
+			int n = 0;
+			bool ok = true;
+			for (auto& x : b) {
+				if (x.action != cardact_ability_target && x.action != cardact_ext_cast) continue;
+				int ic = button_icon(x);
+				got += (got.empty() ? "" : ",") + std::to_string(ic);
+				ok = ok && n < 7 && ic == want[n];
+				++n;
+			}
+			ok = ok && n == 7;
+			bwgame::diag::emit((long)st.current_frame, "selftest", ok ? bwgame::diag::Sev::info : bwgame::diag::Sev::error,
+				ok ? "MODICON_OK" : "MODICON_FAIL", "ability icons " + got + " (want 240,275,251,389,280,277,1006)", "\"scenario\":\"modicon\"");
 			return;
 		}
 		if (name == "smartcast") {
@@ -12922,6 +13003,7 @@ struct ui_functions: ui_util_functions {
 		if (!skip_str() || !skip_str()) return false;          // map_name, args
 		if (engine != save_engine_version || map_id != save_map_id) return false;
 		auto lr = savegame::load(st, action_st, buf.data() + off, buf.size() - off, save_engine_version, save_map_id);
+		eud_set_last = ~0u;   // re-announce the card's Current Button Set over the loaded value
 		return lr == savegame::load_result::ok;
 	}
 
@@ -16414,6 +16496,10 @@ struct ui_functions: ui_util_functions {
 		}
 		default: break;
 		}
+		if (!b.available && b.hint && !l3[0]) {
+			nm = eud_btn_text(b.hint);
+			snprintf(l3, sizeof l3, "%s", nm.c_str());
+		}
 		const int kcode = kbm_mode ? kbm_card_code(b, card_hover_index) : -1;
 		if (kcode >= 0) { char k[8]; kbm_key_name(kcode, k, sizeof k); snprintf(l0, sizeof l0, "%s  [%s]", name, k); }
 		else snprintf(l0, sizeof l0, "%s", name);
@@ -17616,6 +17702,8 @@ struct ui_functions: ui_util_functions {
 		// separate concern (buttons stay lit but their cost text can go red).
 		bool available = true;
 		int icon = -1; // explicit cmdicons frame when action+arg alone is ambiguous
+		int tbl = 0;   // stat_txt string of the button (a map-written set), 0 = the action's own
+		int hint = 0;  // stat_txt string explaining a disabled button
 	};
 	int button_icon(const card_button_t& b) {
 		return b.icon >= 0 ? b.icon : card_icon_frame(b.action, b.arg);
@@ -17639,7 +17727,8 @@ struct ui_functions: ui_util_functions {
 		cardact_menu_abilities, // GE5: the unit's Extended abilities (card_menu 4)
 		cardact_ext_cast,       // arg = ability index; no target
 		cardact_ext_learn_menu, // the hero's learn page (card_menu 5)
-		cardact_ext_learn       // arg = ability index
+		cardact_ext_learn,      // arg = ability index
+		cardact_eud             // a map-written button set's own action (eudbtn.h), arg = index in eud_acts
 	};
 	// GE5: an armed targeted Extended ability is ability_armed_order = ext_target_base + ability index.
 	static constexpr int ext_target_base = 1000;
@@ -17795,42 +17884,6 @@ struct ui_functions: ui_util_functions {
 		v = (uint32_t)x[o] | (uint32_t)x[o + 1] << 8 | (uint32_t)x[o + 2] << 16 | (uint32_t)x[o + 3] << 24;
 		return true;
 	}
-	// EUD maps rewrite button sets (count / array pointer) to trim the command card. Only the
-	// buttons whose icon is among the set's first `count` entries stay; nothing is added.
-	void apply_eud_button_set(static_vector<card_button_t, 9>& r) {
-		if (!game_st.eud_triggers || card_menu != 0 || placing_type) return;
-		unit_t* u = focus_or_primary();
-		if (!u || !u_completed(u) || (size_t)u->unit_type->id >= 228) return;
-		const uint32_t a = eud::button_sets + 12 * (uint32_t)u->unit_type->id;
-		const bool wc = st.eud_deaths.count((a - eud::deaths_base) / 4u) != 0;
-		const bool wp = st.eud_deaths.count((a + 4 - eud::deaths_base) / 4u) != 0;
-		if (!wc && !wp) return;
-		uint32_t count = 0, arr = 0, exe_count = 0, exe_arr = 0;
-		if (!eud_ui_dword(a, count)) return;
-		if (count == 0) {
-			for (auto& b : r) b = {"", cardact_none, 0};
-			return;
-		}
-		if (!eud_ui_dword(a + 4, arr) || !arr) return;
-		const a_vector<uint8_t>& x = global_st.exe_buttons;
-		if (!x.empty()) {
-			size_t o = a - eud::buttons_base;
-			for (int k = 0; k != 4; ++k) exe_count |= (uint32_t)x[o + k] << (8 * k), exe_arr |= (uint32_t)x[o + 4 + k] << (8 * k);
-		}
-		count = std::min<uint32_t>(count, arr == exe_arr ? exe_count : 16);
-		uint16_t icons[16];
-		for (uint32_t k = 0; k != count; ++k) {
-			uint32_t w;
-			if (!eud_ui_dword(arr + 20 * k, w)) return;   // pos (low), icon (high)
-			icons[k] = (uint16_t)(w >> 16);
-		}
-		for (auto& b : r) {
-			if (b.action == cardact_none) continue;
-			int ic = button_icon(b);
-			if (std::find(icons, icons + count, (uint16_t)ic) == icons + count) b = {"", cardact_none, 0};
-		}
-	}
-
 	// GE5: Extended abilities. The ability of a card button, or -1.
 	int ext_card_ability(const card_button_t& b) const {
 		if (b.action == cardact_ext_cast || b.action == cardact_ext_learn) return b.arg;
@@ -17839,6 +17892,8 @@ struct ui_functions: ui_util_functions {
 	}
 	int ext_ability_icon(int ability) {
 		const ext_ability_def& d = game_st.ext_abilities[(size_t)ability];
+		if (d.cmdicon >= 0) return d.cmdicon;
+		if (!d.icon_png.empty() && get_icon_override(ext_png_icon_base + ability)) return ext_png_icon_base + ability;
 		switch (d.effect) {
 		case ext_ability_def::e_damage: return order_icon(Orders::CastPsionicStorm);
 		case ext_ability_def::e_heal: return 365;   // Medic Heal
@@ -18949,6 +19004,9 @@ struct ui_functions: ui_util_functions {
 				w.u8((uint8_t)b.arg);
 			});
 			break;
+		case cardact_eud:
+			eud_activate(b.arg);
+			break;
 		case cardact_cancel:
 			if (submit_select_action()) {
 				game_action_writer w;
@@ -19174,6 +19232,7 @@ struct ui_functions: ui_util_functions {
 
 #include "hud3.h"   // HUD v3, the touch HUD (members of this class; after the card types it uses)
 #include "kbm.h"    // keyboard + mouse play (members of this class)
+#include "eudbtn.h"  // map-written command card button sets (members of this class)
 #include "gamepad.h" // game controller play (members of this class)
 
 	bool is_moving_minimap = false;

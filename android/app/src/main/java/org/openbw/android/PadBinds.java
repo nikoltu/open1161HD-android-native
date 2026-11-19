@@ -23,7 +23,7 @@ final class PadBinds {
         "Nieko", "Žymėti (laikant — rėmelis)", "Komanda į žymeklio vietą", "Ataka", "Stop", "Į laisvą grupę",
         "Atšaukti", "Meniu", "Laisvas darbininkas", "Kita bazė", "Ankstesnė grupė (du kartus — kamera)",
         "Kita grupė (du kartus — kamera)", "Kamera į pažymėtus", "Visa armija", "Tikslus žymeklis (laikant)",
-        "Į paskutinį įspėjimą", "Priartinti", "Atitolinti",
+        "Į paskutinį įspėjimą", "Priartinti", "Atitolinti", "Kitas pogrupis", "Ankstesnis pogrupis",
     };
     static final int A_NONE = 0, A_SELECT = 1;
     // Native ptrig_* order.
@@ -106,7 +106,7 @@ final class PadBinds {
         head.setOrientation(LinearLayout.HORIZONTAL);
         head.setGravity(Gravity.CENTER_VERTICAL);
         head.setPadding(0, Keybinds.dp(act, 6), 0, Keybinds.dp(act, 6));
-        TextView hint = kit.text(S.t("Kairė lazdelė — žymeklis, dešinė — kamera (ar rato kryptis). Mygtuko veiksmą pasirink iš sąrašo."), Kit.TEXT2, 11);
+        TextView hint = kit.text(S.t("Kairė lazdelė — žymeklis, dešinė — kamera (ar rato kryptis). Mygtuko veiksmą pasirink iš sąrašo. Laikant kortelės gaiduką: LB / L3 — kitas / ankstesnis pogrupis."), Kit.TEXT2, 11);
         hint.setPadding(0, 0, Keybinds.dp(act, 12), 0);
         head.addView(hint, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         head.addView(kit.smallButton(S.t("Atstatyti visus"), () -> {

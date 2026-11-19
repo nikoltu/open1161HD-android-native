@@ -836,7 +836,7 @@ final class S {
         p("Kairysis gaidukas", "Left trigger");
         p("Dešinysis gaidukas", "Right trigger");
         p("Bent vienas mygtukas turi žymėti.", "At least one button must select.");
-        p("Kairė lazdelė — žymeklis, dešinė — kamera (ar rato kryptis). Mygtuko veiksmą pasirink iš sąrašo.", "Left stick: cursor, right stick: camera (or the wheel direction). Pick each button's action from the list.");
+        p("Kairė lazdelė — žymeklis, dešinė — kamera (ar rato kryptis). Mygtuko veiksmą pasirink iš sąrašo. Laikant kortelės gaiduką: LB / L3 — kitas / ankstesnis pogrupis.", "Left stick: cursor, right stick: camera (or the wheel direction). Pick each button's action from the list. Holding the card trigger: LB / L3 = next / previous subgroup.");
         p("Pulto mygtukai atstatyti.", "Controller buttons reset.");
         p("Mygtukai", "Buttons");
         p("Kryžmė, meniu ir gaidukai", "D-pad, menu and triggers");
@@ -911,6 +911,7 @@ final class S {
         p("Priartinti", "Zoom in");
         p("Atitolinti", "Zoom out");
         p("Kitas pogrupis", "Next subgroup");
+        p("Ankstesnis pogrupis", "Previous subgroup");
         p("Grupė", "Group");
         p("Kameros vieta", "Camera location");
         p("Kairysis pelės", "Left mouse");

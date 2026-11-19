@@ -5086,7 +5086,7 @@ public class SetupActivity extends Activity {
                 S.t("Kontrastas, sodrumas, šiluma. 0 = išjungta."), "gradeLevel", 0, 100);
         if (scr)
             setSwitch(gfx, S.t("Animuotas vanduo"), "hdWater",
-                    S.t("Vanduo raibuliuoja ir blizga kaip SC:R. Tik HD2 ir FULL HD."), false);
+                    S.t("Vanduo raibuliuoja ir blizga kaip SC:R. Tik HD2 ir FULL HD."), true);
 
         // ---- Valdymas ----
         LinearLayout ctl = settingsSection(S.t("Valdymas"));

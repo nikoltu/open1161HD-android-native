@@ -226,6 +226,8 @@ struct replay_trailer_t {
 	std::array<uint32_t, 12> shared_vision{};
 	uint64_t mod_fp = 0;   // G10: "OBMD" after OBQL (0 = recorded without data mods)
 	a_string mods_csv;
+	// qol bit14: (frame, value) of every change of Current Button Set (0x68C14C), before OBMD
+	a_vector<std::pair<uint32_t, uint32_t>> eud_set_log;
 };
 template<typename base_reader_T, bool le>
 inline replay_trailer_t replay_read_qol_trailer(replay_file_reader<base_reader_T, le>& r) {
@@ -241,6 +243,14 @@ inline replay_trailer_t replay_read_qol_trailer(replay_file_reader<base_reader_T
 		for (size_t i = 0; i != 12; ++i) for (size_t j = 0; j != 12; ++j) t.alliances[i][j] = r.r.template get<uint8_t>();
 		for (size_t i = 0; i != 12; ++i) t.shared_vision[i] = r.r.template get<uint32_t>();
 		t.has_setup = true;
+	}
+	if ((bits >> 14) & 1 && r.r.left() >= 4) {
+		uint32_t n = r.r.template get<uint32_t>();
+		if (n <= (1u << 20) && r.r.left() >= (size_t)n * 8) for (uint32_t i = 0; i != n; ++i) {
+			uint32_t f = r.r.template get<uint32_t>();
+			uint32_t v = r.r.template get<uint32_t>();
+			t.eud_set_log.emplace_back(f, v);
+		}
 	}
 	if (r.r.left() >= 20 && r.r.template get<uint32_t>() == 0x444D424Fu && r.r.template get<uint32_t>() == 1) {
 		uint64_t lo = r.r.template get<uint32_t>();
@@ -277,6 +287,7 @@ struct replay_state {
 	std::array<uint32_t, 8> ai_script{};
 	uint64_t mod_fp = 0;   // G10: from the OBMD trailer
 	a_string mods_csv;
+	a_vector<std::pair<uint32_t, uint32_t>> eud_set_log;   // (frame, Current Button Set) from the trailer
 };
 
 struct replay_functions: action_functions {
@@ -427,6 +438,7 @@ struct replay_functions: action_functions {
 		replay_st.ai_script = trailer.ai_script;
 		replay_st.mod_fp = trailer.mod_fp;
 		replay_st.mods_csv = trailer.mods_csv;
+		replay_st.eud_set_log = trailer.eud_set_log;
 		// An OpenBW recording made before the version 2 trailer stored the engine's
 		// own 0-based force in the header (see the use-map-settings note below).
 		const bool own_old_recording = !trailer.has_setup && arr_str(game_name) == "OpenBW Android";
@@ -547,6 +559,11 @@ struct replay_functions: action_functions {
 	
 	void next_frame() {
 		if (st.current_frame == replay_st.end_frame) error("replay: attempt to play past end");
+		if (!replay_st.eud_set_log.empty()) {
+			// Current Button Set as the recording player's card showed it, applied where play wrote it
+			auto it = std::lower_bound(replay_st.eud_set_log.begin(), replay_st.eud_set_log.end(), std::make_pair((uint32_t)st.current_frame, 0u));
+			for (; it != replay_st.eud_set_log.end() && it->first == (uint32_t)st.current_frame; ++it) eud_write(0x68C14Cu, it->second, 0xffffu);
+		}
 		execute_actions(replay_st.actions_data_buffer.data(), replay_st.actions_data_buffer.data() + replay_st.actions_data_buffer.size());
 		state_functions::next_frame();
 	}

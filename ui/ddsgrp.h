@@ -169,10 +169,8 @@ static inline file_t load_file(const std::string& path) {
 }
 
 // PNG -> ARGB frame (user icon mods).
-static inline frame_t load_png(const std::string& path) {
+static inline frame_t png_to_frame(unsigned char* p, int w, int h) {
 	frame_t out;
-	int w = 0, h = 0, comp = 0;
-	unsigned char* p = stbi_load(path.c_str(), &w, &h, &comp, 4);
 	if (!p) return out;
 	out.w = w;
 	out.h = h;
@@ -183,6 +181,18 @@ static inline frame_t load_png(const std::string& path) {
 	}
 	stbi_image_free(p);
 	return out;
+}
+static inline frame_t load_png(const std::string& path) {
+	int w = 0, h = 0, comp = 0;
+	unsigned char* p = stbi_load(path.c_str(), &w, &h, &comp, 4);
+	return png_to_frame(p, w, h);
+}
+static inline frame_t load_png_memory(const uint8_t* data, size_t size) {
+	int w = 0, h = 0, comp = 0;
+	if (!data || size == 0 || size > (16u << 20)) return frame_t();
+	if (!stbi_info_from_memory(data, (int)size, &w, &h, &comp) || w <= 0 || h <= 0 || w > 512 || h > 512) return frame_t();
+	unsigned char* p = stbi_load_from_memory(data, (int)size, &w, &h, &comp, 4);
+	return png_to_frame(p, w, h);
 }
 
 // Area-average downscale/upscale to dw x dh (alpha-weighted like the anim

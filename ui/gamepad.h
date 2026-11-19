@@ -15,7 +15,7 @@
 	enum {
 		pact_none, pact_select, pact_command, pact_attack, pact_stop, pact_free_group, pact_cancel, pact_menu,
 		pact_idle_worker, pact_next_base, pact_group_prev, pact_group_next, pact_center, pact_army, pact_precise,
-		pact_alert, pact_zoom_in, pact_zoom_out, pact_count
+		pact_alert, pact_zoom_in, pact_zoom_out, pact_subgroup_next, pact_subgroup_prev, pact_count
 	};
 	enum { ptrig_none, ptrig_wheel, ptrig_card, ptrig_count };
 	std::array<uint8_t, pad_buttons> pad_map{{
@@ -227,6 +227,10 @@
 		hud3_wheel_motion(p.x, p.y);
 	}
 
+	void pad_cycle_subgroup(int dir) {
+		if (game_input && pause_screen == 0) cycle_subgroup(dir);
+	}
+
 	void pad_button(int b, bool down) {
 		using ev = native_window::event_t;
 		if (b < 0 || b >= pad_buttons) return;
@@ -239,8 +243,15 @@
 			pad_wheel = wheel_open;
 			return;
 		}
-		if (pad_card_mode()) {
+		// A Select press that started before the card trigger still needs its release (else pad_a_down sticks).
+		if (pad_card_mode() && !(!down && act == pact_select && pad_a_down)) {
 			const int slot = pad_card_slot(b);
+			// LT held: LB / L3 are the built-in Tab / Shift+Tab (mixed-selection subgroups).
+			if (slot < 0 && (b == pad_l1 || b == pad_l3)) {
+				if (down) pad_cycle_subgroup(b == pad_l1 ? 1 : -1);
+				pad_held[(size_t)b] = false;   // the chord must not also hold L3's precise-cursor action
+				return;
+			}
 			if (slot >= 0) {
 				if (down) {
 					static_vector<card_button_t, 9> buttons;
@@ -294,6 +305,8 @@
 		case pact_alert: if (play) kbm_action(kb_alert); break;
 		case pact_zoom_in: kbm_action(kb_zoom_in); break;
 		case pact_zoom_out: kbm_action(kb_zoom_out); break;
+		case pact_subgroup_next: pad_cycle_subgroup(1); break;
+		case pact_subgroup_prev: pad_cycle_subgroup(-1); break;
 		default: break;
 		}
 	}
@@ -582,5 +595,20 @@
 				for (int x = std::max(0, bx); x < std::min((int)screen_width, bx + bw); ++x)
 					data[(size_t)y * pitch + (size_t)x] = (y == by || y == by + bh - 1 || x == bx || x == bx + bw - 1) ? 0xff4fd46au : 0xff05080au;
 			draw_text_rgba(data, pitch, bx + ts, by + ts, t, 0xffffffffu, ts);
+		}
+		if (selection_subgroups().size() >= 2 && !buttons.empty()) {
+			const char* t = "LB/L3: subgroup";
+			const int hs = ts > 1 ? ts - 1 : 1;
+			int top = screen_height, right = 0;
+			for (int i = 0; i < (int)buttons.size(); ++i) {
+				const rect r = card_button_rect(i);
+				top = std::min(top, r.from.y); right = std::max(right, r.to.x);
+			}
+			const int tw = (int)strlen(t) * (ui::unispace_w + 1) * hs, th = ui::unispace_h * hs;
+			const int bh = th + 2 * hs, bw = tw + 2 * hs, by = std::max(0, top - bh - hs), bx = std::max(0, std::min(right - bw, (int)screen_width - bw - 2));
+			for (int y = by; y < std::min((int)screen_height, by + bh); ++y)
+				for (int x = bx; x < std::min((int)screen_width, bx + bw); ++x)
+					data[(size_t)y * pitch + (size_t)x] = (y == by || y == by + bh - 1 || x == bx || x == bx + bw - 1) ? 0xff4fd46au : 0xff05080au;
+			draw_text_rgba(data, pitch, bx + hs, by + hs, t, 0xffffffffu, hs);
 		}
 	}

@@ -28,6 +28,26 @@ inline int kind_of(const std::string& s) {
 	return -1;
 }
 
+constexpr int cmdicon_frames = 390; // unit\cmdbtns\cmdicons.grp of 1.16.1 (HD cmdicons.dds.grp is indexed alike)
+// An ability's "icon" of the form "cmdicon:<frame>": the frame, or -1 (any other text, a file path, out of range).
+inline int parse_cmdicon(const std::string& s) {
+	if (s.compare(0, 8, "cmdicon:") != 0 || s.size() == 8 || s.size() > 11) return -1;
+	int n = 0;
+	for (size_t i = 8; i != s.size(); ++i) {
+		if (s[i] < '0' || s[i] > '9') return -1;
+		n = n * 10 + (s[i] - '0');
+	}
+	return n < cmdicon_frames ? n : -1;
+}
+
+// A safe mod-relative path to a .png (the field check already refused "..", absolute paths).
+inline bool is_png_path(const std::string& s) {
+	if (s.size() < 5 || s.size() > 200) return false;
+	std::string e = s.substr(s.size() - 4);
+	for (auto& c : e) c = (char)tolower((unsigned char)c);
+	return e == ".png" && s.compare(0, 8, "cmdicon:") != 0 && s.find(':') == std::string::npos;
+}
+
 enum ftype { f_int, f_text, f_bool, f_choice, f_base_unit, f_weapon, f_ref, f_refs, f_ints, f_asset };
 struct field {
 	const char* key;
@@ -375,6 +395,8 @@ void to_engine_abilities(const registry& r, Vec& out) {
 		std::string summon = d.str("summon");
 		e.summon = summon.empty() ? -1 : r.unit_type(summon);
 		e.slot = (int)d.num("slot", 1);
+		e.cmdicon = parse_cmdicon(d.str("icon"));
+		if (e.cmdicon < 0 && is_png_path(d.str("icon"))) e.icon_png = d.str("icon").c_str();
 		e.hotkey = d.str("hotkey").c_str();
 		e.event = d.str("script").c_str();
 		out.push_back(std::move(e));

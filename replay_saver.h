@@ -550,6 +550,7 @@ struct replay_saver_state {
 	// G10: game-data fingerprint of the active mods and their ids (0 = no data mods).
 	uint64_t mod_fp = 0;
 	a_string mods_csv;
+	a_vector<std::pair<uint32_t, uint32_t>> eud_set_log;   // (frame, 0x68C14C) changes; qol bit14 + a trailer section
 	std::array<uint32_t, 8> ai_script{};
 	std::array<std::array<uint8_t, 12>, 12> alliances{};
 	std::array<uint32_t, 12> shared_vision{};
@@ -699,14 +700,19 @@ struct replay_saver_functions {
 		// P5 trailer (raw, uncompressed, outside the crc/segment container):
 		// "OBQL" magic, version 1, qol bitmask. replay.h reads it back only when
 		// the bytes are there, so vanilla replays are untouched.
-		if (replay_saver_st.qol_bits || replay_saver_st.has_setup || replay_saver_st.mod_fp) {
+		const bool has_set_log = !replay_saver_st.eud_set_log.empty();
+		if (replay_saver_st.qol_bits || replay_saver_st.has_setup || replay_saver_st.mod_fp || has_set_log) {
 			w.template put<uint32_t>(0x4C51424Fu); // 'O','B','Q','L' little-endian
 			w.template put<uint32_t>(replay_saver_st.has_setup ? 2 : 1);
-			w.template put<uint32_t>(replay_saver_st.qol_bits);
+			w.template put<uint32_t>(replay_saver_st.qol_bits | (has_set_log ? 16384u : 0u));
 			if (replay_saver_st.has_setup) {
 				for (size_t i = 0; i != 8; ++i) w.template put<uint32_t>(replay_saver_st.ai_script[i]);
 				for (size_t i = 0; i != 12; ++i) for (size_t j = 0; j != 12; ++j) w.template put<uint8_t>(replay_saver_st.alliances[i][j]);
 				for (size_t i = 0; i != 12; ++i) w.template put<uint32_t>(replay_saver_st.shared_vision[i]);
+			}
+			if (has_set_log) {
+				w.template put<uint32_t>((uint32_t)replay_saver_st.eud_set_log.size());
+				for (auto& e : replay_saver_st.eud_set_log) { w.template put<uint32_t>(e.first); w.template put<uint32_t>(e.second); }
 			}
 			// G10: "OBMD", version 1, fingerprint (lo, hi), mod ids (u32 length + bytes).
 			if (replay_saver_st.mod_fp) {

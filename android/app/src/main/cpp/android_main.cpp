@@ -279,6 +279,7 @@ struct main_t {
 					// tapping player would, at the same pre-frame point as bot/touch
 					// input. No-op unless qol.auto_worker is set (SP only).
 					if (!net_next_frame && !ui.st.trigger_paused) ui.qol_auto_worker_tick();
+					if (!net_next_frame && !ui.st.trigger_paused) ui.eud_button_set_tick();
 					if (net_next_frame) net_next_frame();
 					else if (bwgame::diag::enabled() && (uint32_t)ui.st.current_frame > 300) {
 							// DIAG SIM_FRAME_SLOW (one-off PERF_HITCH pin): render/asset/memory are
@@ -1479,6 +1480,7 @@ extern "C" int main(int argc, char* argv[]) {
 			mod_loader(data, std::move(filename));
 		};
 		ui.data_file_exists = [&](a_string filename) {
+			std::lock_guard<std::mutex> lk(mpq_io_mtx);
 			return mod_loader.file_exists(filename);
 		};
 
@@ -2462,6 +2464,7 @@ extern "C" int main(int argc, char* argv[]) {
 			sync_st.host_qol = (uint32_t)qol_bits;
 			sync_st.local_req_hash = req_hash;   // the host turns qol bit12 on only if every peer's tables match
 			sync_st.host_mod_fp = net_host ? mod_fp : 0;
+			sync_st.lobby_host = net_host;
 			net.set_local_client_name(!player_name.empty() ? player_name : (net_host ? "host" : "guest"));
 			net.set_local_client_portrait(player_portrait);   // rides the uid handshake (render-only)
 			udp_responder discovery;
@@ -2958,6 +2961,7 @@ extern "C" int main(int argc, char* argv[]) {
 						| (q.trigger_pause ? 1024u : 0u) | 2048u   // bit11: game-second trigger timers
 						| (q.eud_requirements ? 4096u : 0u)
 						| (q.eud_local_player >= 0 && q.eud_local_player < 12 ? 8192u | ((uint32_t)q.eud_local_player << 16) : 0u);
+					replay_rs.eud_set_log = ui.eud_set_log;   // Current Button Set changes (trailer, qol bit14)
 				}
 				// An editor test keeps the player's LastGame.rep and writes its replay next to
 				// the trace instead, where the editor can read it (files/ is private to this app).
