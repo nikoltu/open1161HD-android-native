@@ -2,6 +2,7 @@
 #define NATIVE_WINDOW_H
 
 #include <memory>
+#include <cstdint>
 
 namespace native_window {
 	struct window_impl;
@@ -132,6 +133,20 @@ namespace native_window {
 		// SP shader pipeline: GLES2 present stage (off = classic). effect: -1 AUTO
 		// (sharpen on Adreno, identity elsewhere), 0 identity, 1 sharpen. strength 0..1.
 		void set_post_gl(bool on, int effect = -1, float strength = 0.35f, float bloom = 0.f, float grade = 0.f);
+		// HD water pre-pass in the GL present stage. The frame's alpha byte carries the water
+		// mask (255 - water); null p turns it off. water_ready(): the pass can run this frame.
+		struct water_params {
+			float origin_x = 0, origin_y = 0;   // map px at buffer (0, 0)
+			float ws = 1;                       // buffer px per map px
+			float game_x = 0, fade = 0, time = 0;
+			float tile1 = 1.f / 32, tile2 = 1.f / 128;  // normal_1 / normal_2 repeats per map px
+			const uint32_t* n1[2] = {nullptr, nullptr};  // normal_1 frames (ARGB), current + next
+			const uint32_t* n2[2] = {nullptr, nullptr};  // normal_2 (detail) frames
+			int n1_w = 0, n1_h = 0, n2_w = 0, n2_h = 0;
+			int n1_id[2] = {-1, -1}, n2_id[2] = {-1, -1}; // frame ids: re-upload only on change
+		};
+		void set_water(const water_params* p);
+		bool water_ready() const;
 		explicit operator bool() const;
 	};
 }

@@ -62,6 +62,10 @@ enum region_id : uint8_t {
 	// flingy.dat
 	r_f_sprite, r_f_top_speed, r_f_acceleration, r_f_halt_distance, r_f_turn_rate, r_f_unused,
 	r_f_movement,
+	// sprites.dat / images.dat
+	r_s_image, r_s_hp_bar, r_s_unknown, r_s_visible, r_s_sel_circle, r_s_sel_vpos,
+	r_i_grp, r_i_turns, r_i_clickable, r_i_full_iscript, r_i_draw_cloaked, r_i_draw_func,
+	r_i_remap, r_i_iscript,
 	// upgrades.dat / techdata.dat
 	r_up_mineral_base, r_up_mineral_factor, r_up_gas_base, r_up_gas_factor, r_up_time_base,
 	r_up_time_factor, r_up_max_level,
@@ -221,6 +225,20 @@ static const region regions[] = {
 	{0x006647B0, 1, 228, 0, r_u_has_shields, true},
 	{0x00664898, 1, 228, 0, r_u_return_idle, true},
 	{0x00664980, 2, 96, 106, r_u_infestation, true},
+	{0x00665AC0, 1, 387, 130, r_s_sel_circle, true},
+	{0x00665C48, 1, 517, 0, r_s_visible, true},
+	{0x00665E50, 1, 387, 130, r_s_hp_bar, true},
+	{0x00665FD8, 1, 387, 130, r_s_sel_vpos, true},
+	{0x00666160, 2, 517, 0, r_s_image, true},
+	{0x00666570, 1, 517, 0, r_s_unknown, true},
+	{0x00667718, 1, 999, 0, r_i_draw_cloaked, true},
+	{0x00668AA0, 4, 999, 0, r_i_grp, true},   // read-only: the exe reads it only while loading
+	{0x00669A40, 1, 999, 0, r_i_remap, true},   // the exe's .dat load table: remapping here, drawing function at 0x669E28
+	{0x00669E28, 1, 999, 0, r_i_draw_func, true},
+	{0x0066C150, 1, 999, 0, r_i_clickable, true},
+	{0x0066D4D8, 1, 999, 0, r_i_full_iscript, true},
+	{0x0066E860, 1, 999, 0, r_i_turns, true},
+	{0x0066EC48, 4, 999, 0, r_i_iscript, true},
 	{0x006C9858, 1, 209, 0, r_f_movement, true},
 	{0x006C9930, 4, 209, 0, r_f_halt_distance, true},
 	{0x006C9C78, 2, 209, 0, r_f_acceleration, true},
@@ -234,6 +252,12 @@ static const region regions[] = {
 
 // Where the emulated STR section lives (1.16.1 has it on the heap; maps read 0x5993D4).
 const uint32_t str_base = 0x10000000;
+
+// Button arrays (20 bytes each: pos, icon, ...) and the button-set table (250 x {count,
+// array, ?}) of the 1.16.1 exe; maps that rewrite them change the command card (UI only).
+const uint32_t buttons_base = 0x00515BE8;
+const uint32_t button_sets = 0x005187E8;
+const uint32_t buttons_end = button_sets + 12 * 250;
 
 inline const region* find_region(uint32_t addr) {
 	size_t lo = 0, hi = sizeof(regions) / sizeof(regions[0]);

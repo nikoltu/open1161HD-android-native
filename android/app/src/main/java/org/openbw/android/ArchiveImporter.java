@@ -431,8 +431,8 @@ final class ArchiveImporter {
             File part = t.getValue();
             File fin = p.mpqFinal.get(part.getPath());
             if (fin == null) continue;
-            if (fin.exists() && !fin.delete()) throw new IOException(S.t("nepavyko perrašyti ") + fin.getName());
-            if (!part.renameTo(fin)) throw new IOException(S.t("nepavyko pervadinti ") + part.getName());
+            if (fin.exists() && !fin.delete()) throw new IOException(S.f("nepavyko perrašyti %s", fin.getName()));
+            if (!part.renameTo(fin)) throw new IOException(S.f("nepavyko pervadinti %s", part.getName()));
             res.mpqs.add(fin);
         }
         if (p.cascStage != null && p.cascStage.isDirectory()) {
@@ -443,7 +443,7 @@ final class ArchiveImporter {
                 return;
             }
             deleteTree(p.cascFinal);
-            if (!p.cascStage.renameTo(p.cascFinal)) throw new IOException(S.t("nepavyko pervadinti ") + p.cascStage.getName());
+            if (!p.cascStage.renameTo(p.cascFinal)) throw new IOException(S.f("nepavyko pervadinti %s", p.cascStage.getName()));
             res.cascDir = p.cascFinal.getAbsolutePath();
         }
     }
@@ -547,8 +547,7 @@ final class ArchiveImporter {
         long free;
         try { free = new StatFs(filesDir.getPath()).getAvailableBytes(); } catch (Exception e) { return true; }
         if (need + SPACE_MARGIN <= free) return true;
-        res.warnings.add(label + ": " + S.t("nepakanka vietos: reikia ") + mb(need + SPACE_MARGIN)
-                + S.t(", laisva ") + mb(free) + ".");
+        res.warnings.add(label + ": " + S.f("nepakanka vietos: reikia %s, laisva %s.", mb(need + SPACE_MARGIN), mb(free)));
         return false;
     }
 

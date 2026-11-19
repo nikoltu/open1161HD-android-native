@@ -61,8 +61,9 @@ struct tileset_image_data {
 };
 
 struct image_data {
-	std::array<std::array<uint8_t, 8>, 16> player_unit_colors;
-	std::array<uint8_t, 16> player_minimap_colors;
+	// 16 tunit.pcx rows, then 8 rows for CRGB custom colours (colour 16 + slot).
+	std::array<std::array<uint8_t, 8>, 24> player_unit_colors;
+	std::array<uint8_t, 24> player_minimap_colors;
 	std::array<uint8_t, 24> selection_colors;
 	std::array<uint8_t, 24> hp_bar_colors;
 	std::array<int, 0x100> creep_edge_frame_index{};
@@ -193,6 +194,10 @@ void load_image_data(image_data& img, load_data_file_F&& load_data_file) {
 	if (tminimap_pcx.width != 16 || tminimap_pcx.height != 1) error("tminimap.pcx dimensions are %dx%d (16x1 required)", tminimap_pcx.width, tminimap_pcx.height);
 	for (size_t i = 0; i != 16; ++i) {
 		img.player_minimap_colors[i] = tminimap_pcx.data[i];
+	}
+	for (size_t i = 16; i != 24; ++i) {
+		img.player_unit_colors[i] = img.player_unit_colors[i - 16];
+		img.player_minimap_colors[i] = img.player_minimap_colors[i - 16];
 	}
 	auto tselect_pcx = load_pcx_file("game/tselect.pcx");
 	if (tselect_pcx.width != 24 || tselect_pcx.height != 1) error("tselect.pcx dimensions are %dx%d (24x1 required)", tselect_pcx.width, tselect_pcx.height);
@@ -1848,12 +1853,11 @@ struct ui_functions: ui_util_functions {
 	a_string script_status() const {
 		if (!game_st.oescript.loaded) {
 			if (game_st.oescript.error.empty()) return a_string();
-			return a_string(L("Script error: ")) + game_st.oescript.error + L(" (the script does not run)");
+			return format(L("Script error: %s (the script does not run)"), game_st.oescript.error.c_str());
 		}
 		if (st.oes.faults <= 0) return a_string();
-		a_string r = a_string(L("Script error: ")) + st.oes.last_fault;
-		if (st.oes.faults > 1) r += format(L(" (%d errors)"), (int)st.oes.faults);
-		return r;
+		if (st.oes.faults > 1) return format(L("Script error: %s (%d errors)"), st.oes.last_fault.c_str(), (int)st.oes.faults);
+		return format(L("Script error: %s"), st.oes.last_fault.c_str());
 	}
 	void script_error_tick() {
 		bool show = false;
@@ -3249,7 +3253,7 @@ struct ui_functions: ui_util_functions {
 				return ptr[old_value];
 			};
 			draw_frame(frame, i_flag(image, image_t::flag_horizontally_flipped), dst, data_pitch, offset_x, offset_y, width, height, shadow);
-		} else if (image->modifier == 9) {
+		} else if (image->modifier == 9 && remap_ok(image)) {
 			draw_alpha(image->image_type->color_shift - 1, no_remap());
 		} else if (image->modifier == 12) {
 			if (temporary_warp_texture_buffer.size() < frame.size.x * frame.size.y) temporary_warp_texture_buffer.resize(frame.size.x * frame.size.y);
@@ -3271,6 +3275,11 @@ struct ui_functions: ui_util_functions {
 
 	a_vector<const unit_t*> current_selection_sprites_set = a_vector<const unit_t*>(2500);
 	a_vector<const sprite_t*> current_selection_sprites;
+
+	// An EUD map can set any remapping value (images.dat); out of range draws the image plain.
+	bool remap_ok(const image_t* image) const {
+		return (size_t)(image->image_type->color_shift - 1) < tileset_img.light_pcx.size();
+	}
 
 	void draw_selection_circle(const sprite_t* sprite, const unit_t* u, uint8_t* data, size_t data_pitch) {
 		auto* image_type = get_image_type((ImageTypes)((int)ImageTypes::IMAGEID_Selection_Circle_22pixels + sprite->sprite_type->selection_circle));
@@ -3521,10 +3530,10 @@ struct ui_functions: ui_util_functions {
 	}
 	void prof_frame_done() {
 		if (++prof_frames == 256) {
-			int64_t total = prof_us[0]+prof_us[1]+prof_us[2]+prof_us[3]+prof_us[4]+prof_us[5];
-			ui::log("prof us/frame: tiles %d sprites %d blit %d hd+queue %d fog %d hud %d | render %d fps %d\n",
+			int64_t total = prof_us[0]+prof_us[1]+prof_us[2]+prof_us[3]+prof_us[4]+prof_us[5]+prof_us[6];
+			ui::log("prof us/frame: tiles %d sprites %d blit %d hd+queue %d (terrain %d) fog %d hud %d | render %d fps %d\n",
 			    (int)(prof_us[0] / 256), (int)(prof_us[1] / 256), (int)(prof_us[2] / 256),
-			    (int)(prof_us[3] / 256), (int)(prof_us[4] / 256), (int)(prof_us[5] / 256),
+			    (int)((prof_us[3] + prof_us[6]) / 256), (int)(prof_us[6] / 256), (int)(prof_us[4] / 256), (int)(prof_us[5] / 256),
 			    (int)(total / 256), fps_display);
 			prof_us = {};
 			prof_frames = 0;
@@ -3786,6 +3795,31 @@ struct ui_functions: ui_util_functions {
 	int hd_gl_bloom = 0;
 	// SE color-grade: subtle cinematic tone (0..100; 0 = neutral). Applied in the final GL pass.
 	int hd_grade = 0;
+	// HD water (settings, default off): the GL present stage animates the megatiles the
+	// tileset's .tmsk marks. The terrain pass writes 255 - mask into the frame's alpha byte;
+	// anything drawn over the water writes 0xff there and is left alone.
+	bool hd_water = false;
+	// Not measurable (SC:R's exe is packed), so approximated, and only here.
+	struct hd_water_approx {
+		static constexpr float tile1_px = 32;   // normal_1 repeats once per megatile
+		static constexpr float tile2_px = 128;  // normal_2 at native density (256 px at HD2)
+		static constexpr int fps = 12;          // normal frame rate
+		static constexpr double time_unit_s = 1; // water.glsl `time` is seconds
+	};
+	struct hd_water_t {
+		bool tried = false, ok = false;
+		std::vector<int16_t> frame;              // per megatile: mask frame, -1 = no water
+		ddsgrp::file_t mask, n1, n2;
+		std::unordered_map<int, std::vector<uint8_t>> mask_cache; // grey, scaled to the buffer tile
+		int mask_ts = 0;
+		std::vector<std::vector<uint32_t>> n1_frames;
+		std::vector<uint32_t> n2_cur[2];
+		int n2_id[2] = {-1, -1};
+		int n1_w = 0, n1_h = 0, n2_w = 0, n2_h = 0;
+		std::chrono::steady_clock::time_point t0;
+	};
+	hd_water_t hd_water_st;
+	bool hd_water_frame = false;   // marking the water mask this frame
 	// Faze 7: unit-shadow softness, 0..100 (settings slider). 0 = classic hard 50%
 	// black; higher lightens the shadow so terrain shows through more.
 	int hd_shadow_soft = 0;
@@ -4069,6 +4103,104 @@ struct ui_functions: ui_util_functions {
 		return &hd_tiles.cache[megatile].rgba; // just-inserted (frame==now) is protected from trim
 	}
 
+	void load_hd_water() {
+		hd_water_t& w = hd_water_st;
+		if (w.tried) return;
+		w.tried = true;
+		static const char* names[8] = {"badlands", "platform", "install", "ashworld", "jungle", "desert", "ice", "twilight"};
+		size_t ti = (size_t)game_st.tileset_index;
+		if (ti >= 8 || !load_hd_bytes) return;
+		std::vector<uint8_t> b;
+		a_string base = hd_casc_prefix + "tileset/" + names[ti];
+		if (!load_hd_bytes(base + ".tmsk", b) || b.size() < 8 || memcmp(b.data(), "KSMT", 4) != 0 || anim::detail::rd16(b.data() + 4) != 1) {
+			ui::log("hd water: no %s.tmsk\n", base.c_str());
+			return;
+		}
+		size_t n = anim::detail::rd16(b.data() + 6);
+		std::vector<uint8_t> mb, b1, b2;
+		if (!load_hd_bytes(base + "_mask.dds.grp", mb) || !load_hd_bytes(hd_casc_prefix + "effect/water_normal_1.dds.grp", b1)
+			|| !load_hd_bytes(hd_casc_prefix + "effect/water_normal_2.dds.grp", b2)) {
+			ui::log("hd water: missing mask / normal grp\n");
+			return;
+		}
+		w.mask = ddsgrp::parse(mb.data(), mb.size());
+		w.n1 = ddsgrp::parse(b1.data(), b1.size());
+		w.n2 = ddsgrp::parse(b2.data(), b2.size());
+		if (!w.mask.ok || !w.n1.ok || !w.n2.ok || !w.n1.frame_count() || !w.n2.frame_count()) return;
+		for (size_t i = 0; i != n && 8 + 4 * i + 4 <= b.size(); ++i) {
+			size_t key = anim::detail::rd16(b.data() + 8 + 4 * i);
+			int fr = anim::detail::rd16(b.data() + 10 + 4 * i);
+			if (fr >= (int)w.mask.frame_count()) continue;
+			if (key >= w.frame.size()) w.frame.resize(key + 1, -1);
+			w.frame[key] = (int16_t)fr;
+		}
+		for (size_t i = 0; i != w.n1.frame_count(); ++i) {
+			ddsgrp::frame_t f = w.n1.decode(i);
+			if (i == 0) { w.n1_w = f.w; w.n1_h = f.h; }
+			if (f.w != w.n1_w || f.h != w.n1_h || f.rgba.size() != (size_t)f.w * f.h) return;
+			w.n1_frames.push_back(std::move(f.rgba));
+		}
+		w.n1 = ddsgrp::file_t();
+		w.t0 = std::chrono::steady_clock::now();
+		w.ok = !w.frame.empty() && w.n1_w > 0;
+		ui::log("hd water: %s %d megatiles, %d mask / %d / %d normal frames\n", names[ti], (int)n,
+			(int)w.mask.frame_count(), (int)w.n1_frames.size(), (int)w.n2.frame_count());
+	}
+
+	const uint8_t* hd_water_mask(int fr, int ts) {
+		hd_water_t& w = hd_water_st;
+		if (w.mask_ts != ts) { w.mask_cache.clear(); w.mask_ts = ts; }
+		auto it = w.mask_cache.find(fr);
+		if (it == w.mask_cache.end()) {
+			std::vector<uint8_t> m;
+			ddsgrp::frame_t f = w.mask.decode(fr);
+			if (f.w > 0 && f.rgba.size() == (size_t)f.w * f.h) {
+				ddsgrp::frame_t s = ddsgrp::scale_box(f, ts, ts);
+				if (s.rgba.size() == (size_t)ts * ts) {
+					m.resize(s.rgba.size());
+					for (size_t i = 0; i != m.size(); ++i) m[i] = (uint8_t)(s.rgba[i] >> 8);
+				}
+			}
+			it = w.mask_cache.emplace(fr, std::move(m)).first;
+		}
+		return it->second.empty() ? nullptr : it->second.data();
+	}
+
+	// Current normal frames + timing for the present stage. Both layers step together and
+	// share one cross-fade, as water.glsl does.
+	void hd_water_params(native_window::window::water_params& p) {
+		hd_water_t& w = hd_water_st;
+		double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - w.t0).count() / hd_water_approx::time_unit_s;
+		uint64_t fpos = (uint64_t)(s * 1000.0) * (uint64_t)hd_water_approx::fps;
+		uint64_t fi = fpos / 1000;
+		int c1 = (int)w.n1_frames.size(), c2 = (int)w.n2.frame_count();
+		int a1 = (int)(fi % c1), b1 = (int)((fi + 1) % c1), want2[2] = {(int)(fi % c2), (int)((fi + 1) % c2)};
+		if (w.n2_id[0] != want2[0] && w.n2_id[1] == want2[0]) { std::swap(w.n2_cur[0], w.n2_cur[1]); std::swap(w.n2_id[0], w.n2_id[1]); }
+		for (int k = 0; k < 2; ++k) {
+			if (w.n2_id[k] == want2[k]) continue;
+			ddsgrp::frame_t f = w.n2.decode(want2[k]);
+			if (w.n2_w == 0) { w.n2_w = f.w; w.n2_h = f.h; }
+			if (f.w != w.n2_w || f.h != w.n2_h || f.rgba.size() != (size_t)f.w * f.h) { w.n2_cur[k].clear(); w.n2_id[k] = -1; continue; }
+			w.n2_cur[k] = std::move(f.rgba);
+			w.n2_id[k] = want2[k];
+		}
+		int ws = world_scale < 1 ? 1 : world_scale;
+		p.origin_x = (float)screen_pos.x;
+		p.origin_y = (float)screen_pos.y;
+		p.ws = (float)ws;
+		int span = (int)game_st.map_width - (int)screen_width / ws;
+		p.game_x = span > 0 ? (float)screen_pos.x / span : 0.5f;
+		p.fade = (float)(fpos % 1000) / 1000.f;
+		p.time = (float)std::fmod(s, 4000.0);   // every scroll is a whole number of repeats at 4000 s
+		p.tile1 = 1.f / hd_water_approx::tile1_px;
+		p.tile2 = 1.f / hd_water_approx::tile2_px;
+		p.n1[0] = w.n1_frames[a1].data(); p.n1[1] = w.n1_frames[b1].data();
+		p.n1_id[0] = a1; p.n1_id[1] = b1;
+		p.n1_w = w.n1_w; p.n1_h = w.n1_h;
+		for (int k = 0; k < 2; ++k) { p.n2[k] = w.n2_cur[k].empty() ? nullptr : w.n2_cur[k].data(); p.n2_id[k] = w.n2_id[k]; }
+		p.n2_w = w.n2_w; p.n2_h = w.n2_h;
+	}
+
 	// SC:R creep edges: tileset/<name>.dds.grp, the same 37 frames as the SD
 	// tileset grp at 4x (FULL) / 2x (hd2) size. Scaled once to the SD frame size
 	// x world_scale and kept; SD offsets place them.
@@ -4191,6 +4323,15 @@ struct ui_functions: ui_util_functions {
 						uint32_t* drow = data + (size_t)(screen_y + y) * data_pitch + screen_x;
 						const uint8_t* srow = scratch + (size_t)(y / ws) * 32;
 						for (int x = x0; x < w; ++x) if (!space || srow[x / ws]) drow[x] = pal_rgba(srow[x / ws]);
+					}
+				}
+				if (hd_water_frame && index < hd_water_st.frame.size() && hd_water_st.frame[index] >= 0) {
+					if (const uint8_t* m = hd_water_mask(hd_water_st.frame[index], ts)) {
+						for (int y = y0; y < h; ++y) {
+							uint32_t* drow = data + (size_t)(screen_y + y) * data_pitch + screen_x;
+							const uint8_t* mrow = m + (size_t)y * ts;
+							for (int x = x0; x < w; ++x) drow[x] = (drow[x] & 0xffffffu) | (uint32_t)(255 - mrow[x]) << 24;
+						}
 					}
 				}
 				if (~tile->flags & tile_t::flag_has_creep) {
@@ -4508,8 +4649,7 @@ struct ui_functions: ui_util_functions {
 		const int screen_x = g.screen_x, screen_y = g.screen_y;
 		const int offset_x = g.offset_x, offset_y = g.offset_y, width = g.width, height = g.height;
 
-		uint8_t* color_ptr = img.player_unit_colors.at(color_index).data();
-		uint32_t pc = game_palette[color_ptr[0]];
+		uint32_t pc = player_tint_rgb(color_index);
 		uint32_t pr = (pc >> 16) & 0xff, pg = (pc >> 8) & 0xff, pb = pc & 0xff;
 		bool has_tc = !ha.teamcolor.empty();
 		bool has_em = hd_emissive && !ha.emissive.empty(); // Faze 7 self-glow
@@ -4675,8 +4815,7 @@ struct ui_functions: ui_util_functions {
 		hd_geom_t g;
 		if (!hd_frame_geom(image, ha, g)) return;
 		auto& f = *g.f;
-		uint8_t* color_ptr = img.player_unit_colors.at(color_index).data();
-		uint32_t pc = game_palette[color_ptr[0]];
+		uint32_t pc = player_tint_rgb(color_index);
 		uint32_t pr = (pc >> 16) & 0xff, pg = (pc >> 8) & 0xff, pb = pc & 0xff;
 		bool has_tc = kind == hd_fx_alpha && !ha.teamcolor.empty();
 		bool has_em = kind == hd_fx_alpha && hd_emissive && !ha.emissive.empty();
@@ -4871,7 +5010,7 @@ struct ui_functions: ui_util_functions {
 				blit_grp_frame_ws(frame, flipped, screen_x, screen_y, ws, data, data_pitch,
 					[this](uint8_t, uint32_t& old) { return shadow_darken(old); });
 				return;
-			} else if (m == 9) {
+			} else if (m == 9 && remap_ok(image)) {
 				auto& tdata = tileset_img.light_pcx.at(image->image_type->color_shift - 1).data;
 				uint8_t* tptr = tdata.data();
 				size_t tsize = tdata.size() / 256;
@@ -4959,7 +5098,7 @@ struct ui_functions: ui_util_functions {
 			draw_frame_rgba(frame, flipped, dst, data_pitch, offset_x, offset_y, width, height, [this](uint8_t, uint32_t& old) {
 				return shadow_darken(old);
 			});
-		} else if (image->modifier == 9) {
+		} else if (image->modifier == 9 && remap_ok(image)) {
 			// Glow via the image's color_shift light table. The glow hue comes
 			// from the TABLE, not the raw palette entry (raw entries gave SCV
 			// exhaust blue centers); sample the table over black for the pure
@@ -7875,17 +8014,15 @@ struct ui_functions: ui_util_functions {
 	// moment and already marked it ("todo: callback for message"), so the poll
 	// both duplicated it and could fire a frame or two off from the sound.
 	//
-	// Split of responsibility, by design: the SOUND is unconditional (retail
-	// behaviour -- a launch is heard by everyone), the TEXT only appears when
-	// the target is in the local player's vision, so the notice cannot leak an
-	// enemy position through the fog.
+	// 1.16.1 (order NukeLaunch 0x464730, state 1) plays the advisor line and prints
+	// stat_txt #1046 for every player, fogged target or not. Only the alert jump
+	// (Space / minimap) waits for vision, so it cannot point at a fogged target.
 	virtual void on_nuke_launch(xy target) override {
-		if (!game_input) return;
+		show_hud_message(L("Nuclear launch detected."));
 		int vis = fog_vision_owner();
-		if (vis >= 0 && !player_position_is_visible(vis, target)) return;
+		if (!game_input || (vis >= 0 && !player_position_is_visible(vis, target))) return;
 		alert_pos = target;
 		alert_frame = (int)st.current_frame;
-		show_hud_message("Nuclear launch detected.");
 	}
 
 	// --- Research / upgrade complete notice (v0.83) --------------------
@@ -8173,7 +8310,7 @@ struct ui_functions: ui_util_functions {
 			// a line longer than the field shows its end -- where the caret is
 			int room = (field.to.x - pad - tx) / adv - 1;
 			if (room < 1) room = 1;
-			a_string shown = (int)chat_input.size() > room ? chat_input.substr(chat_input.size() - (size_t)room) : chat_input;
+			a_string shown = tail_cells(chat_input, room);
 			if (((int)st.current_frame / 12) & 1) shown += "_"; // ~1 Hz caret
 			draw_text_rgba(data, pitch, tx, ty, shown.c_str(), 0xffffffffu, 2);
 		}
@@ -8187,6 +8324,61 @@ struct ui_functions: ui_util_functions {
 		draw_text_rgba(data, pitch, (int)screen_width / 2 - 20, 22, buf, 0xff4040ffu, 2);
 	}
 
+	std::array<uint32_t, 8> custom_colors_built{};
+	bool custom_colors_dirty = true;
+
+	uint8_t nearest_palette_index(int r, int g, int b) const {
+		// Skip 0, the cycling ranges (1-7, 248-254) and the player remap slots (8-15).
+		int best = 255, best_d = INT_MAX;
+		for (int i = 16; i != 256; ++i) {
+			if (i >= 248 && i < 255) continue;
+			uint32_t c = game_palette[i];
+			int dr = (int)(c >> 16 & 0xff) - r, dg = (int)(c >> 8 & 0xff) - g, db = (int)(c & 0xff) - b;
+			int d = 2 * dr * dr + 4 * dg * dg + 3 * db * db;
+			if (d < best_d) { best_d = d; best = i; }
+		}
+		return (uint8_t)best;
+	}
+
+	// CRGB custom colours -> rows 16..23. Shade k of a tunit row is close to its first shade
+	// times f[k]; f is fitted (least squares) over the eight standard rows.
+	void sync_custom_player_colors() {
+		auto& want = st.game->custom_player_rgb;
+		if (!custom_colors_dirty && want == custom_colors_built) return;
+		custom_colors_dirty = false;
+		custom_colors_built = want;
+		double f[8];
+		for (size_t k = 0; k != 8; ++k) {
+			double num = 0, den = 0;
+			for (size_t r = 0; r != 8; ++r) {
+				uint32_t b = game_palette[img.player_unit_colors[r][0]], s = game_palette[img.player_unit_colors[r][k]];
+				for (int sh = 0; sh != 24; sh += 8) {
+					double bv = (double)(b >> sh & 0xff), sv = (double)(s >> sh & 0xff);
+					num += bv * sv; den += bv * bv;
+				}
+			}
+			f[k] = den > 0 ? num / den : 1.0;
+		}
+		for (size_t i = 0; i != 8; ++i) {
+			auto& row = img.player_unit_colors[16 + i];
+			if (!(want[i] >> 24)) {
+				row = img.player_unit_colors[i];
+				img.player_minimap_colors[16 + i] = img.player_minimap_colors[i];
+				continue;
+			}
+			int r = want[i] >> 16 & 0xff, g = want[i] >> 8 & 0xff, b = want[i] & 0xff;
+			auto cl = [](double v) { return v < 0 ? 0 : v > 255 ? 255 : (int)(v + 0.5); };
+			for (size_t k = 0; k != 8; ++k) row[k] = nearest_palette_index(cl(r * f[k]), cl(g * f[k]), cl(b * f[k]));
+			img.player_minimap_colors[16 + i] = nearest_palette_index(r, g, b);
+		}
+	}
+
+	// Team colour for the HD tint: the exact CRGB colour, else the first shade of the tunit row.
+	uint32_t player_tint_rgb(size_t ci) const {
+		if (ci >= 16 && ci < 24 && st.game->custom_player_rgb[ci - 16] >> 24) return st.game->custom_player_rgb[ci - 16] & 0xffffff;
+		return game_palette[img.player_unit_colors.at(ci)[0]];
+	}
+
 	uint32_t player_colors_rgba(int p) {
 		// Standard BW player colors (ARGB), indexed by the player's color slot.
 		// v1.0.22: all 16 rows of game/tunit.pcx (measured through the game palette).
@@ -8197,6 +8389,7 @@ struct ui_functions: ui_util_functions {
 			0xff74a47cu, 0xff9090b8u, 0xfffcfc7cu, 0xff00e4fcu,
 		};
 		size_t ci = (size_t)st.players.at(p).color;
+		if (ci >= 16 && ci < 24) return 0xff000000u | player_tint_rgb(ci);
 		return colors[ci < 16 ? ci : 0];
 	}
 
@@ -9127,6 +9320,74 @@ struct ui_functions: ui_util_functions {
 				"fxshow scene at " + std::to_string(c.x) + "," + std::to_string(c.y) + (failed.empty() ? "" : ", not placed:" + failed), "\"scenario\":\"fxshow\"");
 			return;
 		}
+		if (name == "nuke" || name == "nukefog") {
+			// An enemy Ghost with a ready silo paints a nuke: "nuke" next to our base (the
+			// dot and the text in vision), "nukefog" on the far side of the map (text only).
+			int foe = -1;
+			for (int p = 0; p != 8 && foe < 0; ++p)
+				if (p != game_local_player && (st.players[p].controller == player_t::controller_occupied
+				    || st.players[p].controller == player_t::controller_computer)) foe = p;
+			if (foe < 0) foe = game_local_player;
+			const int mw = (int)game_st.map_width, mh = (int)game_st.map_height;
+			xy target = name == "nuke" ? start + xy(start.x < mw / 2 ? 160 : -160, 0) : xy(mw - start.x, mh - start.y);
+			target.x = std::max(64, std::min(target.x, mw - 64));
+			target.y = std::max(64, std::min(target.y, mh - 64));
+			xy gpos = target + xy(0, target.y < mh / 2 ? 200 : -200);
+			unit_t* silo = trigger_create_unit(get_unit_type(UnitTypes::Terran_Nuclear_Silo), gpos + xy(0, target.y < mh / 2 ? 120 : -120), foe);
+			// The missile is not StarEdit-placeable and a lone addon turns neutral: build both by hand.
+			unit_t* nuke = create_unit(get_unit_type(UnitTypes::Terran_Nuclear_Missile), gpos, foe);
+			if (nuke) {
+				hide_unit(nuke);
+				finish_building_unit(nuke);
+				complete_unit(nuke);
+			}
+			if (silo) set_unit_owner(silo, foe, false);
+			unit_t* ghost = trigger_create_unit(get_unit_type(UnitTypes::Terran_Ghost), gpos, foe);
+			if (silo && nuke && ghost) {
+				nuke->connected_unit = silo;
+				silo->building.silo.nuke = nuke;
+				silo->building.silo.ready = true;
+				set_unit_order(ghost, get_order_type(Orders::NukePaint), target);
+			}
+			if (name == "nuke") center_camera_on(target);
+			bwgame::diag::emit((long)st.current_frame, "selftest", bwgame::diag::Sev::info, "SELFTEST_SETUP",
+				name + " by player " + std::to_string(foe) + " at " + std::to_string(target.x) + "," + std::to_string(target.y)
+				+ (silo && nuke && ghost ? "" : std::string(" (not placed:") + (silo ? "" : " silo") + (nuke ? "" : " nuke")
+				+ (ghost ? "" : " ghost") + ")"), "\"scenario\":\"" + name + "\"");
+			return;
+		}
+		if (name == "subgroup") {
+			// A mixed selection (Marines, Medics, a Ghost, an SCV) and one Tab: the card,
+			// portrait and grid highlight move to the next subgroup.
+			const int p = game_local_player;
+			xy c = start + xy(0, start.y < (int)game_st.map_height / 2 ? 192 : -192);
+			const UnitTypes ts[] = {UnitTypes::Terran_Marine, UnitTypes::Terran_Marine, UnitTypes::Terran_Marine,
+				UnitTypes::Terran_Medic, UnitTypes::Terran_Medic, UnitTypes::Terran_Ghost, UnitTypes::Terran_SCV};
+			int i = 0;
+			for (UnitTypes t : ts) {
+				if (unit_t* u = trigger_create_unit(get_unit_type(t), c + xy(-96 + 32 * i, 0), p)) current_selection_add(u);
+				++i;
+			}
+			submit_select_action();
+			cycle_subgroup(1);
+			center_camera_on(c);
+			const unit_type_t* a = active_subgroup();
+			bwgame::diag::emit((long)st.current_frame, "selftest", bwgame::diag::Sev::info, "SELFTEST_SETUP",
+				"subgroup: " + std::to_string(selection_subgroups().size()) + " subgroups, active type "
+				+ std::to_string(a ? (int)a->id : -1), "\"scenario\":\"subgroup\"");
+			return;
+		}
+		if (name == "savename") {
+			// The save list with a UTF-8 name being typed into slot 1.
+			open_pause_menu();
+			pause_screen = 8;
+			open_save_name_prompt(1);
+			chat_input = "\xC5\xBD" "aidimas prie\xC5\xA1 \xC4\x8D" "empion\xC4\x85";   // "Žaidimas prieš čempioną"
+			if (wnd) wnd.stop_text_input();   // keep the field above the soft keyboard visible
+			bwgame::diag::emit((long)st.current_frame, "selftest", bwgame::diag::Sev::info, "SELFTEST_SETUP",
+				"savename prompt open", "\"scenario\":\"savename\"");
+			return;
+		}
 		if (name == "smartcast") {
 			// 3 hero Science Vessels (Magellan bypasses tech research, so it can EMP
 			// with no research building), full energy, selected; then cast EMP on a
@@ -9325,9 +9586,74 @@ struct ui_functions: ui_util_functions {
 	void draw_text_rgba(uint32_t* data, size_t pitch, int x, int y, const char* s, uint32_t color, int text_scale = 2) {
 		draw_text_rgba_scaled(data, pitch, x, y, s, color, text_scale * 50);
 	}
+	// Both HUD fonts are ASCII-only: UTF-8 text (a typed save name, a launcher-made
+	// player name) is drawn one cell per character, Latin letters without their accents.
+	static unsigned utf8_next(const char*& p) {
+		const unsigned char c = (unsigned char)*p++;
+		if (c < 0x80) return c;
+		int n = c >= 0xf0 ? 3 : c >= 0xe0 ? 2 : c >= 0xc0 ? 1 : 0;
+		if (!n) return '?';
+		unsigned cp = c & (0x3f >> n);
+		for (; n && ((unsigned char)*p & 0xc0) == 0x80; --n) cp = cp << 6 | ((unsigned char)*p++ & 0x3f);
+		return n ? '?' : cp;
+	}
+	static char fold_ascii(unsigned cp) {
+		static const char lat1[] = "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYTsaaaaaaaceeeeiiiidnooooo/ouuuuyty";
+		static const char extA[] = "AaAaAaCcCcCcCcDdDdEeEeEeEeEeGgGgGgGgHhHhIiIiIiIiIiIiJjKkkLlLlLlLlLlNnNnNnnNn"
+			"OoOoOoOoRrRrRrSsSsSsSsTtTtTtUuUuUuUuUuUuWwYyYZzZzZzs";
+		static_assert(sizeof lat1 == 65 && sizeof extA == 129, "fold tables");
+		if (cp < 0x80) return (char)cp;
+		if (cp >= 0xc0 && cp <= 0xff) return lat1[cp - 0xc0];
+		if (cp >= 0x100 && cp <= 0x17f) return extA[cp - 0x100];
+		switch (cp) {
+		case 0xa0: return ' ';
+		case 0xb7: case 0x2013: case 0x2014: case 0x2212: return '-';
+		case 0x2018: case 0x2019: return '\'';
+		case 0x201c: case 0x201d: case 0xab: case 0xbb: case 0x201e: return '"';
+		case 0x2026: return '.';
+		default: return '?';
+		}
+	}
+	// Non-ASCII and well-formed UTF-8. A map's own bytes (CP949 / CP1252) fail this and
+	// keep the old blank-cell drawing.
+	static bool utf8_text(const char* s) {
+		bool high = false;
+		while (*s) {
+			const unsigned char c = (unsigned char)*s++;
+			if (c < 0x80) continue;
+			high = true;
+			int n = c >= 0xf8 ? -1 : c >= 0xf0 ? 3 : c >= 0xe0 ? 2 : c >= 0xc2 ? 1 : -1;
+			if (n < 0) return false;
+			for (; n; --n, ++s) if (((unsigned char)*s & 0xc0) != 0x80) return false;
+		}
+		return high;
+	}
+	static a_string fold_utf8(const char* s) {
+		a_string r;
+		while (*s) r += fold_ascii(utf8_next(s));
+		return r;
+	}
+	// Cells a string takes on screen (one per UTF-8 character).
+	static int text_cells(const char* s) {
+		if (!utf8_text(s)) return (int)strlen(s);
+		int n = 0;
+		for (; *s; ++s) if (((unsigned char)*s & 0xc0) != 0x80) ++n;
+		return n;
+	}
+	// The last `room` characters of s (whole UTF-8 characters).
+	static a_string tail_cells(const a_string& s, int room) {
+		size_t b = s.size();
+		for (int n = 0; b > 0 && n < room; ) {
+			--b;
+			if (((unsigned char)s[b] & 0xc0) != 0x80) ++n;
+		}
+		return s.substr(b);
+	}
 	// Percentage scale: 100 = the atlas's native size (text_scale 2). Needed
 	// because text_scale is an integer and the Unit Display wants 80%.
 	void draw_text_rgba_scaled(uint32_t* data, size_t pitch, int x, int y, const char* s, uint32_t color, int pct) {
+		a_string folded;
+		if (utf8_text(s)) { folded = fold_utf8(s); s = folded.c_str(); }
 		const int W = ui::unispace_w, H = ui::unispace_h;
 		// Faze 4.3: in-game HUD text is authored for the HD2 buffer; at FULL HD the
 		// buffer is world_scale x bigger so the glyphs read as tiny. hud_scale_text
@@ -9497,6 +9823,7 @@ struct ui_functions: ui_util_functions {
 	int local_portrait = -1;                              // --player-portrait
 	int ai_portrait_level = -1;                           // -1 original aiscript AI / other bots, 0..3 built-in AI level
 	a_vector<std::pair<a_string, int>> name_portraits;    // --name-portraits (LAN)
+	std::array<int, 12> slot_portraits = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1}; // LAN: each peer's id from the sync uid handshake
 	struct loading_portrait_t { int w = 0, h = 0; std::shared_ptr<const std::vector<uint32_t>> px; };
 	std::map<int, loading_portrait_t> loading_portrait_cache;
 
@@ -9515,8 +9842,10 @@ struct ui_functions: ui_util_functions {
 
 	// The portdata id shown for a player. `race` is what may be SHOWN (-1 = hidden /
 	// random): a portrait picked by the race must not give a hidden race away.
-	int player_portrait_id(bool is_local, bool is_ai, const a_string& name, int race) const {
+	int player_portrait_id(bool is_local, bool is_ai, const a_string& name, int race, int slot = -1) const {
 		if (is_local && local_portrait >= 0) return local_portrait;
+		// A LAN peer keeps its own portrait after disconnect -> AI takes its slot over.
+		if (slot >= 0 && slot < 12 && slot_portraits[(size_t)slot] >= 0) return slot_portraits[(size_t)slot];
 		if (!is_ai) for (auto& v : name_portraits) if (v.first == name && v.second >= 0) return v.second;
 		return ai_portrait_for(is_ai ? ai_portrait_level : -1, race);
 	}
@@ -9647,6 +9976,8 @@ struct ui_functions: ui_util_functions {
 
 	uint32_t loading_player_rgb(int color_index) const {
 		if (color_index >= 0 && color_index < 8) return loading_screen::bw_player_color(color_index);
+		if (color_index >= 16 && color_index < 24 && st.game->custom_player_rgb[color_index - 16] >> 24)
+			return st.game->custom_player_rgb[color_index - 16] & 0xffffff;
 		// Map-defined colours past the eight standard ones: through the minimap palette.
 		if (color_index >= 0 && (size_t)color_index < img.player_minimap_colors.size())
 			return game_palette[img.player_minimap_colors[(size_t)color_index]];
@@ -9774,7 +10105,7 @@ struct ui_functions: ui_util_functions {
 			const bool is_local = (int)p == local_player;
 			const bool computer = st.players[p].controller == player_t::controller_computer_game;
 			std::string fallback = is_local ? std::string(L("Player"))
-				: computer ? std::string(L("Computer")) : std::string(L("Player")) + " " + std::to_string(p + 1);
+				: computer ? std::string(L("Computer")) : format(L("Player %d"), p + 1);
 			a_string nm = loading_slot_name[p];
 			if (nm.empty() && is_local) nm = local_player_name;
 			if (nm.empty()) nm = slot_player_names[p];
@@ -9792,7 +10123,7 @@ struct ui_functions: ui_util_functions {
 			r.team = team_of[p];
 			r.is_local = is_local;
 			// r.race is already -1 for an enemy that picked Random, so its portrait hides too.
-			loading_attach_portrait(r, player_portrait_id(is_local, player_is_ai(p, local_player), nm, r.race));
+			loading_attach_portrait(r, player_portrait_id(is_local, player_is_ai(p, local_player), nm, r.race, (int)p));
 			r.kbm = is_net_game && kbm_player(nm);
 			info.players.push_back(std::move(r));
 		};
@@ -9818,14 +10149,14 @@ struct ui_functions: ui_util_functions {
 		info.players.clear();
 		auto add = [&](const lobby_slot_t& s) {
 			ls::player_t r;
-			r.name = ls::ascii_text(loading_str(s.name), std::string(L("Player")) + " " + std::to_string(s.slot + 1));
+			r.name = ls::ascii_text(loading_str(s.name), format(L("Player %d"), s.slot + 1));
 			r.race = (s.race >= 0 && s.race <= 2) ? s.race : -1;
 			int col = (s.slot >= 0 && s.slot < 12) ? st.players[(size_t)s.slot].color : -1;
 			if (s.is_local && loading_local_color >= 0 && loading_local_color < 16) col = loading_local_color;
 			r.color = loading_player_rgb(col);
 			r.team = s.slot; // LAN games are free-for-all (teams are not synced yet)
 			r.is_local = s.is_local;
-			loading_attach_portrait(r, player_portrait_id(s.is_local, false, s.name, r.race));
+			loading_attach_portrait(r, player_portrait_id(s.is_local, false, s.name, r.race, s.slot));
 			r.kbm = kbm_player(s.name);
 			info.players.push_back(std::move(r));
 		};
@@ -11039,6 +11370,7 @@ struct ui_functions: ui_util_functions {
 			hd_tiles.ents.clear(); hd_tiles.ents.shrink_to_fit();
 			hd_tiles.ok = false; hd_tiles_tried = false;
 		}
+		hd_water_st.mask_cache.clear();
 		ui::log("low memory: dropped %d kB of HD caches\n", (int)(freed >> 10));
 	}
 
@@ -12280,6 +12612,14 @@ struct ui_functions: ui_util_functions {
 		chat_input.clear();
 		if (wnd) wnd.stop_text_input();
 	}
+	// Backspace: the whole last character (UTF-8), not its last byte.
+	void chat_pop_char() {
+		while (!chat_input.empty()) {
+			const unsigned char c = (unsigned char)chat_input.back();
+			chat_input.pop_back();
+			if ((c & 0xc0) != 0x80) break;
+		}
+	}
 	static a_string chat_trim(const a_string& in) {
 		size_t a = 0, b = in.size();
 		while (a < b && (unsigned char)in[a] <= ' ') ++a;
@@ -12443,7 +12783,7 @@ struct ui_functions: ui_util_functions {
 		if (save_dir.empty()) return "";
 		FILE* f = fopen(save_slot_name_path(slot).c_str(), "rb");
 		if (!f) return "";
-		char buf[128];
+		char buf[256];   // 40 characters of up to 4 UTF-8 bytes
 		size_t n = fread(buf, 1, sizeof(buf) - 1, f);
 		fclose(f);
 		while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) --n;
@@ -12509,7 +12849,7 @@ struct ui_functions: ui_util_functions {
 	}
 
 	bool disk_save(int slot, const a_string& name = a_string()) {
-		if (is_net_game || save_dir.empty()) { save_feedback = "Save unavailable"; return false; }
+		if (is_net_game || save_dir.empty()) { save_feedback = L("Save unavailable"); return false; }
 		a_vector<uint8_t> out;
 		auto pu32 = [&](uint32_t v) {
 			uint8_t b[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24)};
@@ -12534,7 +12874,7 @@ struct ui_functions: ui_util_functions {
 		pu32((uint32_t)au.size());
 		out.insert(out.end(), au.begin(), au.end());
 		FILE* f = fopen(save_slot_path(slot).c_str(), "wb");
-		if (!f) { save_feedback = "Save FAILED (no file)"; return false; }
+		if (!f) { save_feedback = L("Save failed (no file)"); return false; }
 		bool ok = out.empty() || fwrite(out.data(), 1, out.size(), f) == out.size();
 		fclose(f);
 		// D5 sidecar: write the user name (or clear a stale one). Sidecar-only -> the
@@ -12549,7 +12889,7 @@ struct ui_functions: ui_util_functions {
 			}
 		}
 		char b[32];
-		snprintf(b, sizeof(b), ok ? "Saved to slot %d" : "Save FAILED (slot %d)", slot);
+		snprintf(b, sizeof(b), ok ? L("Saved to slot %d") : L("Save failed (slot %d)"), slot);
 		save_feedback = b;
 		return ok;
 	}
@@ -12606,7 +12946,7 @@ struct ui_functions: ui_util_functions {
 		int a = (int)((ui::unispace_w + 1) * f + 0.5f);
 		return a < 1 ? 1 : a;
 	}
-	int menu_text_w(const char* s, int scale) { return (int)strlen(s) * menu_text_adv(scale); }
+	int menu_text_w(const char* s, int scale) { return text_cells(s) * menu_text_adv(scale); }
 	int menu_text_h(int scale) {
 		float f = hud_text_pct(scale * 50) / 100.0f;
 		int gs = (int)(f + 0.5f); if (gs < 1) gs = 1;
@@ -12984,18 +13324,18 @@ struct ui_functions: ui_util_functions {
 			char l1[96], l2[96];
 			uint32_t frame = 0, map_id = 0, engine = 0;
 			if (!save_slot_header(s, frame, map_id, engine)) {
-				snprintf(l1, sizeof(l1), "Slot %d", s);
-				snprintf(l2, sizeof(l2), "%s", "Empty");
+				snprintf(l1, sizeof(l1), L("Slot %d"), s);
+				snprintf(l2, sizeof(l2), "%s", L("Empty"));
 			} else {
 				a_string name = save_slot_name(s), map = save_slot_map_name(s);
 				const a_string& shown = name.empty() ? map : name;
-				if (shown.empty()) snprintf(l1, sizeof(l1), "Slot %d", s);
-				else snprintf(l1, sizeof(l1), "Slot %d - %s", s, shown.c_str());
+				if (shown.empty()) snprintf(l1, sizeof(l1), L("Slot %d"), s);
+				else snprintf(l1, sizeof(l1), L("Slot %d - %s"), s, shown.c_str());
 				const unsigned secs = (unsigned)((unsigned long long)frame * 42 / 1000);   // "fastest" game speed
-				if (engine != save_engine_version) snprintf(l2, sizeof(l2), "%s", "other version");
-				else if (map_id != save_map_id) snprintf(l2, sizeof(l2), "%s", "other map");
+				if (engine != save_engine_version) snprintf(l2, sizeof(l2), "%s", L("other version"));
+				else if (map_id != save_map_id) snprintf(l2, sizeof(l2), "%s", L("other map"));
 				else if (!name.empty() && !map.empty()) snprintf(l2, sizeof(l2), "%s  %02u:%02u", map.c_str(), secs / 60, secs % 60);
-				else snprintf(l2, sizeof(l2), "Frame %u  %02u:%02u", (unsigned)frame, secs / 60, secs % 60);
+				else snprintf(l2, sizeof(l2), L("Frame %u  %02u:%02u"), (unsigned)frame, secs / 60, secs % 60);
 			}
 			uint32_t text = 0;
 			menu_button_box(data, pitch, r, naming && pending_save_slot == s ? (int)menu_btn_primary : (int)menu_btn_normal, en, &text);
@@ -13017,11 +13357,14 @@ struct ui_functions: ui_util_functions {
 			line_rectangle_rgba(data, pitch, field, hud_theme().on_line);
 			const int in = hud_h_px(12);
 			const int ty = (field.from.y + field.to.y) / 2 - menu_text_h(2) / 2;
-			const char* lbl = "Save name:";
+			const char* lbl = L("Save name:");
 			draw_text_rgba(data, pitch, field.from.x + in, ty, lbl, hud_theme().amber, 2);
-			a_string shown = chat_input + "_";
-			draw_text_rgba(data, pitch, field.from.x + in + menu_text_w(lbl, 2) + menu_text_adv(2), ty, shown.c_str(), 0xffffffffu, 2);
-			menu_button(data, pitch, save, "Save", menu_btn_primary, true);
+			const int tx = field.from.x + in + menu_text_w(lbl, 2) + menu_text_adv(2);
+			// a name longer than the field shows its end, where the caret is
+			const int room = std::max(1, (field.to.x - in - tx) / menu_text_adv(2) - 1);
+			a_string shown = tail_cells(chat_input, room) + "_";
+			draw_text_rgba(data, pitch, tx, ty, shown.c_str(), 0xffffffffu, 2);
+			menu_button(data, pitch, save, L("Save"), menu_btn_primary, true);
 		}
 		menu_button(data, pitch, back, L("Back"), menu_btn_normal, true);
 		return -1;
@@ -14703,8 +15046,8 @@ struct ui_functions: ui_util_functions {
 	bool ext_hero_line(const unit_t* u, char* out, size_t n) const {
 		const ext_hero_def* hd = ext_hero(u);
 		if (!hd) return false;
-		if (u->hero_level >= hd->max_level) snprintf(out, n, "%s %d %s", L("Level"), u->hero_level, L("(max)"));
-		else snprintf(out, n, "%s %d  %d/%lld XP", L("Level"), u->hero_level, u->hero_xp, (long long)ext_hero_xp_for(*hd, u->hero_level + 1));
+		if (u->hero_level >= hd->max_level) snprintf(out, n, L("Level %d (max)"), u->hero_level);
+		else snprintf(out, n, L("Level %d  %d/%lld XP"), u->hero_level, u->hero_xp, (long long)ext_hero_xp_for(*hd, u->hero_level + 1));
 		return true;
 	}
 	const char* L(const char* en) const {
@@ -14712,22 +15055,22 @@ struct ui_functions: ui_util_functions {
 		struct pair { const char* en; const char* lt; };
 		static const pair tbl[] = {
 			{"MISSION BRIEFING", "MISIJOS INSTRUKTAZAS"},
-			{"Level", "Lygis"},
-			{"(max)", "(maks.)"},
-			{"Skill points", "Igudziu taskai"},
-			{"Rank", "Rangas"},
+			{"Level %d (max)", "Lygis %d (maks.)"},
+			{"Level %d  %d/%lld XP", "Lygis %d  %d/%lld XP"},
+			{"Skill points: %d", "Igudziu taskai: %d"},
+			{"Rank %d/%d", "Rangas %d/%d"},
 			{"Aura", "Aura"},
 			{"Passive", "Pasyvus"},
 			{"Energy", "Energija"},
 			{"Cooldown", "Atsistatymas"},
-			{"Need: level", "Reikia lygio"},
-			{"Ready in", "Paruosta po"},
+			{"Needs level %d", "Reikia %d lygio"},
+			{"Ready in %ds", "Paruosta po %d s"},
 			{"This map uses StarCraft: Remastered terrain. Set the SC:R files in Settings.", "Siam zemelapiui reikia StarCraft: Remastered reljefo. Nurodyk SC:R failus Nustatymuose."},
 			{"Planned building dropped: the spot is blocked.", "Suplanuotas pastatas atsauktas: vieta uzstota."},
 			{"OBJECTIVES", "TIKSLAI"},
-			{"Script error: ", "Scenarijaus klaida: "},
-			{" (the script does not run)", " (scenarijus neveikia)"},
-			{" (%d errors)", " (klaidu: %d)"},
+			{"Script error: %s", "Scenarijaus klaida: %s"},
+			{"Script error: %s (the script does not run)", "Scenarijaus klaida: %s (scenarijus neveikia)"},
+			{"Script error: %s (%d errors)", "Scenarijaus klaida: %s (klaidu: %d)"},
 			{"START MISSION", "PRADETI MISIJA"},
 			{"SKIP", "PRALEISTI"},
 			{"REPLAY", "KARTOTI"},
@@ -14748,6 +15091,22 @@ struct ui_functions: ui_util_functions {
 			 "Priesininkas isejo. Jo pajegas perema kompiuteris."},
 			{"PAUSED", "PAUZE"},
 			{"Return to game", "Grizti i zaidima"},
+			// Save / load slot list (ASCII: the HUD font has no diacritics).
+			{"Nuclear launch detected.", "Aptiktas branduolinis paleidimas."},
+			{"SAVE GAME", "ISSAUGOTI ZAIDIMA"},
+			{"LOAD GAME", "IKELTI ZAIDIMA"},
+			{"Save name:", "Pavadinimas:"},
+			{"Save", "Issaugoti"},
+			{"Slot %d", "Vieta %d"},
+			{"Slot %d - %s", "Vieta %d - %s"},
+			{"Empty", "Tuscia"},
+			{"other version", "kita versija"},
+			{"other map", "kitas zemelapis"},
+			{"Frame %u  %02u:%02u", "Kadras %u  %02u:%02u"},
+			{"Saved to slot %d", "Issaugota: vieta %d"},
+			{"Save failed (slot %d)", "Issaugoti nepavyko (vieta %d)"},
+			{"Save failed (no file)", "Issaugoti nepavyko (nera failo)"},
+			{"Save unavailable", "Issaugoti negalima"},
 			{"Save game", "Issaugoti"},
 			{"Load game", "Ikelti"},
 			{"Help", "Pagalba"},
@@ -14765,6 +15124,7 @@ struct ui_functions: ui_util_functions {
 			{"Random", "Atsitiktine"},
 			{"CANCEL", "ATSAUKTI"},
 			{"Player", "Zaidejas"},
+			{"Player %d", "Zaidejas %d"},
 			{"Computer", "Kompiuteris"},
 			{"Unknown map", "Nezinomas zemelapis"},
 			{"EPISODE", "EPIZODAS"},
@@ -15338,6 +15698,7 @@ struct ui_functions: ui_util_functions {
 			hud2_grid_geom_t gg = hud2_group_grid_geom();
 			int gpad = hud_h_px(2); // zoom-locked cell gaps
 			int gb = gg.gb; if (gb < 6) return;
+			const unit_type_t* sub = active_subgroup();   // mixed selection: the Tab subgroup's cells
 			int i = 0;
 			for (auto uid : current_selection) {
 				unit_t* u = get_unit(uid); if (!u || u->owner != game_local_player) continue;
@@ -15362,7 +15723,7 @@ struct ui_functions: ui_util_functions {
 				}
 				// SCBW2 group-focus: highlight the focused unit's cell (yellow HUD accent)
 				// so it is clear whose 3x3 card + portrait are showing.
-				if (get_unit_id(u) == focused_unit_id && current_selection.size() > 1) {
+				if (current_selection.size() > 1 && (sub ? u->unit_type == sub : get_unit_id(u) == focused_unit_id)) {
 					rect cell = {{gx - gpad, gy - gpad}, {gx + gb + gpad, gy + gb + gpad}};
 					line_rectangle_rgba(data, pitch, cell, hud_theme().amber);
 				}
@@ -16868,6 +17229,37 @@ struct ui_functions: ui_util_functions {
 		if (f && f->owner == game_local_player && current_selection_is_selected(f)) return f;
 		return first_own_selected_unit();
 	}
+	// Subgroups of a mixed selection (Tab, as in SC2 / SC:R): its own unit types, casters
+	// first, then in selection order -- the order HUD v3 lists them. Card and portrait only.
+	a_vector<const unit_type_t*> selection_subgroups() {
+		a_vector<const unit_type_t*> t;
+		for (auto uid : current_selection) {
+			unit_t* u = get_unit(uid);
+			if (u && u->owner == game_local_player && std::find(t.begin(), t.end(), u->unit_type) == t.end()) t.push_back(u->unit_type);
+		}
+		std::stable_sort(t.begin(), t.end(), [](const unit_type_t* a, const unit_type_t* b) {
+			return (a->flags & unit_type_t::flag_has_energy) && !(b->flags & unit_type_t::flag_has_energy);
+		});
+		return t;
+	}
+	const unit_type_t* active_subgroup() {
+		unit_t* f = focus_or_primary();   // whose card is showing
+		if (!f || selection_subgroups().size() < 2) return nullptr;
+		return f->unit_type;
+	}
+	bool cycle_subgroup(int dir) {
+		auto t = selection_subgroups();
+		if (t.size() < 2) return false;
+		auto it = std::find(t.begin(), t.end(), active_subgroup());
+		int i = it == t.end() ? 0 : (int)(it - t.begin());
+		i = (i + dir + (int)t.size()) % (int)t.size();
+		for (auto uid : current_selection) {
+			unit_t* u = get_unit(uid);
+			if (u && u->owner == game_local_player && u->unit_type == t[(size_t)i]) { focused_unit_id = uid; break; }
+		}
+		card_menu = 0; ability_armed_order = -1; attack_armed = false;
+		return true;
+	}
 
 	// v0.83.001: the neutral counterpart, for the selection "what" sound.
 	// Owner 11 is the map's neutral slot; critters are flagged neutral by the
@@ -17390,6 +17782,53 @@ struct ui_functions: ui_util_functions {
 		}
 		place_card_buttons(r);
 		apply_card_availability(r);
+		apply_eud_button_set(r);
+	}
+
+	// A dword of emulated memory as the command card sees it: what the map wrote, else the exe's.
+	bool eud_ui_dword(uint32_t a, uint32_t& v) const {
+		auto i = st.eud_deaths.find((a - eud::deaths_base) / 4u);
+		if (i != st.eud_deaths.end()) { v = (uint32_t)i->second; return true; }
+		const a_vector<uint8_t>& x = global_st.exe_buttons;
+		if (x.empty() || a - eud::buttons_base > x.size() - 4) return false;
+		size_t o = a - eud::buttons_base;
+		v = (uint32_t)x[o] | (uint32_t)x[o + 1] << 8 | (uint32_t)x[o + 2] << 16 | (uint32_t)x[o + 3] << 24;
+		return true;
+	}
+	// EUD maps rewrite button sets (count / array pointer) to trim the command card. Only the
+	// buttons whose icon is among the set's first `count` entries stay; nothing is added.
+	void apply_eud_button_set(static_vector<card_button_t, 9>& r) {
+		if (!game_st.eud_triggers || card_menu != 0 || placing_type) return;
+		unit_t* u = focus_or_primary();
+		if (!u || !u_completed(u) || (size_t)u->unit_type->id >= 228) return;
+		const uint32_t a = eud::button_sets + 12 * (uint32_t)u->unit_type->id;
+		const bool wc = st.eud_deaths.count((a - eud::deaths_base) / 4u) != 0;
+		const bool wp = st.eud_deaths.count((a + 4 - eud::deaths_base) / 4u) != 0;
+		if (!wc && !wp) return;
+		uint32_t count = 0, arr = 0, exe_count = 0, exe_arr = 0;
+		if (!eud_ui_dword(a, count)) return;
+		if (count == 0) {
+			for (auto& b : r) b = {"", cardact_none, 0};
+			return;
+		}
+		if (!eud_ui_dword(a + 4, arr) || !arr) return;
+		const a_vector<uint8_t>& x = global_st.exe_buttons;
+		if (!x.empty()) {
+			size_t o = a - eud::buttons_base;
+			for (int k = 0; k != 4; ++k) exe_count |= (uint32_t)x[o + k] << (8 * k), exe_arr |= (uint32_t)x[o + 4 + k] << (8 * k);
+		}
+		count = std::min<uint32_t>(count, arr == exe_arr ? exe_count : 16);
+		uint16_t icons[16];
+		for (uint32_t k = 0; k != count; ++k) {
+			uint32_t w;
+			if (!eud_ui_dword(arr + 20 * k, w)) return;   // pos (low), icon (high)
+			icons[k] = (uint16_t)(w >> 16);
+		}
+		for (auto& b : r) {
+			if (b.action == cardact_none) continue;
+			int ic = button_icon(b);
+			if (std::find(icons, icons + count, (uint16_t)ic) == icons + count) b = {"", cardact_none, 0};
+		}
 	}
 
 	// GE5: Extended abilities. The ability of a card button, or -1.
@@ -17419,15 +17858,15 @@ struct ui_functions: ui_util_functions {
 		int rank = u->ab_rank[i], shown = std::max(rank, 1);
 		bool passive = d.target == ext_ability_def::t_passive || d.target == ext_ability_def::t_aura;
 		int cost = ext_ability_cost(d, shown), cd = ext_ability_cooldown(d, shown) / 16;
-		if (slots[(size_t)i].hero) snprintf(l1, sizeof l1, "%s %d/%d", L("Rank"), rank, d.ranks);
+		if (slots[(size_t)i].hero) snprintf(l1, sizeof l1, L("Rank %d/%d"), rank, d.ranks);
 		if (passive) snprintf(l2, sizeof l2, "%s", L(d.target == ext_ability_def::t_aura ? "Aura" : "Passive"));
 		else if (cost && cd) snprintf(l2, sizeof l2, "%s %d  %ds", L("Energy"), cost, cd);
 		else if (cost) snprintf(l2, sizeof l2, "%s %d", L("Energy"), cost);
 		else if (cd) snprintf(l2, sizeof l2, "%s %ds", L("Cooldown"), cd);
 		if (b.action == cardact_ext_learn && rank < d.ranks && u->hero_level < ext_ability_learn_level(d, rank + 1))
-			snprintf(l3, sizeof l3, "%s %d", L("Need: level"), ext_ability_learn_level(d, rank + 1));
+			snprintf(l3, sizeof l3, L("Needs level %d"), ext_ability_learn_level(d, rank + 1));
 		else if (!passive && u->ab_ready[i] > (int)st.current_frame)
-			snprintf(l3, sizeof l3, "%s %ds", L("Ready in"), (u->ab_ready[i] - (int)st.current_frame + 15) / 16);
+			snprintf(l3, sizeof l3, L("Ready in %ds"), (u->ab_ready[i] - (int)st.current_frame + 15) / 16);
 		if (!d.tooltip.empty()) effect = d.tooltip.c_str();
 	}
 
@@ -18779,6 +19218,7 @@ struct ui_functions: ui_util_functions {
 		// that runs every rendered frame in every mode. A plain store; read from the
 		// signal handler (never live st there). Cost when idle: one volatile write.
 		bwgame::diag::set_frame((uint32_t)st.current_frame);
+		sync_custom_player_colors();
 
 		if (now - last_fps >= std::chrono::seconds(1)) {
 			//ui::log("draw fps: %g\n", fps_counter / std::chrono::duration_cast<std::chrono::duration<double, std::ratio<1, 1>>>(now - last_fps).count());
@@ -19334,8 +19774,14 @@ struct ui_functions: ui_util_functions {
 					break;
 				case native_window::event_t::type_text_input:
 					if (chat_active || save_name_active) {
-						size_t cur = chat_input.size();
-						for (const char* p = e.text; *p && cur < (save_name_active ? 40u : 120u); ++p, ++cur) chat_input += *p;
+						// Capped in characters, not bytes, so a multi-byte letter is never cut in half.
+						int cur = text_cells(chat_input.c_str());
+						const int cap = save_name_active ? 40 : 120;
+						for (const char* p = e.text; *p && cur < cap; ++cur) {
+							const char* q = p;
+							utf8_next(p);
+							chat_input.append(q, p);
+						}
 					}
 					break;
 				case native_window::event_t::type_key_up:
@@ -19349,13 +19795,13 @@ struct ui_functions: ui_util_functions {
 					if (save_name_active) {
 						if (e.sym == '\r' || e.sym == '\n') confirm_save_name_prompt();
 						else if (e.sym == 27 || e.scancode == 270) cancel_save_name_prompt();
-						else if (e.sym == '\b' && !chat_input.empty()) chat_input.pop_back();
+						else if (e.sym == '\b') chat_pop_char();
 						break;
 					}
 					if (chat_active) {
 						if (e.sym == '\r' || e.sym == '\n') submit_chat();
 						else if (e.sym == 27 || e.scancode == 270) close_chat();
-						else if (e.sym == '\b' && !chat_input.empty()) chat_input.pop_back();
+						else if (e.sym == '\b') chat_pop_char();
 						break;
 					}
 					//if (e.sym == 'q') {
@@ -19392,6 +19838,8 @@ struct ui_functions: ui_util_functions {
 					if (e.sym == 'v' && !game_input) {
 						cycle_replay_vision(); // watch through a player's fog of war
 					}
+					if (e.scancode == 43 && game_input && pause_screen == 0)   // Tab / Shift+Tab: subgroups
+						cycle_subgroup(wnd.get_key_state(225) || wnd.get_key_state(229) ? -1 : 1);
 					if (e.sym == '\b') {
 						int t = 5 * 1000 / 42; // rewind 5s: 1 frame == 42ms at fastest (was 5*42/1000 == 0, a no-op)
 						if (replay_frame < t) replay_frame = 0;
@@ -19565,7 +20013,10 @@ struct ui_functions: ui_util_functions {
 			if (rgba_sprites && !lobby_mode) {
 				// v0.23: HD terrain first, then sprites on top.
 				if (hd_point_lights) frame_lights.clear(); // SHADOWS Phase 2: rebuilt during the sprite pass
+				hd_water_frame = hd_water && hd_terrain_active && hd_casc && wnd && wnd.water_ready();
+				if (hd_water_frame) { load_hd_water(); hd_water_frame = hd_water_st.ok; }
 				draw_tiles_hd(data, rgba_surface->pitch / 4);
+				prof_add(6);   // HD terrain alone; the rest of hd+queue is the sprite queue (draw_image_hd)
 				process_rgba_sprite_queue(data, rgba_surface->pitch / 4);
 				// SHADOWS Phase 2: additive point lights on the world, before fog/HUD.
 				if (hd_point_lights && !frame_lights.empty()) draw_point_lights(data, rgba_surface->pitch / 4);
@@ -19596,7 +20047,15 @@ struct ui_functions: ui_util_functions {
 
 		if (wnd) {
 			wnd.set_bloom(hd_bloom); // Faze 7: GPU bloom (0 = off, default)
-			wnd.set_post_gl(hd_post_gl, hd_post_effect, hd_post_strength / 100.0f, hd_gl_bloom / 100.0f, hd_grade / 100.0f); // SP: present stage + bloom + grade
+			// HD water needs the GL stage; without the user's own pipeline it runs with no effect.
+			const bool water_gl = hd_water && hd_terrain_active && hd_casc && !lobby_mode;
+			wnd.set_post_gl(hd_post_gl || water_gl, hd_post_gl ? hd_post_effect : 0, hd_post_strength / 100.0f, hd_gl_bloom / 100.0f, hd_grade / 100.0f); // SP: present stage + bloom + grade
+			if (hd_water_frame && !lobby_mode) {
+				native_window::window::water_params wp;
+				hd_water_params(wp);
+				wnd.set_water(&wp);
+			} else wnd.set_water(nullptr);
+			hd_water_frame = false;
 			wnd.update_surface();
 		}
 	}
@@ -19672,6 +20131,8 @@ struct ui_functions: ui_util_functions {
 			game_palette[i] = ((uint32_t)palette_colors[i].r << 16)
 				| ((uint32_t)palette_colors[i].g << 8) | (uint32_t)palette_colors[i].b;
 		}
+		custom_colors_dirty = true;
+		sync_custom_player_colors();
 	}
 
 	void reset() {

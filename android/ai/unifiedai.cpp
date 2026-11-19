@@ -14,8 +14,8 @@
 //   * Race auto-detect. openbw_bot_race() returns -1 ("any"), so the host keeps
 //     whatever race the launcher gave the slot (including Random). On the first
 //     frame the bot reads its own race from the base it owns (Command Center /
-//     Nexus / Hatchery) and the enemy's from theirs -- the host unit listing is
-//     not fog-limited, so both are known at once. No ABI change needed.
+//     Nexus / Hatchery); the enemy's comes from player_race() (ABI v6 lists only
+//     what the bot's player sees).
 //   * Declarative build orders. Each race x enemy-race matchup has an OPENING:
 //     a supply-gated list of {at_supply, unit, count} steps executed in order
 //     (the classic "9 pool", "1 gate core" notation). Authoring a new opening is
@@ -243,13 +243,14 @@ struct level_t {
 	//        3 + overlords watch every free expansion and the enemy's approach
 	int handicap_idle, saving; // % of ticks skipped entirely; 0 never bank, 1 bank for depots only, 2 full discipline
 	int micro;                 // 0 none (units trickle), 1 army acts as a group + retreats, 2 + focus fire / pull-back / kiting
+	int first_wave;            // micro 0: no attack before this frame; waves then go out on the cooldown, ahead or not
 };
 static const level_t LEVELS[4] = {
-	// tick react ord | wk/b maxwk | sm smp | ok dly | bases exw exf | wave  cd  an ad ret | upg tec rsh aa sc | idle sav mic
-	{ 48, 720, 4,     10, 20,      2, 0,     0, 6,     1, 99,   0,     30, 2400, 1, 1,  0,    0, 0, 0, 0, 0,    30, 0, 0 },  // 0 very easy
-	{ 24, 360, 8,     14, 40,      4, 0,     1, 3,     2, 20,   0,     24, 1200, 1, 1,  0,    1, 1, 1, 1, 1,    10, 1, 0 },  // 1 easy
-	{ 12,  96, 0,     16, 60,      4, 4,     2, 0,     3, 16, 1000,    18, 1200, 1, 1, 40,    3, 2, 2, 2, 2,     0, 2, 1 },  // 2 medium
-	{  6,   0, 0,     18, 70,      4, 4,     2, 0,     5, 16,  600,    18,  900, 10, 11, 70,  3, 3, 3, 3, 3,     0, 2, 2 },  // 3 hard
+	// tick react ord | wk/b maxwk | sm smp | ok dly | bases exw exf | wave  cd  an ad ret | upg tec rsh aa sc | idle sav mic | 1st wave
+	{ 48, 720, 4,     10, 20,      2, 0,     0, 6,     1, 99,   0,      8, 2880, 1, 0,  0,    0, 0, 0, 0, 0,    30, 0, 0,   10080 },  // 0 very easy
+	{ 24, 360, 8,     14, 40,      4, 0,     1, 3,     2, 20,   0,     12, 2160, 1, 0,  0,    1, 1, 1, 1, 1,    10, 1, 0,    8640 },  // 1 easy
+	{ 12,  96, 0,     16, 60,      4, 4,     2, 0,     3, 16, 1000,    18, 1200, 1, 1, 40,    3, 2, 2, 2, 2,     0, 2, 1,       0 },  // 2 medium
+	{  6,   0, 0,     18, 70,      4, 4,     2, 0,     5, 16,  600,    18,  900, 10, 11, 70,  3, 3, 3, 3, 3,     0, 2, 2,       0 },  // 3 hard
 };
 static const char* LEVEL_NAMES[4] = { "very easy", "easy", "medium", "hard" };
 
@@ -289,6 +290,7 @@ struct bot_t {
 	uint32_t rng = 0x9e3779b9u;                              // bot-side LCG for the idle handicap (not the sim's)
 	int32_t rush_since = -1, air_since = -1, exp_since = -1;  // react_delay bookkeeping per flag
 	bool scout_sent = false; int32_t scout_sent_frame = -1;   // worker scout (levels with scout >= 2)
+	int waves = 0;                                            // micro-0 attack waves sent
 	int orders_left = 0;                                      // per-tick army order budget (max_orders)
 	int workers_max_seen = 0;                                 // DIAG: detect worker losses
 	int tel_cc = 0, tel_rax = 0, tel_near = 0, tel_hold = 0;  // DIAG: why production did not happen this tick
@@ -319,9 +321,23 @@ struct bot_t {
 	int tel_out = 0, tel_en_near = 0;
 	int atk_peak = 0, atk_enemy0 = 0;   // most units the current attack had out / enemy army when it left
 	int tel_plan = 0, tel_ring = 0;                           // DIAG: placements by the planner vs the ring fallback
+	// Fog of war (host v6 lists only what we see): what we have seen of the enemy.
+	// Buildings stay until we look at their spot and they are gone; units for two
+	// minutes or until their last spot is in our sight again.
+	struct emem_t { ob_unit u; int32_t seen; };
+	emem_t em[800]; int nem = 0;
+	// Own units' life last tick: damage with no visible attacker near = something
+	// cloaked or burrowed is hitting us.
+	intptr_t prev_id[700]; int32_t prev_life[700]; int nprev = 0;
+	intptr_t stim_id[128]; int nstim = 0;                    // stimmed since the last tick: their HP loss is ours
+	int32_t ghost_x = 0, ghost_y = 0, ghost_frame = -100000; int ghost_hits = 0;
+	int tel_ghost = 0, tel_unload = 0, tel_held_atk = 0;     // DIAG
+	int32_t last_threat_frame = -100000;
+	struct visit_t { int32_t x, y, frame; };
+	visit_t visits[64]; int nvisits = 0;                      // army search: when each site was last looked at
 };
 
-extern "C" int openbw_bot_abi(void) { return 5; }
+extern "C" int openbw_bot_abi(void) { return 6; }
 // "any": the host keeps the launcher's slot race; we detect it from our base.
 extern "C" int openbw_bot_race(void) { return -1; }
 
@@ -788,11 +804,44 @@ extern "C" void openbw_bot_frame(void* p) {
 	b->orders_left = L->max_orders;   // army order budget for this tick (0 = unlimited)
 
 	int32_t me = api->my_player(h);
-	static ob_unit mine[700], neutral[700], theirs[700];
+	static ob_unit mine[700], neutral[700], theirs[900];
 	int32_t n = api->units(h, me, mine, 700);
 	int32_t nn = api->units(h, 11, neutral, 700);
 	int32_t enemy = (api->abi_version >= 2 && api->enemy_player) ? api->enemy_player(h) : -1;
-	int32_t ne = enemy >= 0 ? api->units(h, enemy, theirs, 700) : 0;
+	// theirs[0..nvis) = what we see now (real handles); theirs[nvis..ne) = remembered
+	// (id 0: never a command target). Tactics read the first part, strategy both.
+	int32_t nvis = enemy >= 0 ? api->units(h, enemy, theirs, 700) : 0;
+	int32_t ne = nvis;
+	const bool fog = api->abi_version >= 6;
+	// hit[i]: theirs[i] can be clicked on (an undetected cloaked unit cannot)
+	static bool hit[700];
+	for (int i = 0; i != nvis; ++i)
+		hit[i] = !fog || !api->unit_status || (api->unit_status(h, theirs[i].id) & (OB_US_CLOAKED | OB_US_DETECTED)) != OB_US_CLOAKED;
+	if (fog) {
+		for (int i = 0; i != nvis; ++i) {
+			int k = 0;
+			while (k != b->nem && b->em[k].u.id != theirs[i].id) ++k;
+			if (k == b->nem) {
+				if (b->nem < 800) ++b->nem;
+				else { k = 0; for (int q = 1; q != 800; ++q) if (b->em[q].seen < b->em[k].seen) k = q; }
+			}
+			b->em[k].u = theirs[i]; b->em[k].seen = frame;
+		}
+		int w = 0;
+		for (int k = 0; k != b->nem; ++k) {
+			bot_t::emem_t& e = b->em[k];
+			bool keep = true;
+			if (e.seen != frame) {
+				bool bld = e.u.type >= 106 && e.u.type < 203;
+				if (!bld && frame - e.seen > 2880) keep = false;
+				// its last spot is in our sight now and it is not there
+				for (int i = 0; i != n && keep; ++i) if (d2(mine[i].x, mine[i].y, e.u.x, e.u.y) < (int64_t)(bld ? 192 : 160) * (bld ? 192 : 160)) keep = false;
+			}
+			if (keep) b->em[w++] = e;
+		}
+		b->nem = w;
+		for (int k = 0; k != b->nem && ne < 900; ++k) if (b->em[k].seen != frame) { theirs[ne] = b->em[k].u; theirs[ne].id = 0; theirs[ne].idle = 0; ++ne; }
+	}
 
 	int32_t minerals = api->minerals(h, me), gas = api->gas(h, me);
 	int32_t su = api->supply_used(h, me), sa = api->supply_available(h, me);
@@ -810,6 +859,8 @@ extern "C" void openbw_bot_frame(void* p) {
 			for (int i = 0; i != n; ++i) { int t = mine[i].type; if (t == T_SCV) b->race = R_TERRAN; else if (t == P_PROBE) b->race = R_PROTOSS; else if (t == Z_DRONE) b->race = R_ZERG; if (b->race >= 0) break; }
 		}
 	}
+	// the lobby shows every player's race -- a player knows it without scouting
+	if (b->enemy_race == R_UNKNOWN && enemy >= 0 && api->abi_version >= 4 && api->player_race) b->enemy_race = api->player_race(h, enemy);
 	if (b->enemy_race == R_UNKNOWN && ne) {
 		for (int i = 0; i != ne; ++i) { int r = race_of_base(theirs[i].type); if (r >= 0) { b->enemy_race = r; break; } }
 		if (b->enemy_race == R_UNKNOWN)
@@ -857,7 +908,7 @@ extern "C" void openbw_bot_frame(void* p) {
 	b->enemy_expanded = delayed(E.bases > 1, b->exp_since);
 	{
 		int near = 0;
-		for (int i = 0; i != ne; ++i) if (is_army(theirs[i].type) && d2(theirs[i].x, theirs[i].y, base->x, base->y) < (int64_t)640 * 640) ++near;
+		for (int i = 0; i != nvis; ++i) if (is_army(theirs[i].type) && d2(theirs[i].x, theirs[i].y, base->x, base->y) < (int64_t)640 * 640) ++near;
 		b->rush = delayed(near >= 2 || (near >= 1 && frame < 4000), b->rush_since);
 		b->tel_near = near;
 	}
@@ -871,12 +922,131 @@ extern "C" void openbw_bot_frame(void* p) {
 	if (b->base_hp_last >= 0 && M.base_hp < b->base_hp_last - 8) b->defend_until = frame + 720;
 	b->base_hp_last = M.base_hp;
 
+	// ---- invisible attackers ----------------------------------------------------
+	// Under fog a burrowed lurker is not in the enemy list at all and a Dark Templar
+	// only as a shimmer. A player still sees it: units take damage and nothing they
+	// can see is close enough to have done it. That spot is where the scan / the
+	// detector goes and where the army must not stand without one.
+	b->tel_ghost = 0;
+	if (fog) {
+		auto reach = [](int t) -> int {   // how far a visible enemy of type t could have hit from (px)
+			switch (t) {
+			case P_ZEALOT: case Z_ZERGLING: case T_FIREBAT: case Z_ULTRA: case P_DT: case T_SCV: case P_PROBE: case Z_DRONE: case P_ARCHON: case P_DARK_ARCHON: return 112;
+			case T_TANK_SIEGED: return 448;
+			case Z_GUARDIAN: case P_REAVER: case P_CARRIER: return 352;
+			default: return 288;
+			}
+		};
+		int hits = 0; int64_t gx = 0, gy = 0;
+		for (int i = 0; i != n; ++i) {
+			ob_unit& u = mine[i];
+			if (!u.completed || (u.type >= 106 && u.type < 203)) continue;
+			int32_t life = u.hp + u.shields, prev = -1;
+			for (int k = 0; k != b->nprev; ++k) if (b->prev_id[k] == u.id) { prev = b->prev_life[k]; break; }
+			if (prev < 0 || life >= prev) continue;
+			bool stimmed = false;
+			for (int k = 0; k != b->nstim && !stimmed; ++k) if (b->stim_id[k] == u.id) stimmed = true;
+			if (stimmed) continue;
+			bool seen_attacker = false;
+			for (int k = 0; k != nvis && !seen_attacker; ++k) {
+				const ob_unit& e = theirs[k];
+				if (!(is_army(e.type) || is_worker(e.type) || e.type == T_BUNKER || e.type == P_CANNON || e.type == Z_SUNKEN || e.type == Z_SPORE || e.type == T_TURRET || e.type == P_HT || e.type == T_SCIENCE_VESSEL)) continue;
+				int st = api->unit_status(h, e.id);
+				if ((st & OB_US_CLOAKED) && !(st & OB_US_DETECTED)) continue;   // a shimmer is no visible attacker
+				int r = reach(e.type);
+				if (d2(e.x, e.y, u.x, u.y) <= (int64_t)r * r) seen_attacker = true;
+			}
+			if (!seen_attacker) { ++hits; gx += u.x; gy += u.y; }
+		}
+		// the shimmer itself: a cloaked, undetected fighter next to our units
+		for (int k = 0; k != nvis; ++k) {
+			const ob_unit& e = theirs[k];
+			if (!is_army(e.type)) continue;
+			int st = api->unit_status(h, e.id);
+			if (!(st & OB_US_CLOAKED) || (st & OB_US_DETECTED)) continue;
+			for (int i = 0; i != n; ++i) if (d2(mine[i].x, mine[i].y, e.x, e.y) < (int64_t)320 * 320) { hits += 2; gx += 2 * (int64_t)e.x; gy += 2 * (int64_t)e.y; b->enemy_cloak = true; break; }
+		}
+		b->nprev = 0; b->nstim = 0;
+		for (int i = 0; i != n && b->nprev < 700; ++i) { b->prev_id[b->nprev] = mine[i].id; b->prev_life[b->nprev] = mine[i].hp + mine[i].shields; ++b->nprev; }
+		if (hits) {
+			b->ghost_x = (int32_t)(gx / hits); b->ghost_y = (int32_t)(gy / hits);
+			// (units on high ground hit "from nowhere" too, so this alone never claims cloak)
+			b->ghost_hits = frame - b->ghost_frame < 720 ? b->ghost_hits + 1 : 1;
+			b->ghost_frame = frame; b->tel_ghost = hits;
+		}
+	}
+	const bool ghost_now = frame - b->ghost_frame <= L->tick * 2;
+	// cloak tech seen once is remembered (under fog it is only seen now and then)
+	b->enemy_cloak = b->enemy_cloak || E.cnt[P_DT] > 0 || E.cnt[Z_LURKER] > 0 || E.cnt[Z_LURKER_EGG] > 0 || E.cnt[P_ARBITER] > 0 || E.cnt[P_ARCHIVES] > 0 || E.cnt[T_GHOST] > 0;
+
 	// ---- expansion site (needed by the worker rules below) --------------------
 	int32_t exp_x = 0, exp_y = 0;
 	int32_t est_x = 0, est_y = 0;
 	bool have_enemy_start = api->enemy_start(h, &est_x, &est_y) != 0;
+	// Under fog the enemy start may be unknown (a 4-player map): a town hall we have
+	// seen is the answer; else the nearest start location we have not looked at yet
+	// is where we go looking (scout, overlord, army) -- est_guess marks that.
+	bool est_guess = false;
+	static uint8_t expl[MAXT]; bool have_expl = false;
+	auto explored_px = [&](int32_t x, int32_t y) -> bool {
+		if (!have_expl) {
+			have_expl = true;
+			if (!(api->abi_version >= 4 && api->explored_tiles && b->map_tw > 0 && b->map_tw * b->map_th <= MAXT && api->explored_tiles(h, expl, MAXT))) memset(expl, 1, sizeof expl);
+		}
+		int tx = x / 32, ty = y / 32;
+		if (tx < 0 || ty < 0 || tx >= b->map_tw || ty >= b->map_th) return true;
+		return expl[ty * b->map_tw + tx] != 0;
+	};
+	if (!have_enemy_start) {
+		for (int i = 0; i != ne; ++i) if (is_base(theirs[i].type)) { est_x = theirs[i].x; est_y = theirs[i].y; have_enemy_start = true; break; }
+	}
+	if (!have_enemy_start && api->abi_version >= 2 && api->start_locations) {
+		int32_t sl[16]; int ns = api->start_locations(h, sl, 8); int64_t bd = -1;
+		for (int i = 0; i != ns; ++i) {
+			if (d2(sl[2 * i], sl[2 * i + 1], b->home_x, b->home_y) < (int64_t)320 * 320 || explored_px(sl[2 * i], sl[2 * i + 1])) continue;
+			int64_t d = d2(sl[2 * i], sl[2 * i + 1], base->x, base->y);
+			if (bd < 0 || d < bd) { bd = d; est_x = sl[2 * i]; est_y = sl[2 * i + 1]; }
+		}
+		if (bd >= 0) { have_enemy_start = true; est_guess = true; }
+	}
 	collect_clusters(mine, n, theirs, ne, neutral, nn);
 	bool have_exp = find_expansion(b, frame, base->x, base->y, est_x, est_y, have_enemy_start, exp_x, exp_y) != 0;
+	// Where the army last looked: every base site and start location, keyed by position.
+	auto visit_slot = [&](int32_t x, int32_t y) -> bot_t::visit_t* {
+		for (int i = 0; i != b->nvisits; ++i) if (d2(x, y, b->visits[i].x, b->visits[i].y) < (int64_t)96 * 96) return &b->visits[i];
+		if (b->nvisits == 64) return nullptr;
+		b->visits[b->nvisits] = bot_t::visit_t{x, y, -100000};
+		return &b->visits[b->nvisits++];
+	};
+	if (fog) {
+		int32_t sl[16]; int ns = (api->abi_version >= 2 && api->start_locations) ? api->start_locations(h, sl, 8) : 0;
+		auto look = [&](int32_t x, int32_t y) {
+			bot_t::visit_t* v = visit_slot(x, y); if (!v) return;
+			for (int i = 0; i != n; ++i) if (!(mine[i].type >= 106 && mine[i].type < 203) && d2(mine[i].x, mine[i].y, x, y) < (int64_t)224 * 224) { v->frame = frame; break; }
+		};
+		for (int c = 0; c != g_ncls; ++c) look(g_cls[c].cx, g_cls[c].cy);
+		for (int i = 0; i != ns; ++i) look(sl[2 * i], sl[2 * i + 1]);
+	}
+	// Attack target: the known enemy building nearest to (fx,fy); else the start we
+	// are still guessing at; else the base site we have not looked at for longest
+	// (the enemy hides somewhere -- a player goes looking, the fog does not lift by itself).
+	auto pick_target = [&](int32_t fx, int32_t fy, int32_t& ox, int32_t& oy) -> bool {
+		const ob_unit* nb = nullptr; int64_t bd = -1;
+		for (int i = 0; i != ne; ++i) if (theirs[i].type >= 106 && theirs[i].type < 203) { int64_t d = d2(theirs[i].x, theirs[i].y, fx, fy); if (!nb || d < bd) { nb = &theirs[i]; bd = d; } }
+		if (nb) { ox = nb->x; oy = nb->y; return true; }
+		if (have_enemy_start && (est_guess || !fog || !explored_px(est_x, est_y))) { ox = est_x; oy = est_y; return true; }
+		if (!fog) return false;
+		const bot_t::visit_t* old = nullptr;
+		for (int i = 0; i != b->nvisits; ++i) {
+			const bot_t::visit_t& v = b->visits[i];
+			bool ours = false;
+			for (int k = 0; k != n && !ours; ++k) if (is_base(mine[k].type) && d2(mine[k].x, mine[k].y, v.x, v.y) < (int64_t)320 * 320) ours = true;
+			if (ours) continue;
+			if (!old || v.frame < old->frame || (v.frame == old->frame && d2(v.x, v.y, fx, fy) < d2(old->x, old->y, fx, fy))) old = &v;
+		}
+		if (!old) return false;
+		ox = old->x; oy = old->y; return true;
+	};
 
 	// ---- 1. workers: idle -> gas (staffed by worker count) else nearest mineral --
 	int wt = b->race == R_TERRAN ? T_SCV : b->race == R_PROTOSS ? P_PROBE : Z_DRONE;
@@ -939,6 +1109,8 @@ extern "C" void openbw_bot_frame(void* p) {
 		// use it there next tick (sending it home would ping-pong it forever).
 		if (d2(u.x, u.y, base->x, base->y) > (int64_t)1200 * 1200) {
 			if (have_exp && frame - b->want_expand_frame < 240 && d2(u.x, u.y, exp_x, exp_y) < (int64_t)400 * 400) continue;
+			// the enemy scout found an empty start: on to the next candidate
+			if (est_guess && b->scout_sent && frame - b->scout_sent_frame < 7200) { api->order_move(h, u.id, est_x, est_y); continue; }
 			api->order_move(h, u.id, base->x, base->y); continue;
 		}
 		if (M.done[gt] && on_gas < M.done[gt] * gas_per) {
@@ -1008,7 +1180,11 @@ extern "C" void openbw_bot_frame(void* p) {
 	// finished, gas stayed 0, the factory was never affordable). A worker in the
 	// gas cycle (81..84, HarvestGas=83 is INSIDE the refinery) can't take orders
 	// either. Mineral workers / idle only.
-	auto worker_busy = [](const ob_unit& u) { return (u.order >= 30 && u.order <= 33) || (u.order >= 81 && u.order <= 84); };
+	// (25 DroneStartBuild / 26 DroneBuild are the Zerg side of it: a drone walking to
+	// morph the new hatchery was re-tasked as builder / scout and never arrived --
+	// measured: the third hatchery "expanding" four times over 4000 frames while the
+	// bot banked 600-850 minerals and held its drones.)
+	auto worker_busy = [](const ob_unit& u) { return (u.order >= 30 && u.order <= 33) || u.order == 25 || u.order == 26 || (u.order >= 81 && u.order <= 84); };
 	ob_unit* scout = nullptr;
 	if (have_exp) {
 		int64_t bd = -1;
@@ -1032,8 +1208,8 @@ extern "C" void openbw_bot_frame(void* p) {
 		api->log(h, "UA:scout sent to the natural expansion");
 	}
 	if (L->scout >= 2 && !b->scout_sent && frame >= 1440 && wct >= 8) {
-		int32_t ex, ey;
-		if (api->enemy_start(h, &ex, &ey)) {
+		int32_t ex = est_x, ey = est_y;
+		if (have_enemy_start) {
 			for (int i = 0; i != n; ++i) {
 				if (mine[i].type != wt || !mine[i].completed || &mine[i] == scout || &mine[i] == builder || worker_busy(mine[i])) continue;
 				api->order_move(h, mine[i].id, ex, ey);
@@ -1222,7 +1398,7 @@ extern "C" void openbw_bot_frame(void* p) {
 		// that unit directly (an attack-move at its old position chases air).
 		ob_unit* threat = nullptr; int threat_n = 0; ob_unit* tbase = nullptr;
 		static ob_unit* thr[48]; int nthr = 0;
-		for (int i = 0; i != ne; ++i) {
+		for (int i = 0; i != nvis; ++i) {
 			if (!(is_army(theirs[i].type) || is_worker(theirs[i].type)) || !theirs[i].completed) continue;
 			for (int k = 0; k != n; ++k) if (is_base(mine[k].type) && d2(theirs[i].x, theirs[i].y, mine[k].x, mine[k].y) < (int64_t)544 * 544) {
 				++threat_n; if (nthr < 48) thr[nthr++] = &theirs[i];
@@ -1236,7 +1412,7 @@ extern "C" void openbw_bot_frame(void* p) {
 				if (!is_army(mine[i].type) || !mine[i].completed || d2(mine[i].x, mine[i].y, tbase->x, tbase->y) >= (int64_t)1600 * 1600) continue;
 				ob_unit* t = thr[0]; int64_t td = d2(mine[i].x, mine[i].y, t->x, t->y);
 				for (int k = 1; k < nthr; ++k) { int64_t d = d2(mine[i].x, mine[i].y, thr[k]->x, thr[k]->y); if (d < td) { t = thr[k]; td = d; } }
-				if (is_worker(t->type)) { if (L->max_orders == 0 || b->orders_left-- > 0) api->order_right_click(h, mine[i].id, t->id); }
+				if (is_worker(t->type) && hit[t - theirs]) { if (L->max_orders == 0 || b->orders_left-- > 0) api->order_right_click(h, mine[i].id, t->id); }
 				else amove(mine[i].id, t->x, t->y);
 			}
 			// (A single enemy WORKER is a scout: the mineral line does not chase it --
@@ -1247,23 +1423,32 @@ extern "C" void openbw_bot_frame(void* p) {
 				for (int i = 0; i != n && k < want; ++i) {
 					ob_unit& u = mine[i];
 					if (u.type != wt || !u.completed || worker_busy(u) || d2(u.x, u.y, threat->x, threat->y) > (int64_t)320 * 320) continue;
-					api->order_right_click(h, u.id, threat->id); ++k;
+					if (hit[threat - theirs]) api->order_right_click(h, u.id, threat->id); else amove(u.id, threat->x, threat->y);
+					++k;
 				}
 			}
 		}
 	}
+	// Zerg base detection: a spore colony per base (two at most) once cloak has shown up.
+	// (Any completed creep colony is morphed here -- into a spore while one is missing.)
+	int want_spore = (b->race == R_ZERG && b->enemy_cloak && L->anti_air > 0) ? (M.bases < 2 ? M.bases : 2) : 0;
+	if (b->race == R_ZERG) for (int i = 0; i != n; ++i) if (mine[i].type == Z_CREEP_COLONY && mine[i].completed && minerals >= 50) {
+		bool spore = M.done[Z_EVO] && M.cnt[Z_SPORE] < want_spore;
+		if (api->train(h, mine[i].id, spore ? Z_SPORE : Z_SUNKEN) && spore) ++M.cnt[Z_SPORE];
+	}
+	if (want_spore && M.done[Z_EVO] && M.cnt[Z_SPORE] < want_spore && M.cnt[Z_CREEP_COLONY] == 0 && minerals >= 75 && !cooldown) place(Z_CREEP_COLONY, 8);
+	if (want_spore && M.cnt[Z_EVO] == 0 && M.done[Z_POOL] && minerals >= 75 && !cooldown) place(Z_EVO, 10);
 	// Zerg static defence: a sunken or two at the front once the pool is up (a
 	// player's standard answer to early pressure), three under a rush. The colony
 	// is placed by the planner (defence role = front side, on creep) and morphed
 	// as soon as it finishes.
 	if (b->race == R_ZERG && L->rush_defense >= 2 && M.done[Z_POOL]) {
 		int want_sunk = b->rush ? 3 : (frame > 4500 ? (L->rush_defense >= 3 ? 2 : 1) : 0);
-		for (int i = 0; i != n; ++i) if (mine[i].type == Z_CREEP_COLONY && mine[i].completed && minerals >= 50) api->train(h, mine[i].id, Z_SUNKEN);
 		if (M.cnt[Z_CREEP_COLONY] + M.cnt[Z_SUNKEN] < want_sunk && minerals >= 75 && !cooldown) place(Z_CREEP_COLONY, 8);
 	}
 	// anti-air on enemy air: turrets / cannons (Zerg: hydras handle it)
 	// (Dark Templar are answered the same way: turrets and cannons are the detectors.)
-	if ((b->enemy_air || E.cnt[P_DT] > 0) && L->anti_air > 0 && !cooldown) {
+	if ((b->enemy_air || b->enemy_cloak) && L->anti_air > 0 && !cooldown) {
 		// the detector needs its tech building first
 		if (b->race == R_TERRAN && M.cnt[T_EBAY] == 0 && M.done[T_BARRACKS] && can_afford(T_EBAY)) place(T_EBAY, 13);
 		if (b->race == R_PROTOSS && M.cnt[P_FORGE] == 0 && M.done[P_GATEWAY] && can_afford(P_FORGE)) place(P_FORGE, 13);
@@ -1318,6 +1503,31 @@ extern "C" void openbw_bot_frame(void* p) {
 		}
 	}
 
+	// ---- 1b. Terran: a building whose SCV died stays half-built, and an unfinished
+	// depot blocks the next one (measured T0 Dark Crystal: supply 34/34 for seven
+	// minutes, 2000 minerals banked). Send an SCV to finish it.
+	if (b->race == R_TERRAN && frame % (L->tick * 4) < L->tick) {
+		for (int k = 0; k != n; ++k) {
+			const ob_unit& bl = mine[k];
+			if (bl.completed || bl.type < 106 || bl.type >= 203) continue;
+			if (bl.type == T_COMSAT || bl.type == T_MACHINE_SHOP || bl.type == 108 || bl.type == 115 || bl.type == 117 || bl.type == 118) continue;   // add-ons build themselves
+			bool worked = false;
+			for (int i = 0; i != n && !worked; ++i) if (mine[i].type == T_SCV && mine[i].order == 33 && d2(mine[i].x, mine[i].y, bl.x, bl.y) < (int64_t)160 * 160) worked = true;
+			if (worked) continue;
+			bool hot = false;
+			for (int i = 0; i != nvis && !hot; ++i) if (is_army(theirs[i].type) && d2(theirs[i].x, theirs[i].y, bl.x, bl.y) < (int64_t)320 * 320) hot = true;
+			if (hot) continue;
+			const ob_unit* scv = nullptr; int64_t sd = 0;
+			for (int i = 0; i != n; ++i) {
+				if (mine[i].type != T_SCV || !mine[i].completed || worker_busy(mine[i])) continue;
+				int64_t d = d2(mine[i].x, mine[i].y, bl.x, bl.y);
+				if (!scv || d < sd) { scv = &mine[i]; sd = d; }
+			}
+			if (scv) { api->order_right_click(h, scv->id, bl.id); api->log(h, "UA:resume unfinished building"); }
+			break;
+		}
+	}
+
 	// ---- 2. supply ahead -- AFTER the opening decision: the build order owns
 	// the money; a margin depot only jumps the queue when a block is imminent.
 	// (Measured L3 TvP: a 14-supply margin fired a depot every time minerals hit
@@ -1345,7 +1555,10 @@ extern "C" void openbw_bot_frame(void* p) {
 	// ---- 4b. float valve: money piling up is spent on production capacity -------
 	// (even mid-opening: a stuck tech step must not leave 2000 minerals idle --
 	// measured Z3: 1300-2600 banked with every larva used and the Lair step pending)
-	if (L->saving == 2 && minerals >= 600 && !cooldown && builder) {
+	// (very easy / easy Zerg: one hatchery's larvae capped it at 16-19 supply from
+	// minute 4 to 8 with 600 banked -- a 2nd / 3rd hatchery even at those levels)
+	const bool zlow = b->race == R_ZERG && L->saving < 2 && minerals >= 350 && M.cnt[Z_HATCH] + M.cnt[Z_LAIR] + M.cnt[Z_HIVE] < 3 + L->saving;
+	if (((L->saving == 2 && minerals >= 600) || zlow) && !cooldown && builder) {
 		if (b->race == R_ZERG) {
 			if (M.larvae == 0 && M.cnt[Z_HATCH] + M.cnt[Z_LAIR] + M.cnt[Z_HIVE] < 7 && b->pending_type != Z_HATCH
 			    && ensure_grid() && plan_build(pc, builder->id, Z_HATCH)) { mark_placed(Z_HATCH); ++b->tel_plan; }
@@ -1451,6 +1664,7 @@ extern "C" void openbw_bot_frame(void* p) {
 	}
 	// A bunker is only worth its 100 minerals with marines inside: idle marines
 	// next to it walk in (right-click = enter) while the base is under pressure.
+	if (pressure || b->rush || b->tel_threat) b->last_threat_frame = frame;
 	if (b->race == R_TERRAN && M.done[T_BUNKER] && (pressure || b->rush || b->tel_threat)) {
 		for (int k = 0; k != n; ++k) {
 			if (mine[k].type != T_BUNKER || !mine[k].completed) continue;
@@ -1462,6 +1676,20 @@ extern "C" void openbw_bot_frame(void* p) {
 			}
 		}
 	}
+	// ...and they come out again. Marines loaded under pressure used to sit in the
+	// bunker for the rest of the game (measured: ~1000 marine-seconds per game with
+	// no enemy anywhere near) while the attack went without them. Out once the base
+	// has been quiet for half a minute, or when our army leaves to attack -- as long
+	// as nothing is near that bunker.
+	if (b->race == R_TERRAN && M.done[T_BUNKER] && api->abi_version >= 6 && api->unit_status && !pressure && !b->rush && b->tel_threat == 0
+	    && (frame - b->last_threat_frame > 720 || b->attacking)) {
+		for (int k = 0; k != n; ++k) {
+			if (mine[k].type != T_BUNKER || !mine[k].completed || !(api->unit_status(h, mine[k].id) & OB_US_CARGO)) continue;
+			bool near = false;
+			for (int i = 0; i != nvis && !near; ++i) if ((is_army(theirs[i].type) || is_worker(theirs[i].type)) && d2(theirs[i].x, theirs[i].y, mine[k].x, mine[k].y) < (int64_t)448 * 448) near = true;
+			if (!near && api->use_ability(h, mine[k].id, OB_AB_UNLOAD_ALL)) { ++b->tel_unload; api->log(h, "UA:bunker unloaded"); }
+		}
+	}
 
 	// ---- 5b. mobile detection -----------------------------------------------------
 	// Cloaked / burrowed enemies cannot be shot without a detector NEXT TO THE ARMY.
@@ -1471,7 +1699,6 @@ extern "C" void openbw_bot_frame(void* p) {
 	// race's mobile detector: Protoss Robotics -> Observatory -> Observers, Terran
 	// Starport + Control Tower + Science Facility -> Science Vessel. (Zerg already
 	// has it: an overlord travels with the army, see the army section.)
-	b->enemy_cloak = E.cnt[P_DT] > 0 || E.cnt[Z_LURKER] > 0 || E.cnt[Z_LURKER_EGG] > 0 || E.cnt[P_ARBITER] > 0 || E.cnt[P_ARCHIVES] > 0 || E.cnt[T_GHOST] > 0;
 	{
 		bool want_detect = L->tech_depth >= 2 && (b->enemy_cloak || (L->tech_depth >= 3 && frame > 12000));
 		auto training = [&](const ob_unit* u) -> bool { ob_unit_ex ex; return api->abi_version >= 3 && api->unit_ex && api->unit_ex(h, u->id, &ex) && ex.is_training; };
@@ -1563,8 +1790,14 @@ extern "C" void openbw_bot_frame(void* p) {
 		// Overlords already morphing count as supply on the way (the old test did not
 		// see them, so every larva of a tick became an overlord, or -- after a raid
 		// killed the overlord cloud -- only one was rebuilt per pass). Up to 4 at once.
-		int pending_ov = 0;
-		if (api->abi_version >= 3 && api->unit_ex) for (int i = 0; i != n; ++i) if (mine[i].type == 36 /*egg*/) { ob_unit_ex ex; if (api->unit_ex(h, mine[i].id, &ex) && ex.build_type == Z_OVERLORD) ++pending_ov; }
+		int pending_ov = 0, pend_ling = 0, pend_hydra = 0, pend_muta = 0;
+		if (api->abi_version >= 3 && api->unit_ex) for (int i = 0; i != n; ++i) if (mine[i].type == 36 /*egg*/) {
+			ob_unit_ex ex; if (!api->unit_ex(h, mine[i].id, &ex)) continue;
+			if (ex.build_type == Z_OVERLORD) ++pending_ov;
+			else if (ex.build_type == Z_ZERGLING) pend_ling += 2;
+			else if (ex.build_type == Z_HYDRA) ++pend_hydra;
+			else if (ex.build_type == Z_MUTA) ++pend_muta;
+		}
 		int want_ov = 0;
 		if (sa < 400) { int eff = sa + 16 * pending_ov; while (eff - su <= margin && want_ov < 4) { ++want_ov; eff += 16; } }
 		int mleft = minerals, gleft = gas;
@@ -1594,6 +1827,13 @@ extern "C" void openbw_bot_frame(void* p) {
 		if (M.done[Z_POOL] && frame > 7000 && safety < 12) safety = 12;
 		if (L->rush_defense == 0) safety = 0;   // very easy: drones first, always
 		bool army_first = M.str < safety;
+		// ...and a share of the supply, not only an answer to what was SEEN: under fog
+		// the enemy army is mostly unseen, and "safety" alone left medium / hard Zerg
+		// at 12-23 army supply next to 70 drones (measured ZvP).
+		if (M.done[Z_POOL]) {
+			int pct = L->micro >= 1 ? (frame < 7200 ? 0 : frame < 14400 ? 35 : 45) : (frame < 7200 ? 10 : 25);
+			if (M.str * 100 < su * pct) army_first = true;
+		}
 		// "Army first" must not mean "no economy": zerglings are strength 1, so a
 		// safety of 50 kept every larva on army for minutes and the drone count sat
 		// at 12-16 (measured). Only when we are actually BEHIND the enemy, or someone
@@ -1611,6 +1851,34 @@ extern "C" void openbw_bot_frame(void* p) {
 			bool drone_turn = !army_first || (!army_only && (larva_i++ & 1) == 0);
 			if (drone_turn && M.workers < want_workers && mleft >= 50 && !b->rush && !hold_workers) { if (api->train(h, lv, Z_DRONE)) mleft -= 50; continue; }
 			if (saving && !b->rush && !army_first) continue;   // bank for the pending building / expansion
+			// Medium / hard: the army has a composition per matchup, in supply shares --
+			// hydralisks (and the lurkers they become) carry it against Protoss, lings +
+			// lurkers + a muta flock against Terran, lings + mutas in the mirror. Each larva
+			// becomes whatever is furthest below its share. Measured before: 77 lings, 13
+			// hydras, 2 lurkers, 0.7 mutas a game at hard -- lings fed into zealots, marines
+			// and bunkers.
+			if (L->micro >= 1 && M.done[Z_POOL]) {
+				int sl = 30, sh = 70, sm = 0;
+				if (b->enemy_race == R_TERRAN) { sl = 40; sh = 45; sm = 15; }
+				else if (b->enemy_race == R_ZERG) { sl = 55; sh = 15; sm = 30; }
+				if (b->enemy_air) { int d = sl < 20 ? sl : 20; sl -= d; sh += d; }
+				if (!M.done[Z_SPIRE]) { sl += sm; sm = 0; }
+				if (!M.done[Z_HYDRA_DEN]) { sl += sh; sh = 0; }
+				int hl = M.cnt[Z_ZERGLING] + pend_ling, hh = (M.cnt[Z_HYDRA] + pend_hydra) * 2 + lurk_have * 4, hm = (M.cnt[Z_MUTA] + pend_muta) * 4;
+				int tot = hl + hh + hm + 4;
+				int dl = sl * tot - hl * 100, dh = sh * tot - hh * 100, dm = sm * tot - hm * 100;
+				bool can_h = sh > 0 && mleft >= 75 && gleft >= 25, can_m = sm > 0 && mleft >= 100 && gleft >= 100;
+				int pick = Z_ZERGLING; int best = dl;
+				if (can_h && dh > best) { pick = Z_HYDRA; best = dh; }
+				if (can_m && dm > best) { pick = Z_MUTA; best = dm; }
+				if (pick == Z_ZERGLING && mleft < 50) continue;
+				if (api->train(h, lv, pick)) {
+					if (pick == Z_ZERGLING) { mleft -= 50; pend_ling += 2; }
+					else if (pick == Z_HYDRA) { mleft -= 75; gleft -= 25; ++pend_hydra; }
+					else { mleft -= 100; gleft -= 100; ++pend_muta; }
+				}
+				continue;
+			}
 			if (want_muta && minerals >= 100) { api->train(h, lv, Z_MUTA); continue; }
 			// Hydralisks are a THIRD of the army, not all of it: their explosive damage
 			// is halved against small units (marines, zealots, zerglings), so a pure
@@ -1792,6 +2060,29 @@ extern "C" void openbw_bot_frame(void* p) {
 		}
 	}
 
+	// ---- 7c. detection where it is needed -------------------------------------------
+	int comsat_e = 0;
+	if (b->race == R_TERRAN && M.done[T_COMSAT] && api->abi_version >= 3 && api->unit_ex)
+		for (int i = 0; i != n; ++i) if (mine[i].type == T_COMSAT && mine[i].completed) { ob_unit_ex ex; if (api->unit_ex(h, mine[i].id, &ex) && ex.energy > comsat_e) comsat_e = ex.energy; }
+	const bool can_scan = comsat_e >= 50;
+	auto is_detector = [&](const ob_unit& u) { return u.completed && (u.type == T_TURRET || u.type == Z_SPORE || u.type == P_CANNON || u.type == T_SCIENCE_VESSEL || u.type == P_OBSERVER || u.type == Z_OVERLORD); };
+	bool ghost_covered = false;
+	if (ghost_now) for (int i = 0; i != n && !ghost_covered; ++i) if (is_detector(mine[i]) && d2(mine[i].x, mine[i].y, b->ghost_x, b->ghost_y) < (int64_t)256 * 256) ghost_covered = true;
+	// an attack into known cloak goes only with a way to reveal it (medium / hard)
+	const bool detect_ok = !b->enemy_cloak || L->tech_depth < 2
+		|| (b->race == R_ZERG ? M.done[Z_OVERLORD] >= 2 : (M.done[T_SCIENCE_VESSEL] + M.done[P_OBSERVER] > 0 || can_scan));
+	// a mobile detector goes to the spot where something invisible is hitting us
+	if (ghost_now && !ghost_covered && L->micro >= 1 && frame - b->last_escort_order >= 48) {
+		ob_unit* pick = nullptr; int64_t bd = -1;
+		for (int i = 0; i != n; ++i) {
+			ob_unit& u = mine[i];
+			if (!u.completed || !(u.type == T_SCIENCE_VESSEL || u.type == P_OBSERVER || (u.type == Z_OVERLORD && u.hp >= 150))) continue;
+			int64_t d = d2(u.x, u.y, b->ghost_x, b->ghost_y);
+			if (d < (int64_t)2400 * 2400 && (!pick || d < bd)) { pick = &u; bd = d; }
+		}
+		if (pick) { api->order_move(h, pick->id, b->ghost_x, b->ghost_y); pick->order = 255; b->last_escort_order = frame; }
+	}
+
 	// ---- 8. army -----------------------------------------------------------------
 	// micro 0 (very easy / easy): the old behaviour -- idle units are attack-moved at
 	// the enemy start whenever a wave is ready; units trickle and never retreat.
@@ -1809,14 +2100,16 @@ extern "C" void openbw_bot_frame(void* p) {
 			if (frame < b->defend_until) {
 				for (int i = 0; i != n; ++i) if (is_army(mine[i].type) && mine[i].completed) amove(mine[i].id, base->x, base->y);
 			} else {
-				int wave = L->wave_min + (b->race == R_ZERG ? 6 : 0);
-				if (b->enemy_expanded) wave += 6;
+				// Very easy / easy: small waves on a clock, from first_wave on, a little
+				// bigger each time (measured before: 24-30 unit waves only when "ahead" --
+				// half the games saw no attack at all, the rest the first at 10-11 min).
+				int wave = L->wave_min + (b->race == R_ZERG ? 4 : 0) + 2 * (b->waves < 6 ? b->waves : 6);
 				bool ahead = M.army * L->ahead_num >= E.army * L->ahead_den;
-				if (M.army >= wave && ahead && frame - b->last_attack_frame >= L->attack_cooldown) {
+				if (frame >= L->first_wave && M.army >= wave && ahead && frame - b->last_attack_frame >= L->attack_cooldown) {
 					int32_t ex = 0, ey = 0;
-					if (api->enemy_start(h, &ex, &ey)) {
+					if (pick_target(base->x, base->y, ex, ey)) {
 						for (int i = 0; i != n; ++i) if (is_army(mine[i].type) && mine[i].completed && mine[i].idle) amove(mine[i].id, ex, ey);
-						b->last_attack_frame = frame;
+						b->last_attack_frame = frame; ++b->waves;
 						api->log(h, "attack wave");
 					}
 				}
@@ -1860,7 +2153,7 @@ extern "C" void openbw_bot_frame(void* p) {
 		if (n_out) spread /= n_out;
 		// what the group is facing: fighters within 14 tiles, static defence counts double
 		int en_near = 0, en_str = 0, out_str = 0;
-		for (int i = 0; i != ne && n_out; ++i) {
+		for (int i = 0; i != nvis && n_out; ++i) {
 			int t = theirs[i].type;
 			bool stat = t == T_BUNKER || t == P_CANNON || t == Z_SUNKEN;
 			if (!(is_army(t) || stat) || !theirs[i].completed) continue;
@@ -1880,9 +2173,11 @@ extern "C" void openbw_bot_frame(void* p) {
 			// stream kept feeding it.) Call it off and wait a full cooldown.
 			if (n_out > b->atk_peak) b->atk_peak = n_out;
 			bool bleeding = b->atk_peak >= 6 && n_out * 2 <= b->atk_peak && E.str * 5 >= b->atk_enemy0 * 4;
-			if ((local_bad || global_bad || bleeding) && frame - b->atk_since > 240) {
+			// hit by what we cannot see, nothing on the way to reveal it and no scan: leave
+			bool blind = ghost_now && b->enemy_cloak && b->ghost_hits >= 2 && !ghost_covered && !can_scan && d2(b->ghost_x, b->ghost_y, cx, cy) < (int64_t)640 * 640;
+			if ((local_bad || global_bad || bleeding || blind) && frame - b->atk_since > 240) {
 				b->defend_until = frame + 600; b->attacking = false; b->last_attack_frame = frame; retreating = true;
-				char s[96]; snprintf(s, sizeof s, "UA:retreat -- %d of ours face %d (army %d vs %d)", n_out, en_near, M.army, E.army); api->log(h, s);
+				char s[128]; snprintf(s, sizeof s, "UA:retreat -- %d of ours face %d (army %d vs %d) why %d%d%d%d", n_out, en_near, M.army, E.army, (int)local_bad, (int)global_bad, (int)bleeding, (int)blind); api->log(h, s);
 			} else if (n_out == 0 && n_home_idle < 4 && frame - b->atk_since > 720) {
 				b->attacking = false; b->last_attack_frame = frame;   // the wave is gone
 			}
@@ -1903,11 +2198,10 @@ extern "C" void openbw_bot_frame(void* p) {
 			bool have_t = false;
 			for (int i = 0; i != ne && !have_t; ++i) if (theirs[i].type >= 106 && theirs[i].type < 203 && d2(theirs[i].x, theirs[i].y, b->atk_x, b->atk_y) < (int64_t)320 * 320) have_t = true;
 			if (!have_t) {
-				ob_unit* nb = nullptr; int64_t bd = -1;
-				for (int i = 0; i != ne; ++i) if (theirs[i].type >= 106 && theirs[i].type < 203) { int64_t d = d2(theirs[i].x, theirs[i].y, cx, cy); if (!nb || d < bd) { nb = &theirs[i]; bd = d; } }
-				if (!nb) for (int i = 0; i != ne; ++i) { int64_t d = d2(theirs[i].x, theirs[i].y, cx, cy); if (!nb || d < bd) { nb = &theirs[i]; bd = d; } }
-				if (nb) { b->atk_x = nb->x; b->atk_y = nb->y; b->last_army_order = -100000; }
-				else { b->attacking = false; b->last_attack_frame = frame; }
+				int32_t tx2, ty2;
+				if (pick_target(cx, cy, tx2, ty2)) {
+					if (d2(tx2, ty2, b->atk_x, b->atk_y) > (int64_t)64 * 64) { b->atk_x = tx2; b->atk_y = ty2; b->last_army_order = -100000; }
+				} else { b->attacking = false; b->last_attack_frame = frame; }
 			}
 			if (b->attacking && frame - b->last_army_order >= 72) {
 				b->last_army_order = frame;
@@ -1934,7 +2228,7 @@ extern "C" void openbw_bot_frame(void* p) {
 				}
 				// The detector travels WITH the body of the army: every Science Vessel /
 				// Observer we own, and for Zerg one overlord (two against cloak tech).
-				if (mid && frame - b->last_escort_order >= 96) {
+				if (mid && frame - b->last_escort_order >= 96 && !(ghost_now && !ghost_covered)) {
 					b->last_escort_order = frame;
 					int want_ov = b->race == R_ZERG ? (b->enemy_cloak ? 2 : 1) : 0;
 					for (int r = 0; r != want_ov; ++r) {
@@ -1982,7 +2276,8 @@ extern "C" void openbw_bot_frame(void* p) {
 			// enough -- the side with the bigger economy re-maxes faster.
 			if (su >= 340) ahead = true;
 			else if (frame > 14000 && M.str >= E.str + E.sdef) ahead = true;
-			if (!b->rush && b->tel_threat == 0 && M.str >= wave && ahead && frame - b->last_attack_frame >= L->attack_cooldown) {
+			if (!detect_ok && M.str >= wave && ahead) ++b->tel_held_atk;
+			if (!b->rush && b->tel_threat == 0 && M.str >= wave && ahead && detect_ok && frame - b->last_attack_frame >= L->attack_cooldown) {
 				int32_t ex = 0, ey = 0; bool got = false;
 				if (b->enemy_expanded) {   // hit the enemy's newest base (the one farthest from their start)
 					ob_unit* far_base = nullptr; int64_t bd = -1;
@@ -2000,7 +2295,7 @@ extern "C" void openbw_bot_frame(void* p) {
 		}
 
 		// ---- unit-level micro (hard) ---------------------------------------------
-		if (micro >= 2 && ne > 0 && api->abi_version >= 3 && api->unit_ex) {
+		if (micro >= 2 && nvis > 0 && api->abi_version >= 3 && api->unit_ex) {
 			auto range_px = [](int t) -> int {
 				switch (t) {
 				case T_MARINE: case P_DRAGOON: case Z_HYDRA: case P_SCOUT: return 128;
@@ -2030,11 +2325,12 @@ extern "C" void openbw_bot_frame(void* p) {
 				int r = range_px(u.type);
 				if (!r || !u.completed) continue;
 				ob_unit* weak = nullptr; int wl = 0; ob_unit* melee = nullptr; int64_t md = -1; bool any_near = false;
-				for (int k = 0; k != ne; ++k) {
+				for (int k = 0; k != nvis; ++k) {
 					ob_unit& e = theirs[k];
 					if (!e.completed || !(is_army(e.type) || is_worker(e.type))) continue;
 					int64_t d = d2(u.x, u.y, e.x, e.y);
 					if (d < (int64_t)288 * 288) any_near = true;
+					if (!hit[k]) continue;
 					if (d <= (int64_t)(r + 24) * (r + 24)) { int life = e.hp + e.shields; if (!weak || life < wl) { weak = &e; wl = life; } }
 					if (slow_melee(u.type, e.type) && d < (int64_t)224 * 224 && (!melee || d < md)) { melee = &e; md = d; }
 				}
@@ -2074,7 +2370,7 @@ extern "C" void openbw_bot_frame(void* p) {
 		// enemy GROUND things worth shooting at: fighters, workers, static defence
 		static ob_unit* eg[700]; int neg = 0;        // ground fighters / workers
 		static ob_unit* eb[256]; int neb = 0;        // buildings
-		for (int k = 0; k != ne; ++k) {
+		for (int k = 0; k != nvis; ++k) {
 			ob_unit& e = theirs[k];
 			if (e.type >= 106 && e.type < 203) { if (neb < 256) eb[neb++] = &e; continue; }
 			if (!e.completed || is_air_unit(e.type)) continue;
@@ -2106,28 +2402,33 @@ extern "C" void openbw_bot_frame(void* p) {
 				ob_unit& u = mine[i];
 				if (!u.completed || !((u.type == T_MARINE && u.hp > 30) || (u.type == T_FIREBAT && u.hp > 40))) continue;
 				int64_t d = nearest_ground(u, false);
-				if (d >= 0 && d <= (int64_t)192 * 192) { if (api->use_ability(h, u.id, OB_AB_STIM)) ++b->ab_stim; }
+				if (d >= 0 && d <= (int64_t)192 * 192) { if (api->use_ability(h, u.id, OB_AB_STIM)) { ++b->ab_stim; if (b->nstim < 128) b->stim_id[b->nstim++] = u.id; } }
 			}
 		}
-		// -- Terran: scanner sweep on a cloaked unit that is next to ours with no
-		// detector of ours near it.
-		if (b->race == R_TERRAN && M.done[T_COMSAT] && frame - b->last_scan >= 300) {
-			for (int k = 0; k != ne && frame - b->last_scan >= 300; ++k) {
+		// -- Terran: scanner sweep where something invisible is hitting us (a burrowed
+		// lurker is not even listed under fog) or on a cloaked shimmer next to our units,
+		// when no detector of ours already covers it.
+		if (b->race == R_TERRAN && can_scan && frame - b->last_scan >= 240) {
+			int32_t sx = 0, sy = 0; bool want = false;
+			if (ghost_now && !ghost_covered) { sx = b->ghost_x; sy = b->ghost_y; want = true; }
+			for (int k = 0; k != nvis && !want; ++k) {
 				ob_unit& e = theirs[k];
-				if (!(e.type == P_DT || e.type == Z_LURKER || e.type == T_GHOST || e.type == T_WRAITH) || !e.completed) continue;
+				bool hidden = fog ? ((api->unit_status(h, e.id) & (OB_US_CLOAKED | OB_US_DETECTED)) == OB_US_CLOAKED)
+				                  : (e.type == P_DT || e.type == Z_LURKER || e.type == T_GHOST || e.type == T_WRAITH);
+				if (!hidden || !e.completed || !is_army(e.type)) continue;
 				bool near_us = false, covered = false;
 				for (int i = 0; i != n; ++i) {
 					int64_t d = d2(mine[i].x, mine[i].y, e.x, e.y);
-					if ((mine[i].type == T_TURRET || mine[i].type == T_SCIENCE_VESSEL) && mine[i].completed && d < (int64_t)224 * 224) { covered = true; break; }
+					if (is_detector(mine[i]) && d < (int64_t)224 * 224) { covered = true; break; }
 					if (d < (int64_t)256 * 256 && (is_army(mine[i].type) || is_worker(mine[i].type) || is_base(mine[i].type))) near_us = true;
 				}
-				if (!near_us || covered) continue;
-				for (int i = 0; i != n; ++i) {
-					if (mine[i].type != T_COMSAT || !mine[i].completed) continue;
-					ob_unit_ex ex;
-					if (!api->unit_ex(h, mine[i].id, &ex) || ex.energy < 50) continue;
-					if (api->cast_at(h, mine[i].id, OB_ORDER_SCANNER_SWEEP, e.x, e.y)) { b->last_scan = frame; ++b->ab_scan; break; }
-				}
+				if (near_us && !covered) { sx = e.x; sy = e.y; want = true; }
+			}
+			for (int i = 0; i != n && want; ++i) {
+				if (mine[i].type != T_COMSAT || !mine[i].completed) continue;
+				ob_unit_ex ex;
+				if (!api->unit_ex(h, mine[i].id, &ex) || ex.energy < 50) continue;
+				if (api->cast_at(h, mine[i].id, OB_ORDER_SCANNER_SWEEP, sx, sy)) { b->last_scan = frame; ++b->ab_scan; break; }
 			}
 		}
 		// -- Zerg: lurkers attack only while burrowed. Burrow with ground enemies
@@ -2181,16 +2482,16 @@ extern "C" void openbw_bot_frame(void* p) {
 		b->workers_max_seen = M.workers;
 	}
 	if (frame % 720 == 0) {
-		char s[260];
+		char s[320];
 		snprintf(s, sizeof s, "UA f%d L%d %s vs %s bo %d want %d afford %d save %d hold %d cc %d rax %d near %d bord %d wk %d/%d army %d/%d bases %d/%d min %d gas %d sup %d/%d%s%s%s",
 		         frame, b->level_id, race_name(b->race), race_name(b->enemy_race), b->bo_done, b->bo_want, b->bo_afford, b->bo_saving, b->tel_hold, b->tel_cc, b->tel_rax, b->tel_near, b->builder_order,
 		         M.workers, want_workers, M.army, E.army, M.bases, E.bases,
 		         minerals, gas, su, sa, b->rush ? " RUSH" : "", b->enemy_expanded ? " EXP" : "", b->enemy_air ? " AIR" : "");
 		api->log(h, s);
 		if (L->micro > 0) {
-			snprintf(s, sizeof s, "UA:army f%d atk %d out %d facing %d target tile (%d,%d) defend_until %d threat %d | abilities siege %d stim %d burrow %d storm %d scan %d",
+			snprintf(s, sizeof s, "UA:army f%d atk %d out %d facing %d target tile (%d,%d) defend_until %d threat %d | abilities siege %d stim %d burrow %d storm %d scan %d | cloak %d ghost hits %d unloads %d held %d",
 			         frame, (int)b->attacking, b->tel_out, b->tel_en_near, b->atk_x / 32, b->atk_y / 32, b->defend_until, b->tel_threat,
-			         b->ab_siege, b->ab_stim, b->ab_burrow, b->ab_storm, b->ab_scan);
+			         b->ab_siege, b->ab_stim, b->ab_burrow, b->ab_storm, b->ab_scan, (int)b->enemy_cloak, b->ghost_hits, b->tel_unload, b->tel_held_atk);
 			api->log(h, s);
 		}
 	}

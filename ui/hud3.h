@@ -948,7 +948,7 @@
 				const char* rank = unit_rank_name(u);
 				if (const ext_hero_def* hd = ext_hero(u)) {
 					status(hd->name.empty() ? hd->id.c_str() : hd->name.c_str(), th.amber);
-					char pts[32]; snprintf(pts, sizeof pts, "%s: %d", this->L("Skill points"), u->hero_points);
+					char pts[32]; snprintf(pts, sizeof pts, this->L("Skill points: %d"), u->hero_points);
 					status(pts, 0xffc8b878u);
 				} else if (rank && !bldg) status(rank, 0xffc8b878u);
 				if (work.busy) {

@@ -203,6 +203,8 @@ struct global_state {
 
 	// 1.16.1 requirement tables (eud::req_base..req_end) read from the user's StarCraft.exe; empty = absent.
 	a_vector<uint8_t> req_tables;
+	// 1.16.1 button arrays + button-set table (eud::buttons_base..buttons_end), same source; UI only.
+	a_vector<uint8_t> exe_buttons;
 	a_vector<uint8_t> units_dat;
 	a_vector<uint8_t> weapons_dat;
 	a_vector<uint8_t> upgrades_dat;
@@ -270,6 +272,9 @@ struct game_state {
 		bool legacy_trigger_seconds = false;
 		// bit12: the requirement tables read from the user's StarCraft.exe are in effect (LAN: every peer's tables match).
 		bool eud_requirements = false;
+		// bit13 + bits16-19: the local player's slot, which 1.16.1 copies to 0x57F1B0 at game start
+		// (0x49CC40). Single player only: LAN peers differ, so it stays -1 (plain memory) there.
+		int eud_local_player = -1;
 	} qol;
 
 	size_t map_tile_width;
@@ -283,6 +288,8 @@ struct game_state {
 	// Raw STR (or STRx, str_ext) section: EUD maps address it through the 0x5993D4 pointer.
 	a_vector<uint8_t> str_section;
 	bool str_ext = false;
+	// CRGB (SC:R), render only: a slot with a custom colour gets colour 16 + slot and its RGB here (0xff000000 | rgb).
+	std::array<uint32_t, 8> custom_player_rgb{};
 
 	a_string scenario_name;
 	a_string scenario_description;
@@ -328,6 +335,8 @@ struct game_state {
 	tech_types_t tech_types;
 	// EUD: a map that writes flingy.dat gets its own copy (global flingy data stays shared)
 	a_vector<flingy_type_t> eud_flingy_types;
+	a_vector<sprite_type_t> eud_sprite_types;   // copied together with flingy / images
+	a_vector<image_type_t> eud_image_types;
 	// Map value of every .dat element an EUD write changed (to undo edits on a state swap).
 	a_map<uint32_t, uint32_t> eud_dat_orig;
 	// The map has EUD/EPD Deaths or Set Deaths (savegames then carry the .dat journal).
@@ -546,6 +555,8 @@ struct state_base_copyable {
 		// bwscript.bin and helper scripts ("enter closest bunker", ...) from aiscript.bin
 		// for the same player.
 		bool bw;
+		// The location a trigger started the script at (1.16.1 thread +0x14); empty otherwise.
+		rect area = {};
 	};
 	// How many script threads one player may have. Was 8: Brood War Terran 1 starts 12
 	// for one player in its first two triggers (campaign script + 11 bunkers).
@@ -1052,6 +1063,7 @@ struct state_functions {
 	}
 	const image_type_t* get_image_type(ImageTypes id) const {
 		if ((size_t)id >= 999) error("invalid image id %d", (size_t)id);
+		if (!game_st.eud_image_types.empty()) return &game_st.eud_image_types[(size_t)id];
 		return &global_st.image_types.vec[(size_t)id];
 	}
 	const weapon_type_t* get_weapon_type(WeaponTypes id) const {
@@ -1060,6 +1072,7 @@ struct state_functions {
 	}
 	const sprite_type_t* get_sprite_type(SpriteTypes id) const {
 		if ((size_t)id >= 517) error("invalid sprite id %d", (size_t)id);
+		if (!game_st.eud_sprite_types.empty()) return &game_st.eud_sprite_types[(size_t)id];
 		return &global_st.sprite_types.vec[(size_t)id];
 	}
 	const upgrade_type_t* get_upgrade_type(UpgradeTypes id) const {
@@ -21054,7 +21067,8 @@ struct state_functions {
 
 	uint32_t eud_store_get(uint32_t addr) const {
 		auto i = st.eud_deaths.find((addr - eud::deaths_base) / 4u);
-		return i == st.eud_deaths.end() ? 0u : (uint32_t)i->second;
+		if (i != st.eud_deaths.end()) return (uint32_t)i->second;
+		return addr == 0x0057F1B0u && st.game->qol.eud_local_player >= 0 ? (uint32_t)st.game->qol.eud_local_player : 0u;
 	}
 	void eud_store_set(uint32_t addr, uint32_t v) {
 		st.eud_deaths[(addr - eud::deaths_base) / 4u] = (int32_t)v;
@@ -21120,6 +21134,8 @@ struct state_functions {
 		auto ut = [&]() -> const unit_type_t& { return game_st.unit_types.vec[id]; };
 		auto wt = [&]() -> const weapon_type_t& { return game_st.weapon_types.vec[id]; };
 		auto ft = [&]() -> const flingy_type_t& { return *get_flingy_type((FlingyTypes)id); };
+		auto it = [&]() -> const image_type_t& { return *get_image_type((ImageTypes)id); };
+		auto spt = [&]() -> const sprite_type_t& { return *get_sprite_type((SpriteTypes)id); };
 		auto upt = [&]() -> const upgrade_type_t& { return game_st.upgrade_types.vec[id]; };
 		auto tt = [&]() -> const tech_type_t& { return game_st.tech_types.vec[id]; };
 		auto uid = [&](const unit_type_t* t) -> uint32_t { return t ? (uint32_t)t->id : 228u; };
@@ -21305,6 +21321,21 @@ struct state_functions {
 		case r_f_turn_rate: return (uint32_t)ft().turn_rate.raw_value;
 		case r_f_unused: return (uint32_t)ft().unused;
 		case r_f_movement: return (uint32_t)ft().movement_type;
+		// sprites.dat / images.dat
+		case r_s_image: return (uint32_t)spt().image->id;
+		case r_s_hp_bar: return (uint32_t)spt().health_bar_size;
+		case r_s_unknown: return (uint32_t)spt().unk0;
+		case r_s_visible: return (uint32_t)spt().visible;
+		case r_s_sel_circle: return (uint32_t)spt().selection_circle;
+		case r_s_sel_vpos: return (uint32_t)spt().selection_circle_vpos;
+		case r_i_grp: return (uint32_t)it().grp_filename_index;
+		case r_i_turns: return (uint32_t)it().has_directional_frames;
+		case r_i_clickable: return (uint32_t)it().is_clickable;
+		case r_i_full_iscript: return (uint32_t)it().has_iscript_animations;
+		case r_i_draw_cloaked: return (uint32_t)it().always_visible;
+		case r_i_draw_func: return (uint32_t)it().modifier;
+		case r_i_remap: return (uint32_t)it().color_shift;
+		case r_i_iscript: return (uint32_t)it().iscript_id;
 		// upgrades.dat / techdata.dat
 		case r_up_mineral_base: return (uint32_t)upt().mineral_cost_base;
 		case r_up_mineral_factor: return (uint32_t)upt().mineral_cost_factor;
@@ -21329,10 +21360,9 @@ struct state_functions {
 		auto wt = [&]() -> weapon_type_t& { return st.game->weapon_types.vec[id]; };
 		auto upt = [&]() -> upgrade_type_t& { return st.game->upgrade_types.vec[id]; };
 		auto tt = [&]() -> tech_type_t& { return st.game->tech_types.vec[id]; };
-		auto ft = [&]() -> flingy_type_t& {
-			if (st.game->eud_flingy_types.empty()) eud_copy_flingy_types();
-			return st.game->eud_flingy_types[id];
-		};
+		auto ft = [&]() -> flingy_type_t& { eud_copy_types(); return st.game->eud_flingy_types[id]; };
+		auto spt = [&]() -> sprite_type_t& { eud_copy_types(); return st.game->eud_sprite_types[id]; };
+		auto it = [&]() -> image_type_t& { eud_copy_types(); return st.game->eud_image_types[id]; };
 		auto as_unit = [&](uint32_t x) -> unit_type_t* { return x < 228 ? &st.game->unit_types.vec[x] : nullptr; };
 		auto as_weapon = [&](uint32_t x) -> const weapon_type_t* { return x < 130 ? get_weapon_type((WeaponTypes)x) : nullptr; };
 		auto as_upgrade = [&](uint32_t x) -> upgrade_type_t* { return x < 61 ? &st.game->upgrade_types.vec[x] : nullptr; };
@@ -21501,6 +21531,21 @@ struct state_functions {
 		case r_f_turn_rate: ft().turn_rate = fp8::from_raw(u8); break;
 		case r_f_unused: ft().unused = u8; break;
 		case r_f_movement: ft().movement_type = u8; break;
+		case r_f_sprite: if (u16 < 517) { eud_copy_types(); ft().sprite = &st.game->eud_sprite_types[u16]; } break;
+		case r_u_construction_image: if (v < 999) { eud_copy_types(); ut().construction_animation = &st.game->eud_image_types[v]; } break;
+		case r_s_image: if (u16 < 999) { eud_copy_types(); spt().image = &st.game->eud_image_types[u16]; } break;
+		case r_s_hp_bar: spt().health_bar_size = u8; break;
+		case r_s_unknown: spt().unk0 = u8; break;
+		case r_s_visible: spt().visible = u8 != 0; break;
+		case r_s_sel_circle: spt().selection_circle = u8; break;
+		case r_s_sel_vpos: spt().selection_circle_vpos = u8; break;
+		case r_i_turns: it().has_directional_frames = u8 != 0; break;
+		case r_i_clickable: it().is_clickable = u8 != 0; break;
+		case r_i_full_iscript: it().has_iscript_animations = u8 != 0; break;
+		case r_i_draw_cloaked: it().always_visible = u8 != 0; break;
+		case r_i_draw_func: if (u8 < 18) it().modifier = u8; break;
+		case r_i_remap: it().color_shift = u8; break;
+		case r_i_iscript: if (global_st.iscript.scripts.count((int)v)) it().iscript_id = (int)v; break;
 		case r_up_mineral_base: upt().mineral_cost_base = u16; break;
 		case r_up_mineral_factor: upt().mineral_cost_factor = u16; break;
 		case r_up_gas_base: upt().gas_cost_base = u16; break;
@@ -21516,11 +21561,63 @@ struct state_functions {
 		}
 	}
 
-	// A map writing flingy.dat gets a per-game copy; unit and weapon types are repointed to it.
-	void eud_copy_flingy_types() {
-		st.game->eud_flingy_types = global_st.flingy_types.vec;
-		for (auto& t : st.game->unit_types.vec) if (t.flingy) t.flingy = &st.game->eud_flingy_types[(size_t)t.flingy->id];
-		for (auto& t : st.game->weapon_types.vec) if (t.flingy) t.flingy = &st.game->eud_flingy_types[(size_t)t.flingy->id];
+	template<typename V>
+	static size_t eud_slot(const void* p, const V& from) {
+		uintptr_t b = (uintptr_t)from.data(), q = (uintptr_t)p;
+		if (!p || q < b || q >= b + from.size() * sizeof(from[0])) return (size_t)-1;
+		return (q - b) / sizeof(from[0]);
+	}
+	static const void* eud_ptr(const void* p) { return p; }
+	template<typename T>
+	static const void* eud_ptr(const type_id<T>& t) { return t.operator->(); }
+	template<typename R, typename V, typename W>
+	static void eud_rebase(R& ref, const V& from, W& to) {
+		size_t k = eud_slot(eud_ptr(ref), from);
+		if (k != (size_t)-1) ref = &to[k];
+	}
+
+	// A map writing flingy / sprites / images.dat gets per-game copies of all three (they point at
+	// each other); the game's types and live objects are repointed to them.
+	void eud_copy_types() {
+		game_state& g = *st.game;
+		if (!g.eud_flingy_types.empty()) return;
+		g.eud_image_types = global_st.image_types.vec;
+		g.eud_sprite_types = global_st.sprite_types.vec;
+		g.eud_flingy_types = global_st.flingy_types.vec;
+		for (auto& t : g.eud_sprite_types) eud_rebase(t.image, global_st.image_types.vec, g.eud_image_types);
+		for (auto& t : g.eud_flingy_types) eud_rebase(t.sprite, global_st.sprite_types.vec, g.eud_sprite_types);
+		for (auto& t : g.ext_flingy_types) eud_rebase(t.sprite, global_st.sprite_types.vec, g.eud_sprite_types);
+		auto units = [&](a_vector<unit_type_t>& vec) {
+			for (auto& t : vec) {
+				eud_rebase(t.flingy, global_st.flingy_types.vec, g.eud_flingy_types);
+				eud_rebase(t.construction_animation, global_st.image_types.vec, g.eud_image_types);
+			}
+		};
+		units(g.unit_types.vec);
+		units(g.ext_unit_types);
+		for (auto& t : g.weapon_types.vec) eud_rebase(t.flingy, global_st.flingy_types.vec, g.eud_flingy_types);
+		eud_retarget_live();
+	}
+
+	template<typename Cont, typename F>
+	static void eud_for_occupied(Cont& c, F&& f) {
+		a_unordered_set<size_t> free;
+		for (auto& e : c.free_list) free.insert((size_t)e.index);
+		const size_t gran = c.list.empty() ? 1 : c.list.front().size();
+		for (size_t i = 0; i != c.size; ++i) {
+			auto& e = c.list[i / gran][i % gran];
+			if (!free.count((size_t)e.index)) f(e);
+		}
+	}
+
+	// Live images, sprites, units and bullets read their type data through these pointers.
+	void eud_retarget_live() {
+		game_state& g = *st.game;
+		if (g.eud_flingy_types.empty()) return;
+		eud_for_occupied(st.images_container, [&](image_t& e) { eud_rebase(e.image_type, global_st.image_types.vec, g.eud_image_types); });
+		eud_for_occupied(st.sprites_container, [&](sprite_t& e) { eud_rebase(e.sprite_type, global_st.sprite_types.vec, g.eud_sprite_types); });
+		eud_for_occupied(st.units_container, [&](unit_t& e) { eud_rebase(e.flingy_type, global_st.flingy_types.vec, g.eud_flingy_types); });
+		eud_for_occupied(st.bullets_container, [&](bullet_t& e) { eud_rebase(e.flingy_type, global_st.flingy_types.vec, g.eud_flingy_types); });
 	}
 
 	// Requirement tables and offset indexes, only when the user's exe supplied the tables.
@@ -21698,6 +21795,7 @@ struct state_functions {
 			st.game->eud_dat_orig.emplace(kv.first, eud_dat_value(kv.first));
 			eud_dat_apply(kv.first, kv.second);
 		}
+		eud_retarget_live();
 	}
 
 	// Raw players a Deaths / Set Deaths player field addresses: groups resolve as usual, the
@@ -22325,7 +22423,8 @@ struct state_functions {
 				// so this town's attack waves aim at its own region rather than
 				// the global-nearest enemy. action 15 (RunAIScript) has location 0.
 				ai_start_script(owner, (uint32_t)a.group2_n,
-				    trigger_loc_ok(a.location) ? trigger_location_center(a.location) : xy());
+				    trigger_loc_ok(a.location) ? trigger_location_center(a.location) : xy(),
+				    trigger_loc_ok(a.location) ? st.locations[a.location - 1].area : rect{});
 				break;
 			}
 			return true;
@@ -22922,7 +23021,7 @@ struct state_functions {
 	}
 
 	// Start a script (4-char ASCII id, e.g. 'TMCu' = "uCMT" little-endian).
-	bool ai_start_script(int owner, uint32_t id, xy script_loc = xy()) {
+	bool ai_start_script(int owner, uint32_t id, xy script_loc = xy(), rect script_area = {}) {
 		if (owner < 0 || owner >= 8) return false;
 		auto& ai = st.ai_players[owner];
 		uint32_t off = ai_find_script(global_st.aiscript_bin, id);
@@ -22961,7 +23060,7 @@ struct state_functions {
 		// start_town/start_areatown resolve it; loc is xy() for melee/plain
 		// RunAIScript, so those threads reduce to the pre-S3 behaviour exactly.
 		if (ai.threads.size() < state::ai_max_threads)
-			ai.threads.push_back({true, off, 0, 0, 0, 0, script_loc, game_st.start_locations[owner], bw});
+			ai.threads.push_back({true, off, 0, 0, 0, 0, script_loc, game_st.start_locations[owner], bw, script_area});
 		else if (trigger_tracing()) trigger_trace_sink()(format("aiscan f%d p%d THREAD_LIMIT\n", (int)st.current_frame, owner));
 #ifdef BWGAME_AI_STEP_TRACE
 		// AITR runtime-trace hook (tool-only; the APK never defines this flag, so
@@ -23094,11 +23193,10 @@ struct state_functions {
 			me.attack_target_rr = (me.attack_target_rr + 1) % (int)me.attack_targets.size();
 	}
 
-	// open1161HD: is the AI's attack target reachable over LAND from its base?
-	// Campaign attackers separated from the target by water (Revolution: enemy
-	// region 5, captured base region 1) must ferry the ground army by transport.
-	bool ai_target_ground_reachable(int owner, xy target) const {
-		return is_reachable(st.ai_players[owner].town_pos, target);
+	// Campaign ground units walk to the target when their own region connects to it; otherwise
+	// they go by transport (Revolution: enemy region 5, captured base region 1).
+	bool ai_unit_reaches(const unit_t* u, xy target) const {
+		return is_reachable(u->sprite->position, target);
 	}
 
 	// open1161HD: begin a transport-drop op toward an un-ground-reachable target
@@ -23262,9 +23360,6 @@ struct state_functions {
 		for (auto& g : ai.attack_group) {
 			if (!ai_is_defense_unit(ai, g.unit_id)) { wave_has_offense = true; break; }
 		}
-		// open1161HD: melee keeps ground_ok=true (byte-identical); a campaign
-		// attacker across water diverts its ground wave to the transport op.
-		bool ground_ok = !ai.campaign || ai_target_ground_reachable(owner, target);
 		for (auto& g : ai.attack_group) {
 			if (force_budget <= 0) break;
 			if (ai_is_defense_unit(ai, g.unit_id) && wave_has_offense) {
@@ -23287,7 +23382,7 @@ struct state_functions {
 				if (unit_can_receive_order(u, get_order_type(Orders::AttackMove), owner)) {
 					// ground units cannot walk across water -- hand the ground wave
 					// to the transport op; air (u_flying) crosses on its own.
-					if (!ground_ok && !u_flying(u)) ai_transport_request(owner, target);
+					if (ai.campaign && !u_flying(u) && !ai_unit_reaches(u, target)) ai_transport_request(owner, target);
 					else set_unit_order(u, get_order_type(Orders::AttackMove), target);
 					--n;
 					--force_budget;
@@ -23348,8 +23443,6 @@ struct state_functions {
 		// keeps the surplus home as a reserve. 0 = uncapped (ai_send_suicide-style).
 		int budget = ai.max_force > 0 ? ai.max_force : 60;
 		if (wave_cap > 0 && wave_cap < budget) budget = wave_cap;
-		// open1161HD: ai.campaign is always true here, so honour water separation.
-		bool ground_ok = ai_target_ground_reachable(owner, target);
 		for (auto i = st.player_units[owner].begin(); i != st.player_units[owner].end() && budget; ++i) {
 			unit_t* u = &*i;
 			if (!u_completed(u) || unit_dying(u)) continue;
@@ -23359,7 +23452,7 @@ struct state_functions {
 			if (oid != Orders::Guard && oid != Orders::PlayerGuard && oid != Orders::Nothing) continue;
 			if (unit_can_receive_order(u, get_order_type(Orders::AttackMove), owner)) {
 				// ground wave across water -> transport op; air crosses directly.
-				if (!ground_ok && !u_flying(u)) ai_transport_request(owner, target);
+				if (!u_flying(u) && !ai_unit_reaches(u, target)) ai_transport_request(owner, target);
 				else set_unit_order(u, get_order_type(Orders::AttackMove), target);
 				--budget;
 			}
@@ -23441,7 +23534,6 @@ struct state_functions {
 		ai.last_attack_frame = (int)st.current_frame;
 		ai_advance_target(owner);
 		int force_budget = ai.max_force > 0 ? ai.max_force : std::numeric_limits<int>::max();
-		bool ground_ok = ai_target_ground_reachable(owner, target);
 		for (auto& g : ai.wave_order) {
 			int n = std::min(g.count, force_budget);
 			int in_training = 0;
@@ -23459,7 +23551,7 @@ struct state_functions {
 					auto oid = u->order_type->id;
 					if (oid != Orders::Guard && oid != Orders::PlayerGuard && oid != Orders::Nothing) continue;
 					if (!unit_can_receive_order(u, get_order_type(Orders::AttackMove), owner)) continue;
-					if (!ground_ok && !u_flying(u)) ai_transport_request(owner, target);
+					if (ai.campaign && !u_flying(u) && !ai_unit_reaches(u, target)) ai_transport_request(owner, target);
 					else if (u->index < 1700) ai.wave.set(u->index);
 					else set_unit_order(u, get_order_type(Orders::AttackMove), target);
 					--n;
@@ -23952,6 +24044,15 @@ struct state_functions {
 					if (p == owner || !player_slot_active(p) || st.alliances[owner][p] != 0) continue;
 					if (st.current_minerals[p] >= (int)args[0] && st.current_gas[p] >= (int)args[1]) { th.pc = args[2]; break; }
 				}
+				break;
+			case 0x20: case 0x21: // player_enemy / player_ally (0x4A0E20): owners of units in the thread's area
+				if (th.area.to != th.area.from) {
+					for (unit_t* u : find_units(th.area)) {
+						if (u->owner != owner) st.alliances[owner][u->owner] = op == 0x20 ? 0 : 2;
+					}
+				}
+				break;
+			case 0x69: // set_randomseed: 1.16.1 writes 0x51CA10, a seed the sim LCG (0x51CA14) never reads in game
 				break;
 			case 0x6a: // if_owned (unit, block)
 				if (ai_owned_count(owner, (int)args[0], false) > 0) th.pc = args[1];
@@ -25049,6 +25150,9 @@ struct game_load_functions : state_functions {
 
 	void reset() {
 
+		game_st.eud_flingy_types.clear();
+		game_st.eud_sprite_types.clear();
+		game_st.eud_image_types.clear();
 		game_st.unit_types = data_loading::load_units_dat(global_st.units_dat);
 		game_st.weapon_types = data_loading::load_weapons_dat(global_st.weapons_dat);
 		game_st.upgrade_types = data_loading::load_upgrades_dat(global_st.upgrades_dat);
@@ -27188,13 +27292,29 @@ struct game_load_functions : state_functions {
 		};
 
 		tag_funcs["COLR"] = [&](data_reader_le r) {
-			// todo
+			// 1.16.1 (0x49B130) indexes 12 rows; larger values read stack garbage. Keep the 16 tunit rows, else the slot's own.
 			for (size_t i = 0; i != 8; ++i) {
-				st.players[i].color = r.get<uint8_t>();
+				int c = r.get<uint8_t>();
+				st.players[i].color = c < 16 ? c : (int)i;
+			}
+		};
+
+		tag_funcs["CRGB"] = [&](data_reader_le r) {
+			// SC:R: rgb[8][3], then per slot 0 random, 1 player's choice (keep COLR), 2 custom rgb, 3 colour id in B.
+			if (r.left() < 32) return;
+			uint8_t rgb[8][3];
+			for (auto& c : rgb) for (auto& v : c) v = r.get<uint8_t>();
+			for (size_t i = 0; i != 8; ++i) {
+				int sel = r.get<uint8_t>();
+				if (sel == 2) {
+					st.players[i].color = 16 + (int)i;
+					game_st.custom_player_rgb[i] = 0xff000000u | (uint32_t)rgb[i][0] << 16 | (uint32_t)rgb[i][1] << 8 | rgb[i][2];
+				} else if (sel == 3 && rgb[i][2] < 16) st.players[i].color = rgb[i][2];
 			}
 		};
 
 		st.players = {};
+		game_st.custom_player_rgb = {};
 		game_st.oescript = oescript::program();
 		st.oes = oescript::runtime();
 
@@ -27311,7 +27431,8 @@ struct game_load_functions : state_functions {
 					{"MRGN", true},
 					{"TRIG", true},
 					{"OESC", false},
-					{"COLR", false}
+					{"COLR", false},
+					{"CRGB", false}
 				});
 			} else {
 				read_chunks({
@@ -27345,6 +27466,7 @@ struct game_load_functions : state_functions {
 					{"TRIG", true},
 					{"OESC", false},
 					{"COLR", true},
+					{"CRGB", false}
 				});
 			} else {
 				read_chunks({
@@ -27910,6 +28032,39 @@ inline bool load_requirement_tables(global_state& st, const a_string& exe_path) 
 	return true;
 }
 
+// Button arrays and button sets from the user's StarCraft.exe (see eud::buttons_base).
+inline bool load_button_sets(global_state& st, const a_string& exe_path) {
+	st.exe_buttons.clear();
+	FILE* f = fopen(exe_path.c_str(), "rb");
+	if (!f) return false;
+	a_vector<uint8_t> d;
+	uint8_t buf[65536];
+	for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) != 0;) d.insert(d.end(), buf, buf + n);
+	fclose(f);
+	auto u16 = [&](size_t o) { return o + 2 <= d.size() ? (uint32_t)d[o] | (uint32_t)d[o + 1] << 8 : 0u; };
+	auto u32 = [&](size_t o) { return u16(o) | u16(o + 2) << 16; };
+	size_t pe = u32(0x3c);
+	if (d.size() < 0x40 || u32(pe) != 0x4550 || u16(pe + 4) != 0x14c) return false;
+	size_t nsec = u16(pe + 6), opt = pe + 24, sec = opt + u16(pe + 20);
+	if (u16(opt) != 0x10b) return false;
+	uint32_t image_base = u32(opt + 28);
+	a_vector<uint8_t> t(eud::buttons_end - eud::buttons_base);
+	for (size_t i = 0; i != nsec; ++i) {
+		size_t h = sec + 40 * i;
+		uint32_t vs = u32(h + 8), rva = u32(h + 12), raw = u32(h + 16), ptr = u32(h + 20);
+		for (uint32_t va = eud::buttons_base; va != eud::buttons_end; ++va) {
+			uint32_t off = va - image_base - rva;
+			if (va - image_base < rva || off >= std::max(vs, raw)) continue;
+			if (off < raw && (size_t)ptr + off < d.size()) t[va - eud::buttons_base] = d[ptr + off];
+		}
+	}
+	auto w32 = [&](uint32_t a) { size_t o = a - eud::buttons_base; return (uint32_t)t[o] | (uint32_t)t[o + 1] << 8 | (uint32_t)t[o + 2] << 16 | (uint32_t)t[o + 3] << 24; };
+	// 1.16.1: the Marine set is 6 buttons at 0x5177D8.
+	if (w32(eud::button_sets) != 6 || w32(eud::button_sets + 4) != 0x5177D8) return false;
+	st.exe_buttons = std::move(t);
+	return true;
+}
+
 // FNV-1a over the loaded tables; 0 = none. LAN peers compare it before turning the tables on.
 inline uint32_t requirement_tables_hash(const global_state& st) {
 	if (st.req_tables.empty()) return 0;
@@ -27954,6 +28109,10 @@ public:
 	}
 	uint32_t requirement_tables_hash() const {
 		return uptr_global_st ? bwgame::requirement_tables_hash(*uptr_global_st) : 0;
+	}
+	bool load_button_sets(const a_string& exe_path) {
+		if (!uptr_global_st) error("game_player: not initialized");
+		return bwgame::load_button_sets(*uptr_global_st, exe_path);
 	}
 	void load_map_file(const a_string& filename, bool initial_processing = true) {
 		if (!opt_funcs) error("game_player: not initialized");

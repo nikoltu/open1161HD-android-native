@@ -43,7 +43,15 @@ extern "C" {
 // cast_at / cast_on (targeted spells and Spider Mines). Without them a bot could
 // only move, attack and build: tanks never sieged, lurkers (which attack only
 // while burrowed) were useless, no storm, no scan. Additive as always.
-#define OPENBW_BOT_ABI_VERSION 5
+// v6 (2026-11-19): fog of war. units() of another player lists only what the bot's
+// player can see (an undetected cloaked unit shows as its shimmer, a burrowed one not
+// at all), enemy_start() names the enemy start only once it is known (one candidate
+// left, or scouted), another player's minerals / gas / supply read 0, and commands
+// cannot target what the bot cannot see -- for a bot that declares ABI 6 or newer;
+// older bots keep the all-seeing contract they were written against. unit_status()
+// tells cloaked / detected / burrowed / loaded; OB_AB_UNLOAD_ALL empties a bunker
+// or transport.
+#define OPENBW_BOT_ABI_VERSION 6
 
 typedef struct ob_bot_host ob_bot_host; // opaque host handle
 
@@ -147,7 +155,21 @@ typedef struct ob_host_api {
 	// order was issued. Only the listed spell orders are accepted.
 	int32_t (*cast_at)(ob_bot_host*, intptr_t unit, int32_t order_id, int32_t x, int32_t y);
 	int32_t (*cast_on)(ob_bot_host*, intptr_t unit, int32_t order_id, intptr_t target_unit);
+
+	// --- v6 additions (NULL when the host is older than the bot) -------
+	// OB_US_* bits for a unit the bot can currently see (0 for anything else).
+	int32_t (*unit_status)(ob_bot_host*, intptr_t unit);
 } ob_host_api;
+
+// Bits of unit_status().
+enum {
+	OB_US_VISIBLE  = 1 << 0,   // the bot's player sees it
+	OB_US_CLOAKED  = 1 << 1,   // needs a detector to be targeted (cloaked or burrowed)
+	OB_US_DETECTED = 1 << 2,   // ...and one of the bot's detectors (or a scan) reveals it
+	OB_US_BURROWED = 1 << 3,
+	OB_US_LOADED   = 1 << 4,   // inside a bunker / transport
+	OB_US_CARGO    = 1 << 5,   // a bunker / transport with units inside
+};
 
 // Untargeted abilities for use_ability().
 enum {
@@ -160,6 +182,7 @@ enum {
 	OB_AB_DECLOAK = 6,
 	OB_AB_HOLD_POSITION = 7,
 	OB_AB_TRAIN_FIGHTER = 8, // reaver scarab / carrier interceptor
+	OB_AB_UNLOAD_ALL = 9,    // v6: a bunker / transport lets everyone out
 };
 
 // Targeted orders for cast_at() / cast_on() (bwenums.h Orders ids, 1.16.1).

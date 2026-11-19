@@ -469,7 +469,7 @@ class Kit {
                 String r = bps > 0 ? mb((long) bps) + "/s" : "";
                 if (bps > 0 && total > got) {
                     long s = (long) Math.ceil((total - got) / bps);
-                    r += "   " + S.t("liko ") + (s >= 3600 ? s / 3600 + ":" + two(s / 60 % 60) : s / 60 + "") + ":" + two(s % 60);
+                    r += "   " + S.f("liko %s", (s >= 3600 ? s / 3600 + ":" + two(s / 60 % 60) : s / 60 + "") + ":" + two(s % 60));
                 }
                 rate.setText(r);
             }

@@ -533,6 +533,8 @@ public class OpenBWActivity extends SDLActivity {
         // present); Bloom>0 or Grade>0 also forces the GL stage on. adb hooks override.
         { int glBloom = getIntent().getIntExtra("bloomStrength", dev.getInt("bloomLevel", 0));
           int glGrade = getIntent().getIntExtra("gradeStrength", dev.getInt("gradeLevel", 0));
+          boolean water = getIntent().getBooleanExtra("hdWater", dev.getBoolean("hdWater", false));
+          if (water) { args.add("--hd-water"); args.add("1"); }
           boolean pipeOn = dev.getBoolean("sharpenFilter", true) || getIntent().getBooleanExtra("postGl", false) || glBloom > 0 || glGrade > 0;
           if (pipeOn) {
             args.add("--post-gl");
@@ -1099,13 +1101,33 @@ public class OpenBWActivity extends SDLActivity {
                 boolean rdy = p.optBoolean("ready");
                 boolean loc = p.optBoolean("local");
                 if (loc) lobbyReadyState = rdy;
-                TextView row = new TextView(this);
-                row.setTextSize(19);
-                row.setTextColor(loc ? 0xFFFFE090 : 0xFFE0E0E0);
-                row.setPadding(0, dp(7), 0, dp(7));
+                int slot = p.optInt("slot");
+                LinearLayout row = new LinearLayout(this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+                row.setPadding(0, dp(5), 0, dp(5));
+                // Each peer's identity portrait (the id rode the sync uid handshake). Views are
+                // kept per slot so a poll does not restart the clip.
+                int pid = p.optInt("portrait", -1);
+                PortraitView pv = lobbyPortraits.get(slot);
+                if (pv == null) {
+                    pv = new PortraitView(this);
+                    pv.setScale(1);
+                    lobbyPortraits.put(slot, pv);
+                }
+                if (pv.getParent() instanceof ViewGroup) ((ViewGroup) pv.getParent()).removeView(pv);
+                pv.setBorderColor(loc ? 0xFFFFE090 : 0xFF707070);
+                if (pid >= 0 && pv.portraitId() != pid) pv.setPortrait(getExternalFilesDir(null), pid);
+                pv.setVisibility(pid >= 0 ? View.VISIBLE : View.INVISIBLE);
+                row.addView(pv);
+                TextView tv = new TextView(this);
+                tv.setTextSize(19);
+                tv.setTextColor(loc ? 0xFFFFE090 : 0xFFE0E0E0);
+                tv.setPadding(dp(12), 0, 0, 0);
                 String raceS = (race >= 0 && race < 6) ? S.t(LOBBY_RACE[race]) : "?";
-                row.setText(S.t("Slot ") + (p.optInt("slot") + 1) + "    " + p.optString("name")
+                tv.setText(S.f("Vieta %d", slot + 1) + "    " + p.optString("name")
                         + "    [" + raceS + "]" + (loc ? "   " + S.t("(tu)") : "") + (rdy ? "    ✔ " + S.t("pasiruošęs") : ""));
+                row.addView(tv);
                 lobbyPlayers.addView(row);
             }
             lobbyReadyBtn.setText(lobbyReadyState ? "✔ " + S.t("Pasiruošęs") : S.t("Pasiruošti"));
@@ -1113,9 +1135,12 @@ public class OpenBWActivity extends SDLActivity {
         } catch (Throwable ignored) {}
     }
 
+    private final java.util.HashMap<Integer, PortraitView> lobbyPortraits = new java.util.HashMap<>();
+
     private void hideLobbyOverlay() {
         if (lobbyOverlay != null && mLayout != null) mLayout.removeView(lobbyOverlay);
         lobbyOverlay = null;
+        lobbyPortraits.clear();
     }
 
 }

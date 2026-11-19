@@ -1759,7 +1759,7 @@ public class SetupActivity extends Activity {
         String tag = null;
         int tagColor = Kit.ACCENT;
         if (!have) { tag = S.t("neturi šio žemėlapio"); tagColor = Kit.DANGER; }
-        else if (!h.ver.isEmpty() && !h.ver.equals(versionName())) tag = S.t("kita versija ") + h.ver;
+        else if (!h.ver.isEmpty() && !h.ver.equals(versionName())) tag = S.f("kita versija %s", h.ver);
         else if (!h.mods.isEmpty() && !h.mods.equals(myMods)) tag = S.t("modai skiriasi");
         if (tag != null) {
             TextView g = kit.text(tag, tagColor, 11);
@@ -2268,6 +2268,12 @@ public class SetupActivity extends Activity {
     }
 
     private boolean launchIfPending() {
+        String map = prefs().getString("launchMapAfterRecreate", "");
+        if (!map.isEmpty()) {
+            prefs().edit().remove("launchMapAfterRecreate").apply();
+            launchUmsMap(map);
+            return true;
+        }
         String dir = prefs().getString("launchAfterRecreate", "");
         if (dir.isEmpty()) return false;
         prefs().edit().remove("launchAfterRecreate").apply();
@@ -2497,7 +2503,7 @@ public class SetupActivity extends Activity {
         name.setEllipsize(android.text.TextUtils.TruncateAt.END);
         name.setPadding(0, dp(8), 0, 0);
         block.addView(name);
-        TextView stats = kit.text(S.t("Žaidimų ") + getStat("games") + "  ·  " + S.t("Pergalės")
+        TextView stats = kit.text(S.f("Žaidimų: %s", getStat("games")) + "  ·  " + S.t("Pergalės")
                 + "  Z " + getStat("wins.Z") + "  T " + getStat("wins.T") + "  P " + getStat("wins.P") + "  R " + getStat("wins.R"), Kit.TEXT2, 11);
         stats.setPadding(0, dp(2), 0, dp(10));
         block.addView(stats);
@@ -2854,10 +2860,10 @@ public class SetupActivity extends Activity {
     private String modIncompatibleReason(ModEntry e) {
         int vc = versionCodeOf();
         if (e.engineMin > 0 && vc < e.engineMin) {
-            return S.t("Modui reikia naujesnės programos versijos (versionCode ≥ ") + e.engineMin + ")";
+            return S.f("Modui reikia naujesnės programos versijos (versionCode ≥ %d)", e.engineMin);
         }
         if (e.engineMax > 0 && vc > e.engineMax) {
-            return S.t("Modas skirtas senesnei programos versijai (versionCode ≤ ") + e.engineMax + ")";
+            return S.f("Modas skirtas senesnei programos versijai (versionCode ≤ %d)", e.engineMax);
         }
         return null;
     }
@@ -3702,7 +3708,7 @@ public class SetupActivity extends Activity {
                     repoCache.clear();
                     repoCache.addAll(mods);
                     renderModList();
-                    if (!quiet) Kit.toast(this, S.t("Talpykla: ") + mods.size() + S.t(" modų."), Toast.LENGTH_SHORT);
+                    if (!quiet) Kit.toast(this, S.f("Talpykla: %s.", S.count(mods.size(), "modas", "modai", "modų", "mod", "mods")), Toast.LENGTH_SHORT);
                 });
             } catch (Exception e) {
                 // v0.83.010: log it. A toast is gone in three seconds and says
@@ -3737,8 +3743,8 @@ public class SetupActivity extends Activity {
             new KitDialog(this)
                     .setTitle(S.t("Nesuderinamas modas"))
                     .setMessage(id + "\n\n" + (emin > 0 && vc < emin
-                            ? S.t("Modui reikia naujesnės programos versijos (versionCode ≥ ") + emin + ")"
-                            : S.t("Modas skirtas senesnei programos versijai (versionCode ≤ ") + emax + ")"))
+                            ? S.f("Modui reikia naujesnės programos versijos (versionCode ≥ %d)", emin)
+                            : S.f("Modas skirtas senesnei programos versijai (versionCode ≤ %d)", emax)))
                     .setPositiveButton(S.t("Gerai"), null)
                     .show();
             return;
@@ -4992,7 +4998,7 @@ public class SetupActivity extends Activity {
                             .remove("gfxTier").remove("emissiveGlow").remove("shadowSoft").remove("bloomLevel")
                             .remove("sharpenFilter").remove("sharpenLevel").remove("gradeLevel")
                             .remove("sunShadow").remove("sunShadowLen").remove("sunShadowSign")
-                            .remove("pointLights").remove("lightStrength").remove("scrFont")
+                            .remove("pointLights").remove("lightStrength").remove("scrFont").remove("hdWater")
                             // interface controls
                             .remove("showFps").remove("showApm").remove("healthBarsAlways").remove("cameraSpeed")
                             .remove("resourceCounts").remove("showSaturation").remove("showZoomButtons").remove("equipGrey")
@@ -5078,6 +5084,9 @@ public class SetupActivity extends Activity {
                 S.t("Per stipriai — triukšmas ir aureolės aplink kraštus."), "sharpenLevel", 35, 100);
         setSlider(gfx, S.t("Kinematinis atspalvis"),
                 S.t("Kontrastas, sodrumas, šiluma. 0 = išjungta."), "gradeLevel", 0, 100);
+        if (scr)
+            setSwitch(gfx, S.t("Animuotas vanduo"), "hdWater",
+                    S.t("Vanduo raibuliuoja ir blizga kaip SC:R. Tik HD2 ir FULL HD."), false);
 
         // ---- Valdymas ----
         LinearLayout ctl = settingsSection(S.t("Valdymas"));
@@ -6422,12 +6431,46 @@ public class SetupActivity extends Activity {
             return false;
         }
         f.delete();
+        umsNext = consumeUmsNext();
         if (rows.isEmpty()) return false;
         // campaign: the mission just played and the one it unlocked (victory only)
         String played = outcome != null ? outcome[0] : getCampaignDir();
         String next = outcome != null && (won || outcome.length > 2) && !outcome[1].isEmpty() ? outcome[1] : null;
         setContentView(buildScoreScreen(won, local, frames, rows, campaign ? played : null, next));
         return true;
+    }
+
+    // Set Next Scenario from a map file (native ums-next.txt): {next map path, "" = not found;
+    // the file name the map asked for}; null when the map named none.
+    private String[] umsNext;
+    private String[] consumeUmsNext() {
+        File f = new File(getExternalFilesDir(null), "ums-next.txt");
+        if (!f.isFile()) return null;
+        String[] out = {"", ""};
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(
+                new java.io.FileInputStream(f), java.nio.charset.StandardCharsets.ISO_8859_1))) {
+            String a = r.readLine(), b = r.readLine();
+            out[0] = a == null ? "" : a.trim();
+            out[1] = b == null ? "" : b.trim();
+        } catch (Exception ignored) {
+        }
+        f.delete();
+        return out;
+    }
+
+    // The next scenario plays like the finished one did in 1.16.1: Use Map Settings, the same race.
+    private void launchUmsMap(String path) {
+        File map = new File(path);
+        if (!map.isFile()) { Kit.toast(this, S.t("Žemėlapis nerastas."), Toast.LENGTH_LONG); return; }
+        if (!mpqMissing().isEmpty()) { Kit.toast(this, S.t("Pirma importuokite MPQ failus."), Toast.LENGTH_LONG); return; }
+        if (refuseExtendedMap(map)) return;
+        Intent i = new Intent(this, OpenBWActivity.class);
+        i.putExtra(OpenBWActivity.EXTRA_MAP, map.getAbsolutePath());
+        i.putExtra(OpenBWActivity.EXTRA_RACE, prefs().getInt("lastLocalRace", 5));
+        addCommonExtras(i);
+        i.putExtra("qol", qolBits());
+        i.putExtra(OpenBWActivity.EXTRA_GAME_MODE, "ums");
+        startActivity(i);
     }
 
     private int parseIntSafe(String s, int def) {
@@ -6567,10 +6610,28 @@ public class SetupActivity extends Activity {
         if (!last.isFile()) { save.setEnabled(false); save.setAlpha(0.4f); }
         if (campaignDir == null) {
             actions.addView(save, new LinearLayout.LayoutParams(dp(220), dp(48)));
-            TextView ret = kit.button(S.t("Grįžti"), 1, this::recreate);
+            final String[] next = umsNext;
+            final boolean canNext = next != null && !next[0].isEmpty();
+            TextView ret = kit.button(S.t("Grįžti"), canNext ? 0 : 1, this::recreate);
             LinearLayout.LayoutParams retLp = new LinearLayout.LayoutParams(dp(220), dp(48));
             retLp.leftMargin = dp(12);
             actions.addView(ret, retLp);
+            if (canNext) {
+                TextView go = kit.button(S.t("Tęsti"), 1, () -> {
+                    prefs().edit().putString("launchMapAfterRecreate", next[0]).apply();
+                    recreate();
+                });
+                LinearLayout.LayoutParams goLp = new LinearLayout.LayoutParams(dp(220), dp(48));
+                goLp.leftMargin = dp(12);
+                actions.addView(go, goLp);
+            }
+            if (next != null) {
+                TextView nt = kit.text(canNext ? S.t("Kitas scenarijus:") + " " + new File(next[0]).getName()
+                        : S.t("Kitas scenarijus nerastas:") + " " + next[1], canNext ? Kit.TEXT2 : Kit.DANGER, 12);
+                nt.setGravity(Gravity.CENTER_HORIZONTAL);
+                nt.setPadding(0, 0, 0, dp(8));
+                panel.addView(nt);
+            }
             scoreBack = this::recreate;
         } else {
             // Campaign missions are not recorded (record_replay = melee only), and
@@ -6770,7 +6831,7 @@ public class SetupActivity extends Activity {
             }
         }
         if (!shown) {
-            container.addView(emptyLabel(S.t("(nėra ") + want + "+ žaidėjų žemėlapių — importuokite arba mažinkite žaidėjų skaičių)"));
+            container.addView(emptyLabel(S.f("(nėra %d+ žaidėjų žemėlapių — importuokite arba mažinkite žaidėjų skaičių)", want)));
         }
         TextView cl = container == mapList ? mapCountLabel : container == mapListMp ? mpMapCountLabel : null;
         if (cl != null)
@@ -7188,7 +7249,7 @@ public class SetupActivity extends Activity {
         if (!nm.isFile()) return null;
         java.io.FileInputStream in = null;
         try {
-            byte[] b = new byte[(int) Math.min(nm.length(), 128)];
+            byte[] b = new byte[(int) Math.min(nm.length(), 256)];
             in = new java.io.FileInputStream(nm);
             int n = in.read(b);
             if (n <= 0) return null;

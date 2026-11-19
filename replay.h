@@ -439,6 +439,7 @@ struct replay_functions: action_functions {
 			st.game->qol.skip_oescript         = !((qol_bits >> 9) & 1);
 			st.game->qol.trigger_pause         = (qol_bits >> 10) & 1;
 			st.game->qol.eud_requirements      = (qol_bits >> 12) & 1;
+			st.game->qol.eud_local_player      = (qol_bits >> 13) & 1 ? (int)((qol_bits >> 16) & 15) : -1;
 			st.game->qol.legacy_trigger_seconds = (trailer.version != 0 || own_old_recording) && !((qol_bits >> 11) & 1);
 			// bit8; a foreign replay comes from the original, which always applies it
 			st.game->qol.ums_unit_properties   = ((qol_bits >> 8) & 1) || (trailer.version == 0 && arr_str(game_name) != "OpenBW Android");

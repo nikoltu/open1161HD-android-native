@@ -74,6 +74,7 @@ final class Keybinds {
         a.add(new Action("center", "Centruoti į pažymėtus", false));
         a.add(new Action("zoom_in", "Priartinti", false));
         a.add(new Action("zoom_out", "Atitolinti", false));
+        a.add(new Action("subgroup", "Kitas pogrupis", false));
         for (int g = 1; g <= 10; g++) a.add(new Action("group" + (g % 10), "Grupė " + (g % 10), false));
         for (int i = 1; i <= 3; i++) a.add(new Action("camloc" + i, "Kameros vieta " + i, false));
         ACTIONS = a.toArray(new Action[0]);
@@ -202,7 +203,7 @@ final class Keybinds {
                 case 3: return S.t("Dešinysis pelės");
                 case 4: return S.t("Pelės atgal");
                 case 5: return S.t("Pelės pirmyn");
-                default: return S.t("Pelės ") + (code - MOUSE);
+                default: return S.f("Pelės %d", code - MOUSE);
             }
         }
         if (code >= 4 && code <= 29) return String.valueOf((char) ('A' + code - 4));
@@ -566,6 +567,11 @@ final class Keybinds {
                     c.drawCircle(12, 12, 6.5f, p);
                     c.drawLine(12, 2, 12, 7, p); c.drawLine(12, 17, 12, 22, p);
                     c.drawLine(2, 12, 7, 12, p); c.drawLine(17, 12, 22, 12, p);
+                    break;
+                case "subgroup":   // the Tab key: an arrow to a stop bar
+                    c.drawLine(3, 12, 17, 12, p);
+                    c.drawLine(12, 7, 17, 12, p); c.drawLine(12, 17, 17, 12, p);
+                    c.drawLine(20, 6, 20, 18, p);
                     break;
                 case "zoom_in": case "zoom_out":
                     c.drawCircle(10, 10, 6.5f, p);

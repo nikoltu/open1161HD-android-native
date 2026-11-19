@@ -14,7 +14,7 @@
 	enum {
 		kb_cam_up, kb_cam_down, kb_cam_left, kb_cam_right,
 		kb_card0, kb_card8 = kb_card0 + 8,
-		kb_cancel, kb_menu, kb_chat, kb_alert, kb_idle, kb_army, kb_center, kb_zoom_in, kb_zoom_out,
+		kb_cancel, kb_menu, kb_chat, kb_alert, kb_idle, kb_army, kb_center, kb_zoom_in, kb_zoom_out, kb_subgroup,
 		kb_group0, kb_group9 = kb_group0 + 9,
 		kb_camloc0, kb_camloc2 = kb_camloc0 + 2,
 		kb_mouse_select, kb_mouse_command, kb_mouse_pan,
@@ -307,6 +307,7 @@
 		case kb_center: if (unit_t* u = first_own_selected_unit()) center_camera_on(u->sprite->position); break;
 		case kb_zoom_in: set_zoom(zoom_level + 1); break;
 		case kb_zoom_out: set_zoom(zoom_level - 1); break;
+		case kb_subgroup: cycle_subgroup(kbm_shift() ? -1 : 1); break;
 		default: break;
 		}
 	}

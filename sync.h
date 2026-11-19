@@ -101,6 +101,7 @@ struct sync_state {
 		uint8_t frame = 0;
 		a_string name;
 		uint32_t req_hash = 0;
+		int portrait = -1;             // portdata id of the peer's profile portrait (render-only, never in st)
 		bool ready = false;            // v0.40 lobby ready-check
 		int picked_race = -1;         // v0.44 chosen race (0/1/2), -1 = random
 		bool game_started = false;
@@ -492,7 +493,15 @@ struct sync_functions: action_functions {
 							if (!c) break;
 							client->name += c;
 						}
+						// A 31-char name still carries its 0 terminator; skip it or every field after it is misread.
+						if (client->name.size() == 31 && r.left() && !r.ptr[0]) r.template get<uint8_t>();
 						client->req_hash = r.left() >= 4 ? r.template get<uint32_t>() : 0;
+						// Tagged trailer (old builds stop after req_hash and ignore it).
+						client->portrait = -1;
+						if (r.left() >= 2 && r.template get<uint8_t>() == uid_portrait_tag) {
+							int v = (int)r.template get<uint8_t>() - 1;
+							client->portrait = v >= 0 && v < 250 ? v : -1;
+						}
 
 						for (int i = 0; i != 12; ++i) {
 							st.players[i].controller = sync_st.initial_slot_controllers[i];
@@ -580,8 +589,9 @@ struct sync_functions: action_functions {
 			sync_st.clients.back().last_synced = std::chrono::steady_clock::now();
 			return &sync_st.clients.back();
 		}
+		static const uint8_t uid_portrait_tag = 0x50;
 		void send_uid(const void* h) {
-			writer<1 + 32 + 32> w;
+			writer<1 + 32 + 32 + 4 + 2> w;
 			w.put<uint8_t>(sync_messages::id_client_uid);
 			for (auto& v : sync_st.local_client->uid.vals) w.put<uint32_t>(v);
 			size_t n = 0;
@@ -592,6 +602,11 @@ struct sync_functions: action_functions {
 			}
 			w.put<uint8_t>(0);
 			w.put<uint32_t>(sync_st.local_req_hash);
+			const int portrait = sync_st.local_client->portrait;
+			if (portrait >= 0 && portrait < 250) {
+				w.put<uint8_t>(uid_portrait_tag);
+				w.put<uint8_t>((uint8_t)(portrait + 1));
+			}
 			send(w, h);
 		}
 
@@ -1296,6 +1311,10 @@ struct sync_functions: action_functions {
 	void set_local_client_name(a_string name) {
 		if (sync_st.game_started) return;
 		sync_st.local_client->name = std::move(name);
+	}
+	void set_local_client_portrait(int portrait) {
+		if (sync_st.game_started) return;
+		sync_st.local_client->portrait = portrait;
 	}
 
 	template<typename server_T>

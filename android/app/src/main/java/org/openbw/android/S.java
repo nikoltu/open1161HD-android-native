@@ -36,6 +36,11 @@ final class S {
         return en != null ? en : lithuanian;
     }
 
+    /** A whole sentence with %s / %d slots, so each language keeps its own word order. */
+    static String f(String lithuanian, Object... args) {
+        return String.format(java.util.Locale.ROOT, t(lithuanian), args);
+    }
+
     /** "n word" with the plural form of the current language (LT: 1 / 2–9 / 0,10–20 forms). */
     static String count(int n, String ltOne, String ltFew, String ltMany, String enOne, String enMany) {
         if (!LT.equals(lang)) return n + " " + (n == 1 ? enOne : enMany);
@@ -177,7 +182,7 @@ final class S {
         p("Aktyvūs hostai (WiFi)", "Active hosts (WiFi)");
         p("Hostas neatsako: ", "No answer from host: ");
         p("neturi šio žemėlapio", "you lack this map");
-        p("kita versija ", "other version ");
+        p("kita versija %s", "other version %s");
         p("modai skiriasi", "mods differ");
         p("Tinklas", "Network");
         p("laukia", "waiting");
@@ -268,7 +273,7 @@ final class S {
         p("atsitiktinis kaskart", "random each time");
         p("fiksuotas", "fixed");
         p("Pergalės pagal rasę", "Wins by race");
-        p("žaid.", "games");
+        p("%d žaid.", "%d games");
         p("Kampanijos", "Campaigns");
         p("Pervardyti", "Rename");
         p("Pervardyti profilį", "Rename profile");
@@ -292,13 +297,15 @@ final class S {
         p("Pasirinkite profilį", "Choose a profile");
         p("Vardas (rodomas žaidime)", "Name (shown in game)");
         p("Statistika (", "Statistics (");
-        p("Žaidimų ", "Games ");
+        p("Žaidimų: %s", "Games: %s");
         p("Gerai", "OK");
         p("Baigti", "Quit");
         p("Atšaukti", "Cancel");
         p("Uždaryti", "Close");
         p("Grįžti", "Back");
         p("Tęsti", "Continue");
+        p("Kitas scenarijus:", "Next scenario:");
+        p("Kitas scenarijus nerastas:", "Next scenario not found:");
         p("Į meniu", "To menu");
         p("Palikti", "Leave");
 
@@ -341,7 +348,7 @@ final class S {
         p("Pasiruošti", "Ready");
         p("Ieškoma...", "Searching...");
         p("Ieškoma…", "Searching...");
-        p("Slot ", "Slot ");
+        p("Vieta %d", "Slot %d");
 
         // --- campaign ---
         p("Kampanija — pasirink epizodą:", "Campaign - choose an episode:");
@@ -468,10 +475,10 @@ final class S {
         p("botų bibliotekos praleistos (nepatvirtinta)", "bot libraries skipped (not approved)");
         // v0.83.009 (S1.2/S1.3): compatibility gate + exclusive-category swap.
         p("Nesuderinamas modas", "Incompatible mod");
-        p("Modui reikia naujesnės programos versijos (versionCode ≥ ",
-          "This mod needs a newer app version (versionCode >= ");
-        p("Modas skirtas senesnei programos versijai (versionCode ≤ ",
-          "This mod targets an older app version (versionCode <= ");
+        p("Modui reikia naujesnės programos versijos (versionCode ≥ %d)",
+          "This mod needs a newer app version (versionCode >= %d)");
+        p("Modas skirtas senesnei programos versijai (versionCode ≤ %d)",
+          "This mod targets an older app version (versionCode <= %d)");
         p("Ta pati kategorija jau užimta", "That category is already taken");
         p("Šias kategorijas jau teikia kitas aktyvus modas:",
           "These categories are already provided by another active mod:");
@@ -667,7 +674,8 @@ final class S {
         p("Importuoti", "Imported");
         p("Klasikiniai (SC) — 2–4 žaidėjų", "Classic (SC) - 2-4 players");
         p("Klasikiniai (SC) — 5–8 žaidėjų", "Classic (SC) - 5-8 players");
-        p("(nėra ", "(no ");
+        p("(nėra %d+ žaidėjų žemėlapių — importuokite arba mažinkite žaidėjų skaičių)",
+          "(no maps for %d+ players — import some or lower the player count)");
         p("StarCraft", "StarCraft");
         p("Brood War", "Brood War");
         p("Pilna", "Full");
@@ -902,6 +910,7 @@ final class S {
         p("Centruoti į pažymėtus", "Center on selection");
         p("Priartinti", "Zoom in");
         p("Atitolinti", "Zoom out");
+        p("Kitas pogrupis", "Next subgroup");
         p("Grupė", "Group");
         p("Kameros vieta", "Camera location");
         p("Kairysis pelės", "Left mouse");
@@ -909,7 +918,7 @@ final class S {
         p("Dešinysis pelės", "Right mouse");
         p("Pelės atgal", "Mouse back");
         p("Pelės pirmyn", "Mouse forward");
-        p("Pelės ", "Mouse ");
+        p("Pelės %d", "Mouse %d");
         p("Tarpas", "Space");
         p("Sukeisti", "Swapped");
         p("Pažymėjus vienetus, bakstelėjimas žemėje/priešą duoda komandą (be ilgo paspaudimo). Savo vieneto bakstelėjimas vis tiek pažymi.",
@@ -929,8 +938,7 @@ final class S {
         p("Pašalinta: ", "Removed: ");
         p("Nustatyk talpyklos adresą (mygtukas žemiau).", "Set the repository address (button below).");
         p("Gaunamas talpyklos sąrašas…", "Fetching the repository list…");
-        p("Talpykla: ", "Repository: ");
-        p(" modų.", " mods.");
+        p("Talpykla: %s.", "Repository: %s.");
         p("Netinkamas talpyklos įrašas.", "Invalid repository entry.");
         p("tuščias zip", "empty zip");
         p("Nepavyko įdiegti: ", "Install failed: ");
@@ -1009,8 +1017,8 @@ final class S {
         p("Kas naujo", "What's new");
         p("Jungiamasi…", "Connecting…");
         p("Atsisiunčiama", "Downloading");
-        p("Tęsiama nuo ", "Resuming from ");
-        p("liko ", "left ");
+        p("Tęsiama nuo %s", "Resuming from %s");
+        p("liko %s", "%s left");
         p("jau atsisiųsta", "already downloaded");
         p("Šiame leidime nėra APK — atsisiųsk jį iš leidimo puslapio.", "This release has no APK — download it from the release page.");
         p("Atidaryti leidimo puslapį", "Open the release page");
@@ -1044,6 +1052,9 @@ final class S {
         p("Kinematinis atspalvis", "Cinematic color grade");
         p("Švelnus spalvų koregavimas (kontrastas, sodrumas, šiluma) — kino atspalvis. 0 = išjungta.",
           "Gentle color grade (contrast, saturation, warmth) — cinematic tint. 0 = off.");
+        p("Animuotas vanduo", "Animated water");
+        p("Vanduo raibuliuoja ir blizga kaip SC:R. Tik HD2 ir FULL HD.",
+          "Water ripples and glints as in SC:R. HD2 and FULL HD only.");
         p("SC:R žaidimo šriftas", "SC:R in-game font");
         p("HUD tekstas SC:R šriftu. Tik HD; išdėstymas nekinta.", "HUD text in the SC:R font. HD only; the layout stays the same.");
         p("Dinaminės šviesos", "Dynamic lights");
@@ -1088,14 +1099,13 @@ final class S {
         p("archyvo žodynas per didelis šiam įrenginiui (> 256 MB). Perpakuok mažesniu žodynu arba ZIP.",
           "the archive's dictionary is too large for this device (> 256 MB). Repack it with a smaller dictionary or as ZIP.");
         p("importas nepavyko: ", "import failed: ");
-        p("nepakanka vietos: reikia ", "not enough space: needs ");
-        p(", laisva ", ", free ");
+        p("nepakanka vietos: reikia %s, laisva %s.", "not enough space: needs %s, %s free.");
         p("nepalaikomas glaudinimo būdas arba archyvas apsaugotas slaptažodžiu.",
           "unsupported compression method, or the archive is password-protected.");
         p("nepavyko atidaryti", "could not open");
         p("nepavyko atidaryti archyvo.", "could not open the archive.");
-        p("nepavyko perrašyti ", "could not replace ");
-        p("nepavyko pervadinti ", "could not rename ");
+        p("nepavyko perrašyti %s", "could not replace %s");
+        p("nepavyko pervadinti %s", "could not rename %s");
         p("nepavyko įrašyti (ar pakanka vietos?).", "could not write (is there enough space?).");
         p("per mažai atminties archyvui išskleisti.", "not enough memory to unpack the archive.");
         p("praleista failų su netinkamais vardais: ", "files skipped for unsafe names: ");

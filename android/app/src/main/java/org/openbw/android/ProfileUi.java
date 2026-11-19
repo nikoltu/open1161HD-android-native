@@ -113,7 +113,7 @@ final class ProfileUi extends Kit {
         right.addView(name);
 
         int games = stat(profile, "games");
-        right.addView(label(S.t("Pergalės pagal rasę") + " · " + games + " " + S.t("žaid.")));
+        right.addView(label(S.t("Pergalės pagal rasę") + " · " + S.f("%d žaid.", games)));
         int maxWins = 1;
         for (String k : RACE_STAT) maxWins = Math.max(maxWins, stat(profile, "wins." + k));
         for (int i = 0; i != 4; ++i) {
@@ -256,7 +256,7 @@ final class ProfileUi extends Kit {
             col.setOrientation(LinearLayout.VERTICAL);
             col.setPadding(dp(12), 0, 0, 0);
             col.addView(text(n, Color.WHITE, 17));
-            col.addView(text(S.t("Žaidimų ") + stat(n, "games"), TEXT2, 12));
+            col.addView(text(S.f("Žaidimų: %s", stat(n, "games")), TEXT2, 12));
             row.addView(col);
             row.setOnClickListener(v -> {
                 pr.edit().putString("activeProfile", n).apply();

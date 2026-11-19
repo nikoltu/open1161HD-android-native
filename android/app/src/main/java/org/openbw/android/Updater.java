@@ -453,7 +453,7 @@ final class Updater {
         final Kit.ProgressPanel pp = new Kit(a).progressPanel("v" + r.version + "  ·  " + r.apkName);
         final long already = new File(target.getPath() + ".part").length();
         if (already > 0 && already < r.apkSize) {
-            pp.busy(S.t("Tęsiama nuo ") + mb(already) + "…");
+            pp.busy(S.f("Tęsiama nuo %s", mb(already)) + "…");
             pp.meter.setFraction(already / (float) r.apkSize);
         } else pp.busy(S.t("Jungiamasi…"));
         final boolean[] cancelled = {false};
@@ -481,7 +481,7 @@ final class Updater {
                     if (code == 200) have = 0;   // the server ignored the range: start over
                     final long from = have;
                     ui.post(() -> {
-                        pp.status.setText(from > 0 ? S.t("Tęsiama nuo ") + mb(from) : S.t("Atsisiunčiama"));
+                        pp.status.setText(from > 0 ? S.f("Tęsiama nuo %s", mb(from)) : S.t("Atsisiunčiama"));
                         pp.update(from, r.apkSize);
                     });
                     try (InputStream in = c.getInputStream(); RandomAccessFile out = new RandomAccessFile(part, "rw")) {

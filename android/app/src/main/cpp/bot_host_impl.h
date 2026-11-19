@@ -67,6 +67,23 @@ static void bot_rec_build(BOT_HOST_T& m, int order_id, int tile_x, int tile_y, i
 	bot_rec(m, b, sizeof b);
 }
 
+// --- fog of war (v6) ------------------------------------------------------------
+// A bot sees what its player sees. Another player's unit is listed only while the
+// bot's player has vision of it; an undetected cloaked unit still shows (a player
+// sees the shimmer, and it cannot be targeted), a burrowed one does not.
+static bool bot_sees(BOT_HOST_T& m, const unit_t* u) {
+	if (!u || !u->sprite) return false;
+	if (!m.bot_fog || u->owner == m.bot_player || u->owner == 11) return true;
+	if (!(u->sprite->visibility_flags & (1 << m.bot_player))) return false;
+	if (m.ui.u_burrowed(u) && m.ui.unit_is_undetected(u, m.bot_player)) return false;
+	return true;
+}
+// A unit the bot may click on: seen and not hidden by cloak.
+static bool bot_targetable(BOT_HOST_T& m, const unit_t* u) {
+	if (!bot_sees(m, u)) return false;
+	return !m.bot_fog || u->owner == m.bot_player || u->owner == 11 || !m.ui.unit_is_undetected(u, m.bot_player);
+}
+
 static int32_t bot_api_current_frame(ob_bot_host* h) {
 	return (int32_t)bot_m(h)->ui.st.current_frame;
 }
@@ -74,21 +91,21 @@ static int32_t bot_api_my_player(ob_bot_host* h) {
 	return bot_m(h)->bot_player;
 }
 static int32_t bot_api_minerals(ob_bot_host* h, int32_t p) {
-	if (p < 0 || p >= 12) return 0;
+	if (p < 0 || p >= 12 || (bot_m(h)->bot_fog && p != bot_m(h)->bot_player)) return 0;   // another player's bank is not visible
 	return bot_m(h)->ui.st.current_minerals[p];
 }
 static int32_t bot_api_gas(ob_bot_host* h, int32_t p) {
-	if (p < 0 || p >= 12) return 0;
+	if (p < 0 || p >= 12 || (bot_m(h)->bot_fog && p != bot_m(h)->bot_player)) return 0;   // another player's bank is not visible
 	return bot_m(h)->ui.st.current_gas[p];
 }
 static int32_t bot_api_supply_used(ob_bot_host* h, int32_t p) {
-	if (p < 0 || p >= 12) return 0;
+	if (p < 0 || p >= 12 || (bot_m(h)->bot_fog && p != bot_m(h)->bot_player)) return 0;
 	auto& m = *bot_m(h);
 	race_t r = m.ui.st.players[p].race;
 	return (int32_t)m.ui.st.supply_used[p][(size_t)r].raw_value; // fp1 raw = half-supply units
 }
 static int32_t bot_api_supply_available(ob_bot_host* h, int32_t p) {
-	if (p < 0 || p >= 12) return 0;
+	if (p < 0 || p >= 12 || (bot_m(h)->bot_fog && p != bot_m(h)->bot_player)) return 0;
 	auto& m = *bot_m(h);
 	race_t r = m.ui.st.players[p].race;
 	return (int32_t)m.ui.st.supply_available[p][(size_t)r].raw_value; // fp1 raw = half-supply units
@@ -99,7 +116,7 @@ static int32_t bot_api_units(ob_bot_host* h, int32_t p, ob_unit* out, int32_t ma
 	int32_t n = 0;
 	for (auto i = m.ui.st.player_units[p].begin(); i != m.ui.st.player_units[p].end() && n != max; ++i) {
 		unit_t* u = &*i;
-		if (!u->sprite) continue;
+		if (!u->sprite || !bot_sees(m, u)) continue;
 		ob_unit& o = out[n++];
 		o.id = (intptr_t)u;
 		o.type = (int32_t)u->unit_type->behaves_as;   // a mod type looks like its parent to bots
@@ -118,14 +135,27 @@ static int32_t bot_api_units(ob_bot_host* h, int32_t p, ob_unit* out, int32_t ma
 	}
 	return n;
 }
+// The enemy's start, once the bot's player can know it: the only start location
+// that is not ours, one it has explored, or the last unexplored candidate (on a
+// 4-player map it is a search, not a given).
 static int32_t bot_api_enemy_start(ob_bot_host* h, int32_t* x, int32_t* y) {
 	auto& m = *bot_m(h);
+	const int mask = 1 << m.bot_player;
+	auto explored = [&](xy pos) { return (m.ui.st.tiles[m.ui.tile_index(pos)].explored & mask) == 0; };
+	const xy own = m.ui.game_st.start_locations[m.bot_player];
+	int unexplored = 0;
+	for (int p = 0; p != 8; ++p) {
+		xy pos = m.ui.game_st.start_locations[p];
+		if (pos == xy() || pos == own) continue;
+		if (!explored(pos)) ++unexplored;
+	}
 	for (int p = 0; p != 8; ++p) {
 		if (p == m.bot_player) continue;
 		if (!m.ui.player_slot_active(p)) continue;
 		if (m.ui.st.alliances[m.bot_player][p] != 0) continue;
 		xy pos = m.ui.game_st.start_locations[p];
 		if (pos == xy()) continue;
+		if (m.bot_fog && !explored(pos) && unexplored > 1) continue;
 		*x = pos.x;
 		*y = pos.y;
 		return 1;
@@ -163,6 +193,7 @@ static void bot_api_order_right_click(ob_bot_host* h, intptr_t unit, intptr_t ta
 	unit_t* u = (unit_t*)unit;
 	unit_t* t = (unit_t*)target;
 	if (!u || !t || u->owner != m.bot_player) { diag_bot_invalid(m, "right_click", !u ? "null_unit" : (!t ? "null_target" : "wrong_owner")); return; }
+	if (!bot_targetable(m, t)) { diag_bot_invalid(m, "right_click", "target_not_visible"); return; }
 	diag_bot_stale(m, u, "right_click"); diag_bot_stale(m, t, "right_click_target");
 	diag_bot_cmd(m);
 	bot_rec_select(m, u); bot_rec_default_order(m, t->sprite->position.x, t->sprite->position.y, t);
@@ -364,7 +395,7 @@ static int32_t bot_api_is_reachable(ob_bot_host* h, intptr_t unit, int32_t x, in
 static int32_t bot_api_unit_ex(ob_bot_host* h, intptr_t unit, ob_unit_ex* out) {
 	auto& m = *bot_m(h);
 	unit_t* u = (unit_t*)unit;
-	if (!u || !out) return 0;
+	if (!u || !out || !bot_sees(m, u)) return 0;
 	memset(out, 0, sizeof(*out));
 	out->energy = u->energy.integer_part();
 	out->resources = m.ui.ut_resource(u) ? u->building.resource.resource_count : 0;
@@ -404,6 +435,12 @@ static int32_t bot_api_use_ability(ob_bot_host* h, intptr_t unit, int32_t abilit
 	case OB_AB_DECLOAK: bot_rec_u8(m, 34, 0); return m.ui.action_decloak(m.bot_player) ? 1 : 0;
 	case OB_AB_HOLD_POSITION: bot_rec_u8(m, 43, 0); return m.ui.action_hold_position(m.bot_player, false) ? 1 : 0;
 	case OB_AB_TRAIN_FIGHTER: bot_rec_op(m, 39); return m.ui.action_train_fighter(m.bot_player) ? 1 : 0;
+	case OB_AB_UNLOAD_ALL: {
+		// action_unload_all reports nothing; "accepted" = there was someone to let out
+		bool cargo = !m.ui.loaded_units(u).empty();
+		bot_rec_u8(m, 40, 0); m.ui.action_unload_all(m.bot_player, false);
+		return cargo ? 1 : 0;
+	}
 	default: diag_bot_invalid(m, "use_ability", "bad_ability", "\"ability\":" + std::to_string(ability)); return 0;
 	}
 }
@@ -438,12 +475,29 @@ static int32_t bot_api_cast_on(ob_bot_host* h, intptr_t unit, int32_t order_id, 
 	unit_t* u = (unit_t*)unit;
 	unit_t* t = (unit_t*)target;
 	if (!u || !t || u->owner != m.bot_player || !t->sprite) { diag_bot_invalid(m, "cast_on", !u ? "null_unit" : (!t ? "null_target" : "wrong_owner")); return 0; }
+	if (!bot_targetable(m, t)) { diag_bot_invalid(m, "cast_on", "target_not_visible"); return 0; }
 	if (!bot_cast_order_ok(order_id)) { diag_bot_invalid(m, "cast_on", "bad_order", "\"order\":" + std::to_string(order_id)); return 0; }
 	diag_bot_stale(m, u, "cast_on"); diag_bot_stale(m, t, "cast_on_target");
 	diag_bot_cmd(m);
 	m.ui.action_select(m.bot_player, u);
 	bot_rec_select(m, u); bot_rec_order(m, t->sprite->position.x, t->sprite->position.y, t, order_id);
 	return m.ui.action_order(m.bot_player, m.ui.get_order_type((Orders)order_id), t->sprite->position, t, nullptr, false) ? 1 : 0;
+}
+
+// --- ABI v6 ------------------------------------------------------------------
+static int32_t bot_api_unit_status(ob_bot_host* h, intptr_t unit) {
+	auto& m = *bot_m(h);
+	unit_t* u = (unit_t*)unit;
+	if (!u || !bot_sees(m, u)) return 0;
+	int32_t s = OB_US_VISIBLE;
+	if (m.ui.u_cloaked(u) || m.ui.u_requires_detector(u)) {
+		s |= OB_US_CLOAKED;
+		if (!m.ui.unit_is_undetected(u, m.bot_player)) s |= OB_US_DETECTED;
+	}
+	if (m.ui.u_burrowed(u)) s |= OB_US_BURROWED;
+	if (m.ui.u_loaded(u)) s |= OB_US_LOADED;
+	if (!m.ui.loaded_units(u).empty()) s |= OB_US_CARGO;
+	return s;
 }
 
 static const ob_host_api bot_host_api_table = {
@@ -480,4 +534,5 @@ static const ob_host_api bot_host_api_table = {
 	bot_api_use_ability,      // v5
 	bot_api_cast_at,
 	bot_api_cast_on,
+	bot_api_unit_status,      // v6
 };

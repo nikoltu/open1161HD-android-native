@@ -9,7 +9,7 @@
 
 <p align="center">
   <img alt="Platform: Android 7.0+" src="https://img.shields.io/badge/platform-Android%207.0%2B%20(arm64%20%7C%20x86__64)-3DDC84?logo=android&logoColor=white">
-  <img alt="Version 1.0.26" src="https://img.shields.io/badge/version-1.0.26-blue">
+  <img alt="Version 1.1.2" src="https://img.shields.io/badge/version-1.1.2-blue">
   <img alt="Licence: MIT (own code)" src="https://img.shields.io/badge/licence-MIT%20(own%20code)-orange">
   <img alt="Core: OpenBW 1.16.1" src="https://img.shields.io/badge/core-OpenBW%201.16.1-8a2be2">
   <img alt="Code: C++14/17, Java, GLSL" src="https://img.shields.io/badge/code-C%2B%2B14%2F17%20%7C%20Java%20%7C%20GLSL-lightgrey">
@@ -27,6 +27,7 @@
 ## Contents
 
 - [What it is](#what-it-is)
+- [Screenshots](#screenshots)
 - [Feature status](#feature-status)
 - [Requirements](#requirements)
 - [Installing and game files](#installing-and-game-files)
@@ -57,6 +58,30 @@ StarCraft: Brood War 1.16.1 game engine. It has three parts:
 The aim is to play Brood War on a tablet or phone exactly as the 1.16.1 rules play it, in the classic look or the
 Remastered one.
 
+<a id="screenshots"></a>
+<img src=".github/strips/12-screenshots.png" width="100%" alt="Screenshots">
+
+Phone (Samsung Galaxy S20+) on the left, tablet (Galaxy Tab S8 Ultra) on the right.
+
+<table>
+<tr><td colspan="2"><b>Launcher — campaign episodes</b></td></tr>
+<tr><td width="50%"><img src=".github/shots/01-launcher-phone.jpg" width="100%" alt="Launcher — campaign episodes (phone)"></td><td width="50%"><img src=".github/shots/01-launcher-tablet.jpg" width="100%" alt="Launcher — campaign episodes (tablet)"></td></tr>
+<tr><td colspan="2"><b>Custom game — map list, preview, players, AI level, SCBW2 rules</b></td></tr>
+<tr><td width="50%"><img src=".github/shots/02-custom-game-phone.png" width="100%" alt="Custom game — map list, preview, players, AI level, SCBW2 rules (phone)"></td><td width="50%"><img src=".github/shots/02-custom-game-tablet.jpg" width="100%" alt="Custom game — map list, preview, players, AI level, SCBW2 rules (tablet)"></td></tr>
+<tr><td colspan="2"><b>Mission briefing</b></td></tr>
+<tr><td width="50%"><img src=".github/shots/03-briefing-phone.jpg" width="100%" alt="Mission briefing (phone)"></td><td width="50%"><img src=".github/shots/03-briefing-tablet.jpg" width="100%" alt="Mission briefing (tablet)"></td></tr>
+<tr><td colspan="2"><b>In game — touch HUD (v3) with the command wheel</b></td></tr>
+<tr><td width="50%"><img src=".github/shots/04-hud-v3-phone.jpg" width="100%" alt="In game — touch HUD (v3) with the command wheel (phone)"></td><td width="50%"><img src=".github/shots/04-hud-v3-tablet.jpg" width="100%" alt="In game — touch HUD (v3) with the command wheel (tablet)"></td></tr>
+<tr><td colspan="2"><b>In game — HUD v2</b></td></tr>
+<tr><td width="50%"><img src=".github/shots/05-hud-v2-phone.jpg" width="100%" alt="In game — HUD v2 (phone)"></td><td width="50%"><img src=".github/shots/05-hud-v2-tablet.jpg" width="100%" alt="In game — HUD v2 (tablet)"></td></tr>
+<tr><td colspan="2"><b>In game — touch HUD, handheld layout</b></td></tr>
+<tr><td width="50%"><img src=".github/shots/06-hud-v3-handheld-phone.jpg" width="100%" alt="In game — touch HUD, handheld layout (phone)"></td><td width="50%"><img src=".github/shots/06-hud-v3-handheld-tablet.jpg" width="100%" alt="In game — touch HUD, handheld layout (tablet)"></td></tr>
+<tr><td colspan="2"><b>In game — Remastered HD graphics (needs your own StarCraft: Remastered files)</b></td></tr>
+<tr><td width="50%"><img src=".github/shots/07-hd-phone.jpg" width="100%" alt="In game — Remastered HD graphics (needs your own StarCraft: Remastered files) (phone)"></td><td width="50%"><img src=".github/shots/07-hd-tablet.jpg" width="100%" alt="In game — Remastered HD graphics (needs your own StarCraft: Remastered files) (tablet)"></td></tr>
+<tr><td colspan="2"><b>Settings › Graphics</b></td></tr>
+<tr><td width="50%"><img src=".github/shots/08-settings-graphics-phone.jpg" width="100%" alt="Settings › Graphics (phone)"></td><td width="50%"><img src=".github/shots/08-settings-graphics-tablet.jpg" width="100%" alt="Settings › Graphics (tablet)"></td></tr>
+</table>
+
 <a id="feature-status"></a>
 <img src=".github/strips/02-feature-status.png" width="100%" alt="Feature status">
 
@@ -68,20 +93,22 @@ Legend: **Working** — used in the regular test runs or played on real devices 
 |---|---|---|---|
 | Game data | Import of the 1.16.1 archives from the launcher | Working | `StarDat.mpq`, `BrooDat.mpq`, `patch_rt.mpq`; CD archives for campaigns and music |
 | Game data | Remastered install (CASC) for the HD tiers | Working | Read in place; no conversion step |
-| Launcher | Profiles, Options, Help, mods, in-app updates | Working | Lithuanian and English |
-| Launcher | Campaigns with briefings, progress and a score screen | Working | All six episodes; mission end window, Continue / Restart / Mission list |
-| Launcher | Custom Game against the computer | Working | One built-in AI with four difficulty levels |
+| Launcher | Profiles, Options, Help, mods, in-app updates | Working | Lithuanian and English; settings that need Remastered files are greyed out without them |
+| Launcher | Campaigns with briefings, progress and a score screen | Working | All six episodes; animated Remastered emblems in HD; custom `.oecampaign` packages |
+| Launcher | Custom Game against the computer | Working | One built-in AI with four difficulty levels; it plays with fog of war, detects cloaked units and uses bunkers |
 | Game | Full 1.16.1 simulation, triggers, campaign AI scripts | Working | Determinism gates on every change to the core |
-| Game | Save and load | Working | In game and from the launcher |
-| Game | Use Map Settings (UMS) maps | In progress | Slot setup, preplaced unit properties and trigger edge cases |
-| Game | EUD maps | Planned | A measured subset first (deaths, resources, unit counts) |
-| Graphics | SD, HD and HD2 tiers | Working | HD sprites, terrain, portraits, cinematics |
-| Graphics | Remastered effects in HD2/HD | In progress | Drawn from SD art today |
+| Game | Save and load | Working | In game and from the launcher; free-text save names |
+| Game | Use Map Settings (UMS) maps | Working | Lobby slots, preplaced unit properties, Set Next Scenario, player colours (`COLR` / `CRGB`) |
+| Game | EUD maps | In progress | Deaths, resources, unit and `.dat` tables, images / sprites, button sets; eudplib-generated maps not yet |
+| Game | Mod heroes, abilities and scripts | Working | Hero levels, custom abilities and OEScript from mod packages |
+| Graphics | SD, HD and HD2 tiers | Working | HD sprites, terrain, portraits, cinematics, cursors, space parallax |
+| Graphics | Remastered effects in HD2/HD | Working | Shadows, selection circles, creep edges, EMP, lights; animated water is optional and approximate |
 | Graphics | GPU post-processing: sharpen, bloom, colour grade, shadows | Working | All optional, off by default |
-| Controls | Touch HUD, S Pen, pinch zoom | Working | Designed on a Galaxy Tab S8 Ultra |
-| Controls | Keyboard and mouse | Working | Classic hotkeys |
+| Controls | Touch HUD, S Pen, pinch zoom | Working | Touch HUD (v3, default), HUD v2 and the classic panel |
+| Controls | Keyboard and mouse | Working | Classic hotkeys or a per-command key editor; game cursor with a real mouse |
+| Controls | Game controller | Working | Button mapping editor in the launcher |
 | Replays | Classic `.rep` and Remastered replays, timeline, speed | Working | Recording of own games included |
-| Multiplayer | LAN (FFA and teams), optional house rules | Working | Up to 8 players |
+| Multiplayer | LAN (FFA and teams), optional house rules | Working | Up to 8 players; commands validated; players' portraits |
 | Multiplayer | Online multiplayer | Not planned | |
 
 <a id="requirements"></a>
@@ -183,16 +210,19 @@ reference data are not part of this repository.
 <a id="status-and-roadmap"></a>
 <img src=".github/strips/09-status-and-roadmap.png" width="100%" alt="Status and roadmap">
 
-Current version: **v1.0.26**
+Current version: **v1.1.2**
 
 - **Campaigns:** all six episodes can be played through, with briefings, cinematics, a mission end window and a score
-  screen that continues to the next mission.
-- **Custom games** against the built-in AI at four difficulty levels, and **LAN games** between devices.
+  screen that continues to the next mission; campaign AI scripts follow 1.16.1 more closely (allies and enemies set by
+  script, random seeds).
+- **Custom games** against the built-in AI at four difficulty levels, **Use Map Settings maps**, and **LAN games**
+  between devices.
 - **Replays:** classic and Remastered replays, and recordings of your own games.
-- **HD:** Remastered sprites, terrain, portraits and cinematics from your own install.
+- **HD:** Remastered sprites, terrain, portraits, cinematics, effects and cursors from your own install.
+- **Controls:** touch, S Pen, keyboard and mouse, and game controllers.
 
-Next: Use Map Settings maps (slot setup, preplaced unit properties, trigger edge cases), a first EUD subset
-and LAN command validation.
+Next: more EUD maps (including eudplib-generated ones), and the remaining Remastered terrain effects (foliage and
+lighting).
 
 <a id="credits"></a>
 <img src=".github/strips/10-credits.png" width="100%" alt="Credits">

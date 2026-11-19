@@ -5,7 +5,7 @@
   "race": "any",
   "level": "adaptive",
   "author": "open1161HD",
-  "abi": 4,
+  "abi": 6,
   "levels": ["very_easy", "easy", "medium", "hard"],
   "default_level": "medium",
   "level_names": { "lt": ["Labai lengvas", "Lengvas", "Vidutinis", "Sunkus"], "en": ["Very easy", "Easy", "Medium", "Hard"] },

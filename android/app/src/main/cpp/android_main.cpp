@@ -140,6 +140,7 @@ struct main_t {
 	void (*bot_frame_f)(void*) = nullptr;
 	void (*bot_destroy_f)(void*) = nullptr;
 	int bot_player = -1;
+	bool bot_fog = true;   // bot ABI >= 6: sees only what its player sees (bot_host_impl.h)
 	int bot_level = 2;   // --bot-level: 0 very easy .. 3 hard (bot_api_difficulty)
 	// v1.0.2: the bot's commands in the replay's action encoding (bot_host_impl.h);
 	// set while a game is being recorded.
@@ -617,6 +618,7 @@ bool main_t::load_bot(const a_string& path, int slot) {
 		return false;
 	}
 	bot_player = slot;
+	bot_fog = bot_abi >= 6;
 	bot_instance = create_f((ob_bot_host*)this, &bot_host_api_table);
 	log("bot: %s loaded, playing slot %d\n", path.c_str(), slot);
 	// Re-snapshot module bases so a crash inside the just-loaded bot .so resolves to
@@ -958,6 +960,7 @@ extern "C" int main(int argc, char* argv[]) {
 	int post_strength = 35;       // SP effect strength 0..100
 	int gl_bloom = 0;             // SP Phase 3: real GPU bloom through the GL chain 0..100
 	int gl_grade = 0;             // SE: cinematic color-grade 0..100
+	int hd_water = 0;             // HD water in the GL present stage (default off)
 	int emissive_on = 1;          // open1161HD Faze 7: SC:R emissive self-glow (default on)
 	int soft_shadows = 0;         // open1161HD Faze 7: softer unit shadows (default off)
 	int sun_shadow = 0;           // SHADOWS Phase 1: directional sun shadow (0 = off)
@@ -1081,6 +1084,7 @@ extern "C" int main(int argc, char* argv[]) {
 		else if (arg == "--post-strength" && i + 1 < argc) post_strength = atoi(argv[++i]); // 0..100
 		else if (arg == "--gl-bloom" && i + 1 < argc) gl_bloom = atoi(argv[++i]); // SP Phase 3 GPU bloom 0..100
 		else if (arg == "--grade" && i + 1 < argc) gl_grade = atoi(argv[++i]); // SE color-grade 0..100
+		else if (arg == "--hd-water" && i + 1 < argc) hd_water = atoi(argv[++i]);
 		else if (arg == "--emissive" && i + 1 < argc) emissive_on = atoi(argv[++i]);
 		else if (arg == "--soft-shadows" && i + 1 < argc) soft_shadows = atoi(argv[++i]);
 		else if (arg == "--sun-shadow" && i + 1 < argc) sun_shadow = atoi(argv[++i]); // directional sun shadow (0/1)
@@ -1401,6 +1405,7 @@ extern "C" int main(int argc, char* argv[]) {
 		const bool req_tables = player.load_requirement_tables(data_dir + "/StarCraft.exe");
 		const uint32_t req_hash = player.requirement_tables_hash();
 		if (req_tables) log("requirement tables loaded from StarCraft.exe (hash %08x)\n", (unsigned)req_hash);
+		if (player.load_button_sets(data_dir + "/StarCraft.exe")) log("button sets loaded from StarCraft.exe\n");
 
 		main_t m(std::move(player));
 		auto& ui = m.ui;
@@ -1684,6 +1689,7 @@ extern "C" int main(int argc, char* argv[]) {
 		ui.hd_post_strength = post_strength; // SP: effect strength 0..100
 		ui.hd_gl_bloom = gl_bloom;           // SP Phase 3: GPU bloom 0..100
 		ui.hd_grade = gl_grade;              // SE: color-grade 0..100
+		ui.hd_water = hd_water != 0;
 		ui.hd_emissive = emissive_on != 0;
 		ui.hd_shadow_soft = soft_shadows; // 0..100 softness (0 = classic hard)
 		ui.hd_shadow_dir = sun_shadow;        // SHADOWS: directional sun shadow (0/1)
@@ -2099,6 +2105,7 @@ extern "C" int main(int argc, char* argv[]) {
 				ui.st.game->qol.smart_rally = true;   // v1.0.2: recorded (qol bit7), so playback runs it too
 				ui.st.game->qol.trigger_pause = true;   // single player only (qol bit10)
 				ui.st.game->qol.eud_requirements = req_tables;   // recorded (qol bit12)
+				ui.st.game->qol.eud_local_player = chosen_local;   // recorded (qol bit13, bits16-19)
 				if (!campaign) ui.map_mpq_path = map_path;
 				if (!campaign) ui.loading_map_label = !map_mpq.empty() ? map_mpq : map_path; // loading screen map name
 				for (size_t i = 0; i != 12; ++i) ui.action_st.player_id[i] = (int)i;
@@ -2280,6 +2287,7 @@ extern "C" int main(int argc, char* argv[]) {
 			ui.smart_rally = true; // melee: rally-to-resource gathers, rally-to-enemy attacks
 			ui.st.game->qol.smart_rally = true;   // v1.0.2: recorded (qol bit7), so playback runs it too
 			ui.st.game->qol.eud_requirements = req_tables;   // recorded (qol bit12)
+			ui.st.game->qol.eud_local_player = chosen_local;   // recorded (qol bit13, bits16-19)
 			// Action routing for direct action_* calls uses the owner index
 			// directly, but set player_id so any raw-action path also works.
 			for (size_t i = 0; i != 12; ++i) ui.action_st.player_id[i] = (int)i;
@@ -2455,6 +2463,7 @@ extern "C" int main(int argc, char* argv[]) {
 			sync_st.local_req_hash = req_hash;   // the host turns qol bit12 on only if every peer's tables match
 			sync_st.host_mod_fp = net_host ? mod_fp : 0;
 			net.set_local_client_name(!player_name.empty() ? player_name : (net_host ? "host" : "guest"));
+			net.set_local_client_portrait(player_portrait);   // rides the uid handshake (render-only)
 			udp_responder discovery;
 			if (net_host) {
 				server.bind(a_string("0.0.0.0"), net_port);
@@ -2505,8 +2514,10 @@ extern "C" int main(int argc, char* argv[]) {
 				// v0.39: project the lobby snapshot into the slot table (the UI
 				// only renders this; it never edits shared lobby state).
 				ui.lobby_slots.clear();
+				ui.slot_portraits.fill(-1);
 				for (auto& c : sync_st.clients) {
 					if (c.player_slot < 0) continue;
+					if (c.player_slot < 12 && &c != sync_st.local_client) ui.slot_portraits[(size_t)c.player_slot] = c.portrait;
 					ui.lobby_slots.emplace_back();
 					auto& s = ui.lobby_slots.back();
 					s.name = c.name.empty() ? a_string("?") : c.name;
@@ -2546,7 +2557,9 @@ extern "C" int main(int argc, char* argv[]) {
 					for (auto& s : ui.lobby_slots) {
 						if (!first) j += ",";
 						first = false;
+						int pid = ui.player_portrait_id(s.is_local, false, s.name, s.race, s.slot);
 						j += "{\"name\":\"" + json_esc(std::string(s.name.c_str())) + "\",\"race\":" + std::to_string(s.race)
+						   + ",\"portrait\":" + std::to_string(pid)
 						   + ",\"slot\":" + std::to_string(s.slot) + ",\"ready\":" + (s.ready ? "true" : "false")
 						   + ",\"local\":" + (s.is_local ? "true" : "false") + "}";
 					}
@@ -2795,9 +2808,14 @@ extern "C" int main(int argc, char* argv[]) {
 			// v0.83: the UI needs the same names to attribute incoming chat
 			// lines (opcode 92), and it needs them whether or not a replay is
 			// being recorded -- so fill them outside that branch.
+			ui.slot_portraits.fill(-1);
 			for (auto& c : sync_st.clients) {
-				if (c.player_slot >= 0 && c.player_slot < 12)
+				if (c.player_slot >= 0 && c.player_slot < 12) {
 					ui.slot_player_names[(size_t)c.player_slot] = c.name;
+					if (&c != sync_st.local_client) ui.slot_portraits[(size_t)c.player_slot] = c.portrait;
+				}
+				log("net peer: slot=%d name=%s portrait=%d%s\n", c.player_slot, c.name.c_str(), c.portrait,
+					&c == sync_st.local_client ? " (local)" : "");
 			}
 			if (record_replay && init_replay_recording(reload_funcs.setup_info, (int)active_slots.size())) {
 				for (auto& c : sync_st.clients) {
@@ -2938,7 +2956,8 @@ extern "C" int main(int argc, char* argv[]) {
 						| (q.auto_worker ? 32u : 0u) | (q.worker_rally_split ? 64u : 0u) | (q.smart_rally ? 128u : 0u)
 						| (q.ums_unit_properties ? 256u : 0u) | (ui.st.game->oescript.loaded ? 512u : 0u)
 						| (q.trigger_pause ? 1024u : 0u) | 2048u   // bit11: game-second trigger timers
-						| (q.eud_requirements ? 4096u : 0u);
+						| (q.eud_requirements ? 4096u : 0u)
+						| (q.eud_local_player >= 0 && q.eud_local_player < 12 ? 8192u | ((uint32_t)q.eud_local_player << 16) : 0u);
 				}
 				// An editor test keeps the player's LastGame.rep and writes its replay next to
 				// the trace instead, where the editor can read it (files/ is private to this app).
@@ -3169,7 +3188,7 @@ extern "C" int main(int argc, char* argv[]) {
 							for (auto& ch : nm) if (ch == '\n' || ch == '\r') ch = ' ';
 							int prace = (int)ui.st.players[p].race;
 							int portrait = ui.player_portrait_id(p == m.local_player,
-								ui.player_is_ai((size_t)p, m.local_player), nm, prace);
+								ui.player_is_ai((size_t)p, m.local_player), nm, prace, p);
 							fprintf(sf,
 								"p=%d race=%d units=%d buildings=%d kills=%d losses=%d "
 								"killscore=%d razescore=%d minerals=%d gas=%d color=%d portrait=%d ai=%d name=%s\n",
@@ -3184,6 +3203,35 @@ extern "C" int main(int argc, char* argv[]) {
 						}
 						fclose(sf);
 						log("score written: %s\n", spath.c_str());
+					}
+				}
+				// Set Next Scenario in a single-player custom game: 1.16.1 (0x4DC1C0) loads the
+				// named file from the finished map's folder after the end screen, won or lost.
+				{
+					a_string upath = data_dir + "/ums-next.txt";
+					remove(upath.c_str());
+					size_t nsi = (size_t)ui.st.next_scenario_string;
+					if (m.ums_mode && !net_mode && !test_mode && !campaign && oec_mission.empty() && map_mpq.empty()
+					    && !map_path.empty() && nsi && nsi <= ui.game_st.map_strings.size()) {
+						a_string want = ui.game_st.map_strings[nsi - 1];
+						while (!want.empty() && (unsigned char)want.back() <= ' ') want.pop_back();
+						size_t slash = map_path.find_last_of('/');
+						a_string dir = slash == a_string::npos ? a_string(".") : map_path.substr(0, slash);
+						a_string found;
+						if (!want.empty() && want.find_first_of("/\\:") == a_string::npos && want != "." && want != "..") {
+							// Windows file names are case-insensitive; Android's are not.
+							if (DIR* d = opendir(dir.c_str())) {
+								while (dirent* e = readdir(d)) {
+									if (strcasecmp(e->d_name, want.c_str()) == 0) { found = dir + "/" + e->d_name; break; }
+								}
+								closedir(d);
+							}
+						}
+						log("ums: next scenario '%s' -> '%s'\n", want.c_str(), found.c_str());
+						if (FILE* f = fopen(upath.c_str(), "wb")) {
+							fprintf(f, "%s\n%s\n", found.c_str(), want.c_str());
+							fclose(f);
+						}
 					}
 				}
 				save_recorded_replay();

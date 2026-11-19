@@ -164,6 +164,18 @@ struct window_impl {
 	GLuint post_bloomfbo[2] = {0, 0}, post_bloomtex[2] = {0, 0}; // half-res ping-pong
 	int post_bloom_w = 0, post_bloom_h = 0;
 	bool post_bloom_ready = false;  // bloom programs built OK
+	// HD water pre-pass: SDL source -> post_wfbo, written in the source's BGRA order so it
+	// stands in for the source in every pass below. Alpha byte in = 255 - water mask.
+	bool post_water_on = false;
+	window::water_params post_water;
+	GLuint post_prog_water = 0;
+	GLint post_water_pos = -1, post_water_tex = -1, post_water_size = -1, post_water_origin = -1, post_water_data = -1, post_water_tile = -1;
+	GLint post_water_n[4] = {-1, -1, -1, -1};
+	GLuint post_wn_tex[4] = {0, 0, 0, 0};      // normal_1 a/b, normal_2 a/b
+	int post_wn_id[4] = {-1, -1, -1, -1};
+	GLuint post_wfbo = 0, post_wfbo_tex = 0;
+	int post_wfbo_w = 0, post_wfbo_h = 0;
+	bool post_water_ready = false;
 #endif
 	SDL_Surface* present_source = nullptr;
 	int render_scale;
@@ -865,6 +877,9 @@ struct window_impl {
 				post_prog_bright = 0; post_prog_blur = 0; post_prog_comp = 0;
 				post_bloomfbo[0] = 0; post_bloomfbo[1] = 0; post_bloomtex[0] = 0; post_bloomtex[1] = 0;
 				post_bloom_w = 0; post_bloom_h = 0; post_bloom_ready = false;
+				post_prog_water = 0; post_wfbo = 0; post_wfbo_tex = 0; post_wfbo_w = 0; post_wfbo_h = 0;
+				for (int i = 0; i < 4; ++i) { post_wn_tex[i] = 0; post_wn_id[i] = -1; }
+				post_water_ready = false;
 				post_gl_ok = false; post_gl_tried = false;
 #endif
 				update_render_size();
@@ -989,6 +1004,9 @@ struct window_impl {
 		if (post_prog_bright) { glDeleteProgram(post_prog_bright); post_prog_bright = 0; }
 		if (post_prog_blur) { glDeleteProgram(post_prog_blur); post_prog_blur = 0; }
 		if (post_prog_comp) { glDeleteProgram(post_prog_comp); post_prog_comp = 0; }
+		if (post_prog_water) { glDeleteProgram(post_prog_water); post_prog_water = 0; }
+		post_water_teardown();
+		post_water_ready = false;
 		post_fbo_teardown();
 		post_bloom_fbo_teardown();
 		post_gl_ok = false;
@@ -1138,6 +1156,49 @@ struct window_impl {
 			post_comp_amt = glGetUniformLocation(post_prog_comp, "uAmt");
 			post_comp_grade = glGetUniformLocation(post_prog_comp, "uGrade");
 		}
+		// HD water (SC:R water.glsl, measured): two scrolling normal layers, screen-space
+		// refraction of the frame inside the mask, specular band near the screen centre.
+		const char* fs_water =
+			"#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n"
+			"varying vec2 vUv;\nuniform sampler2D uTex;\n"
+			"uniform sampler2D uN1a;\nuniform sampler2D uN1b;\nuniform sampler2D uN2a;\nuniform sampler2D uN2b;\n"
+			"uniform vec2 uSize;\nuniform vec3 uOrigin;\nuniform vec3 uData;\nuniform vec2 uTile;\n"
+			"vec3 sc(vec3 v){ return v * 2.0 - 1.0; }\n"
+			"void main(){\n"
+			"  vec4 s = texture2D(uTex, vUv);\n"
+			"  float src = 1.0 - s.a;\n"
+			"  if (src <= 0.0) { gl_FragColor = vec4(s.rgb, 1.0); return; }\n"
+			"  vec2 mp = uOrigin.xy + vUv * uSize / uOrigin.z;\n"
+			"  float t = uData.z / 20.0;\n"
+			"  vec2 m1 = mp * uTile.x - vec2(t / 2.0, t);\n"
+			"  vec2 m2 = mp * uTile.y - vec2(t * 2.0, t * 1.8);\n"
+			"  vec3 n = sc(mix(texture2D(uN1a, m1).bgr, texture2D(uN1b, m1).bgr, uData.y));\n"
+			"  vec3 d = sc(mix(texture2D(uN2a, m2).bgr, texture2D(uN2b, m2).bgr, uData.y)) * 0.6;\n"
+			"  n = normalize(vec3((n.xy + d.xy) * 0.6, n.z));\n"
+			"  vec4 s2 = texture2D(uTex, vUv + n.xy * vec2(0.019, 0.029));\n"
+			"  float dm = min(src, 1.0 - s2.a);\n"
+			"  vec3 ground = s.bgr;\n"
+			"  vec3 res = mix(s2.bgr, ground, 1.0 - dm);\n"
+			"  vec2 su = vUv * 2.0 - 1.0;\n"
+			"  float lx = mix(-0.1, 0.1, 1.0 - clamp(uData.x, 0.0, 1.0));\n"
+			"  float xd = clamp(1.0 - abs(su.x - lx), 0.0, 1.0);\n"
+			"  float yd = clamp(1.0 - abs(su.y + 0.2), 0.0, 1.0);\n"
+			"  float spec = ((n.x * 1.2 + n.y + n.z) / 3.0) * yd * xd * xd * xd * 0.6;\n"
+			"  ground = mix(ground, ground + spec, src);\n"
+			"  vec3 o = clamp(mix(ground, res + spec, dm), 0.0, 1.0);\n"
+			"  gl_FragColor = vec4(o.bgr, 1.0);\n"
+			"}\n";
+		post_prog_water = post_link(vs_noflip, fs_water);
+		if (post_prog_water) {
+			post_water_pos = glGetAttribLocation(post_prog_water, "aPos");
+			post_water_tex = glGetUniformLocation(post_prog_water, "uTex");
+			static const char* nn[4] = {"uN1a", "uN1b", "uN2a", "uN2b"};
+			for (int i = 0; i < 4; ++i) post_water_n[i] = glGetUniformLocation(post_prog_water, nn[i]);
+			post_water_size = glGetUniformLocation(post_prog_water, "uSize");
+			post_water_origin = glGetUniformLocation(post_prog_water, "uOrigin");
+			post_water_data = glGetUniformLocation(post_prog_water, "uData");
+			post_water_tile = glGetUniformLocation(post_prog_water, "uTile");
+		}
 		static const float tri[6] = { -1.f, -1.f,  3.f, -1.f,  -1.f, 3.f };
 		glGenBuffers(1, &post_vbo);
 		glBindBuffer(GL_ARRAY_BUFFER, post_vbo);
@@ -1158,6 +1219,7 @@ struct window_impl {
 		// pass into the FBO) + the blit path's FBO scaffold.
 		post_bloom_ready = post_prog_bright && post_prog_blur && post_prog_comp && post_prog_sharp
 			&& post_bright_pos >= 0 && post_blur_pos >= 0 && post_comp_pos >= 0 && post_sharp_pos >= 0;
+		post_water_ready = post_prog_water && post_water_pos >= 0;
 		post_gl_ok = true;
 #ifdef __ANDROID__
 		__android_log_print(ANDROID_LOG_INFO, "OpenBW", "post_gl: ready (effect=%d strength=%.2f, GL_RENDERER=%s)", resolve_effect(), post_strength, rend ? rend : "?");
@@ -1181,6 +1243,73 @@ struct window_impl {
 		glDrawArrays(GL_TRIANGLES, 0, 3);
 		glDisableVertexAttribArray((GLuint)aPosLoc);
 	}
+	// Upload the normal frames that changed. When the animation steps, the old "next" frame
+	// becomes "current": swap the texture names instead of uploading it again.
+	void post_water_upload() {
+		const window::water_params& p = post_water;
+		const uint32_t* px[4] = {p.n1[0], p.n1[1], p.n2[0], p.n2[1]};
+		const int id[4] = {p.n1_id[0], p.n1_id[1], p.n2_id[0], p.n2_id[1]};
+		const int w[4] = {p.n1_w, p.n1_w, p.n2_w, p.n2_w}, h[4] = {p.n1_h, p.n1_h, p.n2_h, p.n2_h};
+		for (int k = 0; k < 4; k += 2) {
+			if (post_wn_id[k] != id[k] && post_wn_id[k + 1] == id[k]) {
+				std::swap(post_wn_tex[k], post_wn_tex[k + 1]);
+				std::swap(post_wn_id[k], post_wn_id[k + 1]);
+			}
+		}
+		for (int i = 0; i < 4; ++i) {
+			if (post_wn_id[i] == id[i] && post_wn_tex[i]) continue;
+			if (!px[i] || w[i] <= 0 || h[i] <= 0) continue;
+			if (!post_wn_tex[i]) glGenTextures(1, &post_wn_tex[i]);
+			glBindTexture(GL_TEXTURE_2D, post_wn_tex[i]);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w[i], h[i], 0, GL_RGBA, GL_UNSIGNED_BYTE, px[i]);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+			post_wn_id[i] = id[i];
+		}
+	}
+	void post_water_teardown() {
+		if (post_wfbo) { glDeleteFramebuffers(1, &post_wfbo); post_wfbo = 0; }
+		if (post_wfbo_tex) { glDeleteTextures(1, &post_wfbo_tex); post_wfbo_tex = 0; }
+		post_wfbo_w = post_wfbo_h = 0;
+		for (int i = 0; i < 4; ++i) { if (post_wn_tex[i]) glDeleteTextures(1, &post_wn_tex[i]); post_wn_tex[i] = 0; post_wn_id[i] = -1; }
+	}
+	// Water pass at the source's own size: texture unit 0 holds the SDL source on entry and
+	// the water target on success. Returns false (source still bound) if it could not run.
+	bool post_water_run(SDL_Texture* tex) {
+		if (!post_wfbo || post_wfbo_w != tex_w || post_wfbo_h != tex_h) {
+			if (post_wfbo) { glDeleteFramebuffers(1, &post_wfbo); post_wfbo = 0; }
+			if (post_wfbo_tex) { glDeleteTextures(1, &post_wfbo_tex); post_wfbo_tex = 0; }
+			while (glGetError() != GL_NO_ERROR) {}
+			if (!make_fbo(post_wfbo, post_wfbo_tex, tex_w, tex_h)) { post_water_teardown(); SDL_GL_BindTexture(tex, nullptr, nullptr); return false; }
+			post_wfbo_w = tex_w; post_wfbo_h = tex_h;
+			SDL_GL_BindTexture(tex, nullptr, nullptr);   // make_fbo unbinds unit 0
+		}
+		post_water_upload();
+		bool ok = true;
+		for (int i = 0; i < 4; ++i) if (!post_wn_tex[i]) ok = false;
+		glActiveTexture(GL_TEXTURE0);
+		SDL_GL_BindTexture(tex, nullptr, nullptr);       // uploads rebound unit 0
+		if (!ok) return false;
+		for (int i = 0; i < 4; ++i) { glActiveTexture(GL_TEXTURE1 + i); glBindTexture(GL_TEXTURE_2D, post_wn_tex[i]); }
+		glActiveTexture(GL_TEXTURE0);
+		glBindFramebuffer(GL_FRAMEBUFFER, post_wfbo);
+		glViewport(0, 0, tex_w, tex_h);
+		glUseProgram(post_prog_water);
+		for (int i = 0; i < 4; ++i) if (post_water_n[i] >= 0) glUniform1i(post_water_n[i], 1 + i);
+		const window::water_params& p = post_water;
+		glUniform2f(post_water_size, (float)tex_w, (float)tex_h);
+		glUniform3f(post_water_origin, p.origin_x, p.origin_y, p.ws > 0 ? p.ws : 1.f);
+		glUniform3f(post_water_data, p.game_x, p.fade, p.time);
+		glUniform2f(post_water_tile, p.tile1, p.tile2);
+		post_draw_tri(post_prog_water, post_water_pos, post_water_tex);
+		for (int i = 0; i < 4; ++i) { glActiveTexture(GL_TEXTURE1 + i); glBindTexture(GL_TEXTURE_2D, 0); }
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, post_wfbo_tex);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		return true;
+	}
 	// Present `tex` through the selected effect to the default framebuffer. Returns true if
 	// it ran; false -> caller falls back to SDL_RenderCopy.
 	bool post_gl_present(SDL_Texture* tex) {
@@ -1188,15 +1317,18 @@ struct window_impl {
 		int eff = resolve_effect();
 		bool want_bloom = post_bloom > 0.004f && post_bloom_ready;
 		bool want_grade = post_grade > 0.004f;  // SE color-grade (applied in the final shader)
+		bool want_water = post_water_on && post_water_ready;
 		// AUTO that resolves to identity (e.g. Mali/S7+) with no bloom or grade buys nothing
 		// but a blit -> classic present. An explicit effect / bloom / grade runs the GL path.
-		if (eff == 0 && post_effect < 0 && !want_bloom && !want_grade) return false;
+		if (eff == 0 && post_effect < 0 && !want_bloom && !want_grade && !want_water) return false;
 		SDL_RenderFlush(renderer);   // commit SDL's queued clear/copies before our GL block
 		float tw = 1, th = 1;
 		glActiveTexture(GL_TEXTURE0);
 		if (SDL_GL_BindTexture(tex, &tw, &th) != 0) return false;
 		int ow = 0, oh = 0; SDL_GetRendererOutputSize(renderer, &ow, &oh);
 		glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST);
+		if (want_water && post_water_run(tex)) { tw = 1; th = 1; }
+		else if (!want_water && (post_wfbo || post_wn_tex[0])) { post_water_teardown(); SDL_GL_BindTexture(tex, nullptr, nullptr); }
 
 		// SP Phase 3 bloom chain: base (SDL source -> texA via the sharpen prog, uAmt=0 when
 		// not sharpening) -> bright-pass into a half-res buffer -> separable blur (H then V,
@@ -1484,6 +1616,24 @@ void window::set_bloom(int strength) {
 
 void window::set_post_gl(bool on, int effect, float strength, float bloom, float grade) {
 	if (impl) { impl->post_gl_enabled = on; impl->post_effect = effect; impl->post_strength = strength; impl->post_bloom = bloom; impl->post_grade = grade; }
+}
+
+void window::set_water(const water_params* p) {
+#ifdef OB_POST_GL
+	if (!impl) return;
+	impl->post_water_on = p != nullptr;
+	if (p) impl->post_water = *p;
+#else
+	(void)p;
+#endif
+}
+
+bool window::water_ready() const {
+#ifdef OB_POST_GL
+	return impl && impl->post_gl_enabled && impl->post_gl_ok && impl->post_water_ready;
+#else
+	return false;
+#endif
 }
 
 window::operator bool() const {
